@@ -1,4 +1,4 @@
-const CACHE = 'preflop-v1';
+const CACHE = 'preflop-v3';
 const ASSETS = [
   './', './index.html', './app.js',
   './react.production.min.js', './react-dom.production.min.js',
