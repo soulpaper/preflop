@@ -3,4 +3,3 @@ build/
 *.spec
 __pycache__/
 config.json
-templates/

@@ -21,3 +21,8 @@ pyinstaller --onefile --windowed --name CardReader --collect-all winrt reader.py
 ```
 
 `config.json`과 `templates/`는 exe 옆에 생성된다.
+
+## 학습 데이터
+
+`templates/`에 게임 스크린샷에서 뽑은 카드 13장(Qc 4s Kc Jc 4d 9h Kh 2d Ks 5h 5c 8h 3c)이 들어 있다.
+exe로 쓸 때는 이 폴더를 exe 옆에 두면 된다. 나머지 카드는 실행 중 `[카드 학습]`으로 추가한다.
