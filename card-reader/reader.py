@@ -1,7 +1,8 @@
 """화면의 카드 영역을 캡처해 인식하고 승률/아웃츠를 표시하는 테스트 도구.
 
 사용 순서
-  1. [영역 지정]  : 스크린샷 위에서 보드 영역, 내 카드 영역을 차례로 드래그
+  1. [자동 지정]  : 게임 창을 한 번 드래그하면 보드/내 카드/팟/스택/콜 금액 자리를 자동으로 찾음
+     (직접 하려면 [카드]로 보드·내 카드 영역, [숫자]로 팟·스택 영역을 차례로 드래그)
   2. [카드 학습]  : 화면에 보이는 카드에 라벨(예: Ah, Td)을 입력해 템플릿 저장
   3. 이후 자동 인식 → 승률/아웃츠 계산
 """
@@ -22,6 +23,7 @@ import numpy as np
 
 import evaluator as ev
 import glyphs
+import layout
 from fastmatch import FastMatcher
 import ocr
 import odds
@@ -43,6 +45,10 @@ REGIONS = [("board", "보드"), ("hero", "내 카드")]
 NUMBER_STEPS = [("pot", "팟"), ("my_stack", "내 스택")]
 OCR_INTERVAL = 0.8  # 초
 UNKNOWN = "?"
+BACK = "back"          # 뒷면 카드 (폴드 후 내 카드 등)
+BACK_MAX_INK = 0.03    # 뒷면: 빨강/검정 글자 픽셀 비율이 이 미만 (앞면은 어둡게 처리돼도 0.14 이상)
+BACK_MAX_VALUE = 160   # 뒷면: 회색 (실측 밝기 88, 앞면 220 / 어두운 앞면 113)
+BACK_MAX_STD = 25      # 뒷면: 무늬가 고른 회색 (실측 편차 5)
 NORM_SIZE = (52, 72)   # 비교용 정규화 크기 (w, h)
 INSET = 4              # 템플릿 가장자리를 잘라 몇 픽셀 위치 오차를 허용
 CORNER = (24, 36)      # 정규화 이미지에서 숫자+무늬가 있는 왼쪽 위 영역 (w, h)
@@ -124,7 +130,7 @@ def dark_title_bar(win):
 def parse_label(text):
     """사용자 입력 → 'Ah' / None(건너뛰기)."""
     text = text.strip()
-    if text in ("", UNKNOWN):
+    if text in ("", UNKNOWN, BACK):
         return None
     return ev.card_str(ev.parse_card(text))
 
@@ -185,6 +191,18 @@ def _card_rects(img, min_value):
             n = max(1, int(w / (CARD_ASPECT * h)))  # 경계가 안 보이면 카드 2장 폭 이상일 때만 균등 분할
         split += [(x + i * w // n, y, w // n, h) for i in range(n)]
     return split
+
+
+def is_card_back(crop):
+    """글자(빨강/검정 잉크)가 없는 고른 회색 카드 = 뒷면."""
+    inner = cv2.resize(crop, NORM_SIZE, interpolation=cv2.INTER_AREA)[8:-8, 8:-8]
+    b, g, r = [inner[:, :, i].astype(np.int32) for i in range(3)]
+    hsv = cv2.cvtColor(inner, cv2.COLOR_BGR2HSV)
+    s, v = hsv[:, :, 1].astype(np.int32), hsv[:, :, 2].astype(np.int32)
+    red = (r - g > 45) & (r - b > 30)
+    black = (v < 0.5 * np.percentile(v, 95)) & (s < 90)
+    return ((red | black).mean() < BACK_MAX_INK and np.median(v) < BACK_MAX_VALUE
+            and v.std() < BACK_MAX_STD)
 
 
 def detect_cards(img):
@@ -304,6 +322,9 @@ def draw_card(c, x, y, w, h, label):
     if label is None:
         round_rect(c, x, y, x + w, y + h, r, fill="", outline=SLOT, width=1.5, dash=(3, 3))
         return
+    if label == BACK:
+        round_rect(c, x, y, x + w, y + h, r, fill="#4a4f57", outline="#8b9099", width=1.5)
+        return
     if label == UNKNOWN:
         round_rect(c, x, y, x + w, y + h, r, fill=PANEL, outline=WARN, width=1.5)
         c.create_text(x + w / 2, y + h / 2, text="?", fill=WARN, font=(F_NUM, int(h * 0.32), "bold"))
@@ -361,6 +382,7 @@ class RegionSelector:
         with MSS() as sct:
             self.mon = sct.monitors[0]
             shot = np.array(sct.grab(self.mon))[:, :, :3]
+        self.shot = shot  # 원본 해상도 ([자동 지정]은 이 화면을 그대로 분석)
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         self.scale = min(1.0, sw * 0.92 / shot.shape[1], sh * 0.82 / shot.shape[0])
         self.disp = cv2.resize(shot, None, fx=self.scale, fy=self.scale, interpolation=cv2.INTER_AREA)
@@ -537,6 +559,80 @@ class LearnDialog:
         self.on_saved(saved)
 
 
+# --- 자동 지정 확인 -----------------------------------------------------------
+AUTO_COLORS = {"board": "#38bdf8", "hero": "#f472b6", "pot_total": WARN, "my_stack": WIN_C, "call": "#fb923c"}
+AUTO_NAMES = {"board": "보드", "hero": "내 카드", "pot_total": "POT", "my_stack": "내 스택", "call": "콜 금액",
+              "pill": "가운데 팟"}
+
+
+class AutoSetupDialog:
+    """[자동 지정] 결과 확인: 게임 창 스크린샷 위에 찾은 영역을 표시하고 저장/취소."""
+
+    def __init__(self, root, img, res, on_save):
+        self.on_save = on_save
+        self.win = tk.Toplevel(root, bg=BG)
+        self.win.title("자동 지정")
+        self.win.attributes("-topmost", True)
+        self.win.resizable(False, False)
+        dark_title_bar(self.win)
+
+        tk.Label(self.win, text="자동 지정 결과", bg=BG, fg=TEXT, font=(F_UI, 13, "bold")).pack(
+            anchor="w", padx=20, pady=(16, 2))
+        values = res.get("values", {})
+        lines = [f"찾은 영역: {layout.summary(res)}"]
+        nums = [f"{AUTO_NAMES.get(k, '상대 ' + k[3:])} {ocr.format_value(*values[k])}"
+                for k in ["pot_total", "my_stack", "call"] + sorted((k for k in res if k.startswith("opp")),
+                                                                     key=lambda k: int(k[3:]))
+                if values.get(k)]
+        if nums:
+            lines.append("  ·  ".join(nums))
+        if not res.get("found", {}).get("board", True):
+            lines.append("보드 카드가 안 보여서 보드 자리는 테이블 위치로 추정했습니다 (점선).")
+        if "call" in res and not res["found"].get("call"):
+            lines.append("콜 버튼이 안 보여서 콜 금액 자리는 추정했습니다 (점선). 내 차례에 콜 금액을 읽습니다.")
+        if res.get("blinds"):
+            b = res["blinds"]
+            lines.append(f"블라인드 SB {b['sb']} / BB {b['bb']} / 앤티 {b['ante']} → SB·BB·앤티 합계 입력")
+        tk.Label(self.win, bg=BG, fg=MUTED, font=(F_UI, 9), justify="left", wraplength=860,
+                 text="\n".join(lines)).pack(anchor="w", padx=20, pady=(0, 10))
+
+        h, w = img.shape[:2]
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        scale = min(1.0, min(900, sw * 0.8) / w, min(600, sh * 0.65) / h)
+        self.photo = to_photo((img * 0.7).astype(np.uint8), int(w * scale), int(h * scale))
+        c = tk.Canvas(self.win, width=int(w * scale), height=int(h * scale), bg=BG, highlightthickness=0)
+        c.pack(padx=20)
+        c.create_image(0, 0, anchor="nw", image=self.photo)
+        for rect, _ in res.get("bets", []):
+            self._box(c, rect, scale, MUTED, "", dash=(2, 2))
+        if "pill" in res:
+            self._box(c, res["pill"], scale, MUTED, "", dash=(2, 2))
+        for key in [k for k in res if k in AUTO_COLORS or k.startswith("opp")]:
+            name = AUTO_NAMES.get(key) or f"상대{key[3:]}"
+            dash = () if res.get("found", {}).get(key, True) else (4, 3)
+            self._box(c, res[key], scale, AUTO_COLORS.get(key, ACCENT), name, dash=dash)
+
+        buttons = tk.Frame(self.win, bg=BG)
+        buttons.pack(fill="x", padx=20, pady=(12, 18))
+        tk.Label(buttons, bg=BG, fg=MUTED, font=(F_UI, 8),
+                 text="게임 창을 옮기거나 크기를 바꾸면 다시 [자동 지정]을 누르세요").pack(side="left")
+        LearnDialog._flat_button(buttons, "저장", self.save, primary=True).pack(side="right")
+        LearnDialog._flat_button(buttons, "취소", self.win.destroy).pack(side="right", padx=8)
+        self.win.bind("<Return>", lambda e: self.save())
+        self.win.bind("<Escape>", lambda e: self.win.destroy())
+
+    @staticmethod
+    def _box(c, rect, scale, color, name, dash=()):
+        x, y, w, h = [v * scale for v in rect]
+        c.create_rectangle(x, y, x + w, y + h, outline=color, width=2 if name else 1, dash=dash)
+        if name:
+            c.create_text(x + 1, y - 2, anchor="sw", text=name, fill=color, font=(F_UI, 8, "bold"))
+
+    def save(self):
+        self.win.destroy()
+        self.on_save()
+
+
 # --- 메인 창 ----------------------------------------------------------------
 class App:
     W = 420
@@ -548,6 +644,7 @@ class App:
         self.matcher = Matcher()
         self.sct = MSS()
         self.detected = {}
+        self.memory = {}  # 핸드 동안 읽은 카드 (가려져도 유지)
         self.view = {}
         self.result = None
         self.computing = False
@@ -583,6 +680,7 @@ class App:
             "btn": tkfont.Font(family=F_UI, size=8),
         }
         self.buttons = {
+            "auto": Button(self, "auto", self.auto_setup),
             "region": Button(self, "region", self.select_regions),
             "learn": Button(self, "learn", self.learn),
             "numbers": Button(self, "numbers", self.select_numbers),
@@ -619,6 +717,79 @@ class App:
                 self.show_toast(f"숫자 영역 {len(rects)}개를 저장했습니다")
         RegionSelector(self.root, done, steps=NUMBER_STEPS, repeat=("opp", "상대 스택 {}"),
                        hint="숫자가 표시되는 자리를 글자에 맞게 드래그")
+
+    def auto_setup(self):
+        """[자동 지정]: 게임 창을 한 번 드래그 → 그 화면에서 카드/숫자 영역을 찾아 확인 창을 띄움."""
+        if not ocr.available():
+            self.show_toast("이 PC에서는 Windows 한국어 OCR을 쓸 수 없습니다")
+            return
+        selector = None
+
+        def done(rects):
+            rect = rects.get("table")
+            if not rect:
+                return
+            x0, y0 = rect[0] - selector.mon["left"], rect[1] - selector.mon["top"]
+            img = selector.shot[y0:y0 + rect[3], x0:x0 + rect[2]].copy()
+            self.show_toast("게임 화면 분석 중…")
+
+            def work():
+                try:
+                    res, err = layout.calibrate(img), None
+                except Exception as exc:  # OCR 실패 등
+                    res, err = None, str(exc)
+                self.root.after(0, lambda: self.auto_result(rect, img, res, err))
+            threading.Thread(target=work, daemon=True).start()
+
+        selector = RegionSelector(self.root, done, steps=[("table", "게임 창")],
+                                  hint="게임 창 전체(테이블, 아래 버튼까지)를 드래그")
+
+    def auto_result(self, rect, img, res, err):
+        if err or not res:
+            self.show_toast(f"자동 지정 실패: {err}" if err else "자동 지정 실패")
+            return
+        if "my_stack" not in res and "board" not in res:
+            self.show_toast("테이블을 찾지 못했습니다. 게임 창 전체를 드래그하세요")
+            return
+        AutoSetupDialog(self.root, img, res, lambda: self.save_auto(rect, res))
+
+    def save_auto(self, rect, res):
+        """찾은 영역(게임 창 기준 좌표)을 화면 좌표로 바꿔 저장."""
+        ox, oy = rect[0], rect[1]
+
+        def screen(r):
+            return [r[0] + ox, r[1] + oy, r[2], r[3]]
+        if "board" in res and "hero" in res:
+            self.cfg["regions"] = {"board": screen(res["board"]), "hero": screen(res["hero"])}
+        numbers = {k: screen(res[k]) for k in ("pot_total", "my_stack", "call") if k in res}
+        numbers.update({k: screen(v) for k, v in res.items() if k.startswith("opp")})
+        if numbers:
+            self.cfg["number_regions"] = numbers
+            self.cfg["auto_numbers"] = True
+            if self.cfg.get("villain_seat", "max") not in numbers:
+                self.cfg["villain_seat"] = "max"
+        self.fill_blinds(res)
+        save_config(self.cfg)
+        self.ocr_values, self.ocr_pending = {}, None
+        self.refresh_auto_toggle()
+        self.reset_state()
+        self.show_toast(f"자동 지정: {layout.summary(res)}")
+
+    def fill_blinds(self, res):
+        """왼쪽 위 블라인드 줄이 확실히 읽혔으면 SB/BB/앤티 합계(앤티 × 인원)를 채움. 단위는 스택 표기를 따름."""
+        blinds, unit = res.get("blinds"), res.get("unit")
+        if not blinds:
+            return
+        players = 1 + sum(1 for k in res if k.startswith("opp"))
+        ante_total = blinds["ante"] * players
+        if unit == "BB":
+            bb = blinds["bb"]
+            self.set_input("sb", f"{blinds['sb'] / bb:g}BB")
+            self.set_input("bb", "1BB")
+            self.set_input("ante", f"{round(ante_total / bb, 2):g}BB")
+        else:  # 칩 단위
+            for key, value in (("sb", blinds["sb"]), ("bb", blinds["bb"]), ("ante", ante_total)):
+                self.set_input(key, odds.format_amount(value))
 
     # --- 팟/스택 숫자 자동 읽기 ----------------------------------------------
     def ocr_worker(self):
@@ -666,9 +837,12 @@ class App:
         self.ocr_values = values
         if not values:
             return
-        for key in ("pot", "my_stack"):
+        for key in ("pot", "my_stack"):  # "pot": 예전 방식 영역 (읽은 값을 그대로 팟으로)
             if values.get(key):
                 self.set_input(key, ocr.format_value(*values[key]))
+        if values.get("call"):  # 콜 버튼 금액 = 상대 벳. 내 차례에만 보임 → 안 보이면 입력값을 그대로 둠
+            self.set_input("bet", ocr.format_value(*values["call"]))
+        self.fill_pot()
         opp = self.villain_stack()
         if opp:
             self.set_input("opp_stack", ocr.format_value(*opp))
@@ -677,6 +851,18 @@ class App:
             self.set_input("sb", "0.5BB")
             self.set_input("bb", "1BB")
         self.build_villain_pills()
+
+    def fill_pot(self):
+        """팟 입력 = 화면 POT(바닥에 깔린 벳까지 전체) − 상대 벳. 입력칸 정의 '팟 (상대 벳 전)'에 맞춤."""
+        total = self.ocr_values.get("pot_total") if self.cfg.get("auto_numbers") else None
+        if not total:
+            return
+        value, unit = total
+        bet = self.amount("bet")
+        if bet and bet < value:
+            value -= bet
+        value = round(value, 2) if unit != "만" else int(value)
+        self.set_input("pot", ocr.format_value(value, unit))
 
     def opp_values(self):
         return [(k, v) for k, v in sorted(self.ocr_values.items(), key=lambda kv: (len(kv[0]), kv[0]))
@@ -704,7 +890,7 @@ class App:
 
     def toggle_auto(self):
         if not self.cfg.get("number_regions"):
-            self.show_toast("먼저 [숫자 영역]을 지정하세요")
+            self.show_toast("먼저 [자동 지정] 또는 [숫자]로 영역을 지정하세요")
             return
         self.cfg["auto_numbers"] = not self.cfg.get("auto_numbers")
         self.ocr_values, self.ocr_pending = {}, None
@@ -715,8 +901,11 @@ class App:
         on = bool(self.cfg.get("auto_numbers") and self.cfg.get("number_regions"))
         self.auto_btn.config(text=("● 화면 자동 입력" if on else "○ 화면 자동 입력"),
                              bg="#123b37" if on else "#232931", fg=ACCENT if on else MUTED)
-        for key in ("pot", "my_stack", "opp_stack"):
-            self.entries[key].config(fg=ACCENT if on else TEXT)
+        regions = self.cfg.get("number_regions") or {}
+        for key in ("pot", "my_stack", "opp_stack", "bet"):
+            auto = on and (key != "bet" or "call" in regions)
+            self.entries[key].config(fg=ACCENT if auto else TEXT)
+        self.pot_hint.config(text="= 화면 POT − 상대 벳" if on and "pot_total" in regions else "")
         self.build_villain_pills()
 
     def build_villain_pills(self):
@@ -742,7 +931,7 @@ class App:
 
     def learn(self):
         if not self.cfg["regions"]:
-            self.show_toast("먼저 영역을 지정하세요")
+            self.show_toast("먼저 [자동 지정] 또는 [카드]로 영역을 지정하세요")
             return
         LearnDialog(self.root, dict(self.detected), self.matcher,
                     lambda n: (self.show_toast(f"카드 {n}장을 학습했습니다"), self.reset_state()))
@@ -764,6 +953,20 @@ class App:
 
     def reset_state(self):
         self.computed_state = self.pending_state = None
+        self.memory = {}
+
+    def hold(self, key, labels):
+        """같은 핸드 동안 이미 읽은 카드는 말풍선·이펙트에 가려 ?가 돼도 유지.
+
+        카드 수가 줄거나, 뒷면이 보이거나, 읽힌 카드가 다른 카드로 바뀌면 새 핸드로 보고 기억을 지운다."""
+        prev = self.memory.get(key, [])
+        if BACK in labels or len(labels) < len(prev) or any(
+                ev.is_card(a) and ev.is_card(b) and a != b for a, b in zip(labels, prev)):
+            prev = []
+        out = [p if label == UNKNOWN and ev.is_card(p) else label
+               for label, p in zip(labels, prev + [""] * (len(labels) - len(prev)))]
+        self.memory[key] = out
+        return out
 
     # --- 메인 루프 ----------------------------------------------------------
     def tick(self):
@@ -777,14 +980,16 @@ class App:
     def capture(self):
         regions = self.cfg["regions"]
         if not regions:
-            self.view = {"message": ("영역을 지정하세요", "[영역 지정]을 눌러 보드와 내 카드 위치를 드래그합니다.")}
+            self.view = {"message": ("영역을 지정하세요", "[자동 지정]을 누르고 게임 창을 드래그하면 보드·내 카드·팟·스택 "
+                                                       "자리를 찾습니다. 직접 하려면 [카드]로 보드와 내 카드를 드래그합니다.")}
             return
         self.detected = {}
         for key, _ in REGIONS:
             crops = detect_cards(grab(self.sct, regions[key]))
-            self.detected[key] = [(c, self.matcher.match(c, self.cfg["threshold"])[0]) for c in crops]
-        hero = [label for _, label in self.detected["hero"]][:2]
-        board = [label for _, label in self.detected["board"]][:5]
+            self.detected[key] = [(c, BACK if is_card_back(c) else self.matcher.match(c, self.cfg["threshold"])[0])
+                                  for c in crops]
+        hero = self.hold("hero", [label for _, label in self.detected["hero"]][:2])
+        board = self.hold("board", [label for _, label in self.detected["board"] if label != BACK][:5])
         self.view = {"hero": hero, "board": board}
 
         state = self.read_state(hero, board)
@@ -802,6 +1007,8 @@ class App:
             self.start_analysis(state)
 
     def read_state(self, hero, board):
+        if hero and all(label == BACK for label in hero):
+            return "폴드", "내 카드가 뒷면입니다. 다음 핸드를 기다립니다."
         if UNKNOWN in hero + board:
             return "학습되지 않은 카드", "노란색 ? 카드가 있습니다. [카드 학습]에서 라벨을 입력하세요."
         if len(hero) < 2:
@@ -844,14 +1051,16 @@ class App:
         # 헤더
         c.create_text(P, y, anchor="nw", text="Card Reader", font=self.fonts["title"], fill=TEXT)
         x = W - P
-        for bkey, text in (("learn", "카드 학습"), ("numbers", "숫자 영역"), ("region", "카드 영역")):
+        # 헤더 폭이 좁아서 짧은 이름: 카드 = 카드 영역 지정, 숫자 = 숫자 영역 지정, 학습 = 카드 학습
+        for bkey, text in (("learn", "학습"), ("numbers", "숫자"), ("region", "카드"), ("auto", "자동 지정")):
             w = self.fonts["btn"].measure(text) + 18
-            self.buttons[bkey].draw(c, x - w, y - 3, x, y + 23, text, font=self.fonts["btn"])
+            self.buttons[bkey].draw(c, x - w, y - 3, x, y + 23, text, font=self.fonts["btn"],
+                                    primary=bkey == "auto" and not self.cfg["regions"])
             x -= w + 6
         y += 26
         learned = len(self.matcher.labels)
         msg = self.view.get("message")
-        dot = MUTED if not self.cfg["regions"] else (WARN if msg and msg[0] != "핸드 대기 중" else WIN_C)
+        dot = MUTED if not self.cfg["regions"] else (WARN if msg and msg[0] not in ("핸드 대기 중", "폴드") else WIN_C)
         c.create_oval(P, y + 5, P + 7, y + 12, fill=dot, outline="")
         c.create_text(P + 14, y + 8, anchor="w", font=(F_UI, 8), fill=MUTED,
                       text=self.toast or f"학습된 카드 {learned}/52   ·   상대 {self.cfg['opponents']}명 기준")
@@ -1141,6 +1350,11 @@ class App:
                 self.inputs[key] = var
                 extra = tk.Frame(box, bg=BG)
                 extra.grid(row=2 + r * 2, column=col, sticky="w", pady=(3, 8))
+                if key == "pot":
+                    self.pot_hint = tk.Label(extra, text="", bg=BG, fg=MUTED, font=(F_UI, 7))
+                    self.pot_hint.pack(side="left")
+                if key == "bet":  # 상대 벳을 바꾸면 팟(= 화면 POT − 벳)도 다시 계산
+                    var.trace_add("write", lambda *_: hasattr(self, "side_canvas") and self.fill_pot())
                 if key in ("bet", "my_bet"):
                     for name, frac in (("⅓", 1 / 3), ("½", 0.5), ("팟", 1.0)):
                         b = tk.Label(extra, text=name, bg="#232931", fg=TEXT, font=(F_UI, 8),

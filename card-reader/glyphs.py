@@ -31,7 +31,24 @@ CORNER_K = 2.0      # 큰 숫자 높이 / 코너 숫자 높이 (실측 2.03)
 
 # 검증(서로 다른 카드끼리 leave-one-out)에서 오인식 0건이 되도록 정한 값
 RANK_MIN, RANK_MARGIN = 0.85, 0.15  # 실측: 정답 0.907 이상(차이 0.24 이상), 다른 숫자 최대 0.75
+# 보조 기준: 점수가 조금 낮아도 2등과 차이가 압도적이면 인정 (많이 기울어진 10 등).
+# 정답 숫자를 원형에서 통째로 뺀 검증에서 틀린 1등은 점수 최대 0.731, 차이 최대 0.223
+RANK_MIN_WIDE, RANK_MARGIN_WIDE = 0.75, 0.35
 SUIT_MIN, SUIT_MARGIN = 0.90, 0.30  # 무늬 margin = 판별값 t (1 = 1등 무늬 평균, 0 = 두 무늬 중간). 실측: 정답 t 0.44 이상, 틀린 무늬 점수 최대 0.55
+
+
+def card_face(face):
+    """밝은 카드 면 마스크 → 가장 큰 면의 볼록 껍질(글자 구멍 포함). 면을 못 찾으면 전체."""
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(face.astype(np.uint8))
+    if n <= 1:
+        return np.ones_like(face, bool)
+    biggest = (lab == 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))).astype(np.uint8)
+    pts = cv2.findNonZero(biggest)
+    hull = np.zeros_like(biggest)
+    cv2.fillConvexPoly(hull, cv2.convexHull(pts), 1)
+    # 카드 테두리의 어두운 가장자리 픽셀이 글자로 잡히지 않게 조금 안쪽으로
+    hull = cv2.erode(hull, np.ones((2 * SCALE + 1, 2 * SCALE + 1), np.uint8))
+    return hull > 0
 
 
 def segment(img):
@@ -45,9 +62,11 @@ def segment(img):
     s, v = hsv[:, :, 1].astype(np.float32), hsv[:, :, 2].astype(np.float32)
     low = s < 45
     face_v = float(np.percentile(v[low], 90)) if low.any() else 220.0
-    # 강한 잉크 (면 밝기 기준 상대 판정 → 어둡게 처리된 카드도 동작)
-    red = (r - g > 0.2 * face_v) & (r - b > 0.13 * face_v) & (r > 0.3 * face_v)
-    black = (v < 0.5 * face_v) & ((s < 90) | (v < 0.3 * face_v))
+    inside = card_face(low & (v > 0.72 * face_v))
+    # 강한 잉크 (면 밝기 기준 상대 판정 → 어둡게 처리된 카드도 동작). 기울어진 카드의 crop 모서리에 들어온
+    # 테이블/이펙트(아바타 링 등)는 카드 면 바깥이므로 제외
+    red = (r - g > 0.2 * face_v) & (r - b > 0.13 * face_v) & (r > 0.3 * face_v) & inside
+    black = (v < 0.5 * face_v) & ((s < 90) | (v < 0.3 * face_v)) & inside
     color = "red" if red.sum() > black.sum() else "black"
     ink = red if color == "red" else black
     # 잉크 세기 (0~1): 빨강은 r-g, 검정은 어두운 정도
@@ -263,7 +282,9 @@ class Prototypes:
         suit, s_score, _ = best(suits)
         if rank not in real:  # 글꼴 원형(실제 샘플 없는 숫자)이 이기면 모름
             return None
-        if r_score >= RANK_MIN and r_margin >= RANK_MARGIN and s_score >= SUIT_MIN and s_margin >= SUIT_MARGIN:
+        rank_ok = (r_score >= RANK_MIN and r_margin >= RANK_MARGIN) or \
+            (r_score >= RANK_MIN_WIDE and r_margin >= RANK_MARGIN_WIDE)
+        if rank_ok and s_score >= SUIT_MIN and s_margin >= SUIT_MARGIN:
             return rank + suit, min(r_score, s_score)
         return None
 

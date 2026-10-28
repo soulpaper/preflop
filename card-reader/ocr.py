@@ -10,6 +10,7 @@ import re
 from collections import Counter
 
 import cv2
+import numpy as np
 
 try:
     from winrt.windows.globalization import Language
@@ -49,36 +50,48 @@ def _bitmap(img):
                                                   BitmapAlphaMode.PREMULTIPLIED)
 
 
-def _variants(img):
+WARM = 25  # R - B가 이보다 크면 따뜻한 색(구리색 테이블 레일, 금색 글자) — 숫자(연보라/흰색)가 아님
+
+
+def _variants(img, suppress_warm=True):
     scale = TARGET_HEIGHT / max(1, img.shape[0])
     big = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    bg = [int(v) for v in np.median(big.reshape(-1, 3), 0)]
+    if suppress_warm:  # 숫자 뒤로 지나가는 레일 선이 '3'을 '#'로 바꾸는 등 → 배경색으로 지움
+        big = big.copy()
+        big[big[:, :, 2].astype(np.int16) - big[:, :, 0].astype(np.int16) > WARM] = bg
     gray = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     binary = cv2.copyMakeBorder(255 - binary, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
-    return [big, 255 - gray, binary]
+    # 글자가 가장자리에 붙어 있으면 OCR이 앞뒤에 '1', '|' 같은 헛글자를 붙이거나 점을 빠뜨림 → 배경색 여백
+    big = cv2.copyMakeBorder(big, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=bg)
+    inv = cv2.copyMakeBorder(255 - gray, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=int(255 - np.median(gray)))
+    return [big, inv, binary]
 
 
-async def _read_all(crops):
+async def _read_all(crops, suppress_warm):
     engine = _engine()
     out = {}
     for key, img in crops.items():
         texts = []
-        for v in _variants(img):
+        for v in _variants(img, suppress_warm):
             result = await engine.recognize_async(_bitmap(v))
             texts.append(" ".join(line.text for line in result.lines))
         out[key] = texts
     return out
 
 
-def read_texts(crops):
-    """{key: 이미지} → {key: [전처리별 OCR 문자열 3개]}. 백그라운드 스레드에서 호출."""
-    return asyncio.run(_read_all(crops))
+def read_texts(crops, suppress_warm=True):
+    """{key: 이미지} → {key: [전처리별 OCR 문자열 3개]}. 백그라운드 스레드에서 호출.
+    suppress_warm: 따뜻한 색 픽셀을 지우고 읽음 (팟/스택 숫자용. 금색 블라인드 글자는 False)."""
+    return asyncio.run(_read_all(crops, suppress_warm))
 
 
 # --- 문자열 → 숫자 -------------------------------------------------------------
 def _clean(text):
     t = text.replace(" ", "").replace(",", "")
     t = re.sub(r"[Oo](?=[\d.]*B)|(?<=\d)[Oo]|[Oo](?=\d)", "0", t)  # 0을 O로 읽은 경우
+    t = re.sub(r"(?<=[\d.])[Il|]|[Il|](?=\.\d|BB)", "1", t)  # 1을 I/l로 읽은 경우 ('IBB', '91.IBB')
     return t
 
 
