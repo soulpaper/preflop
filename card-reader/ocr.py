@@ -7,6 +7,7 @@
 """
 import asyncio
 import re
+import threading
 from collections import Counter
 
 import cv2
@@ -21,6 +22,7 @@ except ImportError:  # OCR 미지원 환경
     OcrEngine = None
 
 TARGET_HEIGHT = 60  # 이 높이로 키워서 읽으면 작은 글씨 인식률이 크게 오름
+_LOCK = threading.Lock()  # OCR 엔진을 여러 스레드(숫자/테이블 상태/닉네임)가 동시에 쓰면 충돌 → 한 번에 하나씩
 HANGUL = re.compile(r"[가-힣]")
 
 
@@ -81,10 +83,36 @@ async def _read_all(crops, suppress_warm):
     return out
 
 
+JITTER_MARGIN = 2
+# 같은 영역을 몇 px씩 다르게 잘라 읽음 (왼, 위, 오른, 아래 추가 여백). Windows OCR은 특정 잘림 위치에서
+# 빈 문자열을 내거나 소수점을 빠뜨리는 일이 있어(100BB → '', 32.7BB → 327BB) 여러 장의 다수결로 보완
+JITTER = [(0, 0, 0, 0), (2, 2, 2, 2), (1, 0, 0, 0), (0, 0, 1, 0), (2, 1, 0, 1)]
+
+
+def read_jittered(crops):
+    """{key: 영역보다 사방 JITTER_MARGIN px 크게 잡은 이미지} → {key: 모든 잘림의 OCR 문자열}."""
+    m = JITTER_MARGIN
+    sub = {}
+    for key, img in crops.items():
+        h, w = img.shape[:2]
+        for i, (left, top, right, bottom) in enumerate(JITTER):
+            part = img[m - top:h - m + bottom, m - left:w - m + right]
+            if part.size:  # 화면 가장자리에서 잘린 경우 건너뜀
+                sub[(key, i)] = part
+    texts = read_texts(sub)
+    return {key: sum((texts.get((key, i), []) for i in range(len(JITTER))), []) for key in crops}
+
+
 def read_texts(crops, suppress_warm=True):
     """{key: 이미지} → {key: [전처리별 OCR 문자열 3개]}. 백그라운드 스레드에서 호출.
     suppress_warm: 따뜻한 색 픽셀을 지우고 읽음 (팟/스택 숫자용. 금색 블라인드 글자는 False)."""
-    return asyncio.run(_read_all(crops, suppress_warm))
+    return run_locked(_read_all(crops, suppress_warm))
+
+
+def run_locked(coro):
+    """OCR 코루틴 실행 (모든 모듈이 이 함수로 엔진을 써야 스레드끼리 안 겹침)."""
+    with _LOCK:
+        return asyncio.run(coro)
 
 
 # --- 문자열 → 숫자 -------------------------------------------------------------

@@ -67,7 +67,7 @@ def evaluate(cards):
     singles = [r for r in present if counts[r] == 1]
 
     if quads:
-        return (7, quads[0], max(r for r in present if r != quads[0]))
+        return (7, quads[0], max((r for r in present if r != quads[0]), default=-1))  # 4장만 볼 때(드로우 계산)는 키커 없음
     if trips and (len(trips) > 1 or pairs):
         return (6, trips[0], max(trips[1:] + pairs))
     if flush_suit >= 0:
@@ -78,7 +78,7 @@ def evaluate(cards):
     if trips:
         return (3, trips[0], *singles[:2])
     if len(pairs) >= 2:
-        return (2, pairs[0], pairs[1], max(r for r in present if r not in pairs[:2]))
+        return (2, pairs[0], pairs[1], max((r for r in present if r not in pairs[:2]), default=-1))
     if pairs:
         return (1, pairs[0], *singles[:3])
     return (0, *singles[:5])

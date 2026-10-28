@@ -4,3 +4,12 @@ build/
 *.spec
 __pycache__/
 config.json
+# 로컬 데이터 (다른 플레이어 닉네임 포함) / 생성물
+samples/
+profiles.db
+*.db
+hands/
+recordings/
+debug.log
+test_userinfo.py
+gto_lib/

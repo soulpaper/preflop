@@ -9,6 +9,11 @@
   hero       내 카드 자리 (앞면 기울어진 카드 / 뒷면 모두 들어가게)
   bets       바닥(펠트)에 깔린 벳 숫자 (참고용)
   blinds     왼쪽 위 'SB : 50 / BB : 100 / Ante 15' (확실히 읽힌 경우만)
+  seats      좌석 기준점 (아바타/닉네임/스택/벳 자리/카드 아이콘), 내 왼쪽부터 시계 방향 + 마지막에 나 (anchors())
+             slot_seats(res): geom 으로 모든 고정 자리(9인+6인 합집합 9자리 + 나)의 기준점 — tablestate 가 매 프레임
+             사람 있는지 확인 (보정 뒤에 앉은 사람도 보임). 키 'seat_<자리>' 는 보정 순서와 무관
+  action_bar 폴드/콜/레이즈 버튼, 벳 크기 줄 위치
+  geom       알약 중심, pw(알약 폭), 좌석 타원, 창 크기 — tablestate.py 가 씀
 
 방법
   1. 창 전체를 여러 배율로 OCR 해서 글자 줄을 모은다 (배율마다 놓치는 줄이 달라 합친다).
@@ -32,6 +37,9 @@ BOARD_FROM_PILL = (-1.07, 0.06, 2.14, 0.56)    # 보드 (x0, y0, w, h): x는 알
 BOARD_CARD_H = 0.50                             # 보드 카드 높이
 HERO_FROM_STACK = (0.32, -0.71, 0.86, 0.61)     # 내 카드 (x0, y0, w, h): 내 스택 글자 중심 기준 (앞면/뒷면 모두 포함)
 CALL_FROM_STACK = (1.77, 0.41)                  # 콜 버튼 금액 글자 중심: 내 스택 글자 중심 기준
+CALL_X = (1.2, 2.2)                             # 콜 금액 글자 중심 x 범위 (내 스택 기준). 레이즈 금액은 ≈2.6
+CALL_MIN_DY = 0.3                               # 콜 금액은 내 스택보다 이만큼 아래 (벳 크기 버튼 줄은 ≈0.2)
+BELOW_HERO = 0.12                               # 좌석 타원 아래 끝(= 내 스택 줄)보다 이만큼 아래 숫자는 액션 바
 RING = (0.0, 0.50, 2.10, 1.20)                  # 좌석이 놓인 타원 (cx, cy, a, b): 알약 중심 기준
 STACK_RING = (0.88, 1.30)                       # 스택: 타원 반지름 비율 이 범위 (닉네임이 보이면 0.75~1.45)
 PILL_ASPECT = (3.5, 7.0)                        # 알약 폭/높이
@@ -109,7 +117,7 @@ def read_lines(img, scales=OCR_SCALES):
     """창 전체를 여러 배율로 OCR → [{"box", "texts", "words"}] (같은 자리의 줄은 하나로 합침)."""
     base = min(2.5, max(0.6, BASE_WIDTH / img.shape[1]))
     images = [cv2.resize(img, None, fx=base * s, fy=base * s, interpolation=cv2.INTER_CUBIC) for s in scales]
-    results = asyncio.run(_recognize(images))
+    results = ocr.run_locked(_recognize(images))
     merged = []
     # 기울기 보정이 안 된(정상) 결과부터 넣어서 박스는 정상 결과를 우선 사용
     order = sorted(zip(images, results, scales), key=lambda r: abs(r[1].text_angle or 0.0) > 0.05)
@@ -365,7 +373,8 @@ def calibrate(img):
 
     키: pot_total, pill, my_stack, opp1.., board, hero, call (모두 있을 때만)
     그 외: values {키: (값, 단위)}, found {키: 화면에서 직접 찾았는지(False = 비율로 추정)},
-          bets [(영역, 값)], blinds {'sb','bb','ante'} 또는 None, board_cards, unit
+          bets [(영역, 값)], blinds {'sb','bb','ante'} 또는 None, board_cards, unit,
+          seats / action_bar (anchors() 참고), geom
     """
     import reader  # 카드 찾기 함수 재사용 (순환 import 방지로 여기서)
 
@@ -463,7 +472,9 @@ def calibrate(img):
             continue  # 글자가 너무 큼 (카드 숫자 등)
         r = ring_r(c["box"])
         c["named"] = name_above(c["box"])
-        if STACK_RING[0] <= r <= STACK_RING[1] or (c["named"] and 0.75 <= r <= 1.45):
+        if pill is not None and cy > rcy + rb + BELOW_HERO * pw:
+            others.append(c)  # 내 스택 줄보다 아래 = 액션 바 (벳 크기 버튼 '2BB 3BB 5BB', 콜/레이즈 금액)
+        elif STACK_RING[0] <= r <= STACK_RING[1] or (c["named"] and 0.75 <= r <= 1.45):
             stacks.append(c)
         elif r < STACK_RING[0] and not c["named"]:
             bets.append(c)
@@ -490,8 +501,10 @@ def calibrate(img):
         bottom = (rcx, rcy + rb)
         hero = min(stacks, key=lambda c: math.hypot(_center(c["box"])[0] - bottom[0], _center(c["box"])[1] - bottom[1]))
         hx, hy = _center(hero["box"])
-        call = next((c for c in others + stacks if _center(c["box"])[0] > hx + 0.8 * pw
-                     and _center(c["box"])[1] > hy + 0.15 * pw and not c["named"]), None)
+        # 콜 버튼 = 버튼 줄(벳 크기 버튼 줄보다 아래)의 가운데 버튼. 오른쪽 레이즈 금액과 헷갈리지 않게 x 범위 제한
+        calls = [c for c in others + stacks if CALL_X[0] * pw < _center(c["box"])[0] - hx < CALL_X[1] * pw
+                 and _center(c["box"])[1] > hy + CALL_MIN_DY * pw and not c["named"]]
+        call = min(calls, key=lambda c: _center(c["box"])[0]) if calls else None
         if call is not None:
             if call in stacks:
                 stacks.remove(call)
@@ -535,7 +548,189 @@ def calibrate(img):
         put("board", _clip(board, img.shape), found=bool(rects))
 
     result["blinds"] = read_blinds(img, lines)
+    result["geom"] = {"pill_center": [round(float(pcx), 1), round(float(pcy), 1)], "pw": round(float(pw), 2),
+                      "ring": [round(float(v), 1) for v in (rcx, rcy, ra, rb)], "size": [W, H]}
+    result.update(anchors(result))
     return result
+
+
+# --- 좌석 기준점 (tablestate.py 용) ------------------------------------------------------------
+# 이 클라이언트의 좌석 자리는 고정: 스택 글자 중심, 알약 중심 기준 (단위 pw). 9인/6인 테이블 샘플에서 잰 값 (±0.005)
+SLOTS = {"BL": (-1.767, 1.408), "L": (-2.141, 0.499), "UL": (-1.628, -0.226), "TL": (-0.631, -0.704),
+         "TC": (0.0, -0.702), "TR": (0.633, -0.704), "UR": (1.628, -0.226), "R": (2.144, 0.498),
+         "BR": (1.770, 1.408), "HERO": (-0.461, 1.704)}
+SLOT_FAMILIES = (("BL", "L", "UL", "TL", "TR", "UR", "R", "BR"),  # 9인
+                 ("BL", "UL", "TC", "UR", "BR"))                  # 6인
+SLOT_TOL = 0.12
+# 벳 숫자 글자 중심 (알약 기준). TC는 샘플에 벳이 없어서 TL/TR 높이로 추정
+SLOT_BET = {"BL": (-1.405, 0.917), "L": (-1.702, 0.399), "UL": (-1.281, -0.127), "TL": (-0.625, -0.285),
+            "TC": (0.0, -0.285), "TR": (0.622, -0.285), "UR": (1.281, -0.127), "R": (1.700, 0.399),
+            "BR": (1.404, 0.917), "HERO": (-0.002, 0.939)}
+AVATAR_FROM_STACK = (-0.32, 0.175)              # 아바타 중심 dy, 반지름 (상대). 스택 글자 중심 기준
+HERO_AVATAR_FROM_STACK = (-0.41, 0.235)         # 내 아바타 (더 큼)
+NAME_FROM_STACK = -0.105                        # 닉네임 줄 중심 dy
+ICON_FROM_AVATAR = (0.17, 0.125)                # 카드 뒷면 아이콘 중심 (±dx: 테이블 안쪽, dy). 아바타 중심 기준
+BET_TEXT_HALF = (0.2, 0.06)                     # 벳 숫자 찾는 영역 반폭/반높이
+BET_CHIPS_UP = 0.34                             # 칩 더미는 숫자 위로 이만큼까지
+# 액션 바 (알약 기준 [x, y, w, h]): 폴드 / 콜(체크) / 레이즈 버튼, 그 위 벳 크기 줄 (2BB 3BB 5BB 올인 + 입력칸)
+ACTION_BUTTONS = {"fold": (-0.075, 2.03, 0.83, 0.28), "call": (0.81, 2.03, 0.83, 0.28),
+                  "raise": (1.69, 2.03, 0.83, 0.28)}
+ACTION_SIZES = (-0.07, 1.82, 2.59, 0.12)
+
+
+def _slot_of(x, y):
+    """알약 기준 좌표(pw) → 가장 가까운 고정 좌석 이름 (SLOT_TOL 안일 때만)."""
+    name = min(SLOTS, key=lambda s: math.hypot(SLOTS[s][0] - x, SLOTS[s][1] - y))
+    return name if math.hypot(SLOTS[name][0] - x, SLOTS[name][1] - y) <= SLOT_TOL else None
+
+
+def anchors(res):
+    """calibrate() 결과 → {'seats': [...], 'action_bar': {...}} (이미지 좌표, JSON 직렬화 가능).
+
+    seats: 내 왼쪽부터 시계 방향, 내 자리(hero)는 마지막. 항목:
+      key       'opp1'.. / 'hero' / 'seat_<자리>' (보정 때 빈자리였던 고정 좌석 — 나중에 누가 앉을 수 있음)
+      slot      고정 좌석 이름 (BL, L, UL, TL, TC, TR, UR, R, BR, HERO) 또는 None
+      avatar    [cx, cy, r]
+      name      닉네임 줄 [x, y, w, h]
+      stack     스택 숫자 [x, y, w, h]
+      bet       펠트 위 벳 자리 (칩 더미 + 숫자) [x, y, w, h]
+      bet_text  벳 숫자가 나오는 줄 [x, y, w, h]
+      icons     카드 뒷면 아이콘 중심 후보 [[x, y], [x, y]] (왼쪽/오른쪽)
+      occupied  보정 화면에서 사람이 있었는지
+    action_bar: fold / call / raise 버튼, sizes (벳 크기 줄), call_amount (콜 금액 글자) [x, y, w, h]
+    """
+    geom = res.get("geom")
+    if geom is None and "pill" in res:
+        px, py, pw_, ph = res["pill"]
+        geom = {"pill_center": [px + pw_ / 2, py + ph / 2], "pw": pw_}
+    if geom is None or "my_stack" not in res:
+        return {"seats": [], "action_bar": {}}
+    (pcx, pcy), pw = geom["pill_center"], geom["pw"]
+    W, H = geom.get("size", (10 ** 5, 10 ** 5))
+
+    def rel(rect):
+        x, y, w, h = rect
+        return ((x + w / 2 - pcx) / pw, (y + h / 2 - pcy) / pw)
+
+    def absolute(rx, ry):
+        return pcx + rx * pw, pcy + ry * pw
+
+    def ri(rect):
+        return _clip(rect, (H, W))
+
+    entries = []  # (key, stack rect, slot, occupied)
+    opps = sorted((k for k in res if re.fullmatch(r"opp\d+", k)), key=lambda k: int(k[3:]))
+    for k in opps:
+        entries.append((k, res[k], _slot_of(*rel(res[k])), True))
+    used = {e[2] for e in entries}
+    family = ()  # 찾은 좌석이 모두 고정 자리이고 9인/6인 중 하나로 정해질 때만 빈자리를 채움
+    if None not in used:
+        nine, six = SLOT_FAMILIES
+        if used <= set(nine) and used & {"L", "R", "TL", "TR"}:
+            family = nine
+        elif used <= set(six) and "TC" in used:
+            family = six
+    for s in family:
+        if s not in used:  # 빈자리: 같은 테이블 형태의 고정 좌석 (스택 글자 크기는 대표값)
+            sx, sy = absolute(*SLOTS[s])
+            th = 0.096 * pw
+            entries.append((f"seat_{s}", ri((sx - 0.3 * pw, sy - th / 2, 0.6 * pw, th)), s, False))
+
+    rcx, rcy, ra, rb = geom.get("ring") or (pcx, pcy + RING[1] * pw, RING[2] * pw, RING[3] * pw)
+
+    def clockwise(e):
+        cx, cy = _center_rect(e[1])
+        return math.atan2(-(cx - rcx) / ra, (cy - rcy) / rb) % (2 * math.pi)
+    entries.sort(key=clockwise)
+    entries.append(("hero", res["my_stack"], _slot_of(*rel(res["my_stack"])) or "HERO", True))
+
+    seats = [seat_anchor(key, stack, slot, occupied, geom) for key, stack, slot, occupied in entries]
+
+    bar = {}
+    for name, (x, y, w, h) in ACTION_BUTTONS.items():
+        bar[name] = [int(round(v)) for v in (pcx + x * pw, pcy + y * pw, w * pw, h * pw)]
+    x, y, w, h = ACTION_SIZES
+    bar["sizes"] = [int(round(v)) for v in (pcx + x * pw, pcy + y * pw, w * pw, h * pw)]
+    if "call" in res:
+        bar["call_amount"] = [int(v) for v in res["call"]]
+    # 화면(창) 아래로 잘린 경우: 버튼이 창 밖이면 그대로 두고 tablestate 가 '없음'으로 처리
+    return {"seats": seats, "action_bar": bar}
+
+
+def _center_rect(rect):
+    x, y, w, h = rect
+    return x + w / 2, y + h / 2
+
+
+def seat_anchor(key, stack, slot, occupied, geom):
+    """좌석 하나의 기준점 (anchors() 항목과 같은 모양). stack: 스택 숫자 [x, y, w, h]."""
+    (pcx, pcy), pw = geom["pill_center"], geom["pw"]
+    W, H = geom.get("size", (10 ** 5, 10 ** 5))
+    rcx, rcy, ra, rb = geom.get("ring") or (pcx, pcy + RING[1] * pw, RING[2] * pw, RING[3] * pw)
+
+    def ri(rect):
+        return _clip(rect, (H, W))
+    sx, sy = _center_rect(stack)
+    is_hero = key == "hero"
+    dy, r = (HERO_AVATAR_FROM_STACK if is_hero else AVATAR_FROM_STACK)
+    ax, ay, ar = sx, sy + dy * pw, r * pw
+    if slot in SLOT_BET:
+        bx, by = pcx + SLOT_BET[slot][0] * pw, pcy + SLOT_BET[slot][1] * pw
+    else:  # 모르는 자리: 스택에서 테이블 중심 쪽으로
+        bx, by = sx + 0.3 * (rcx - sx), sy + 0.45 * (rcy - sy)
+    hw, hh = BET_TEXT_HALF[0] * pw, BET_TEXT_HALF[1] * pw
+    ny = sy + NAME_FROM_STACK * pw
+    nh = 0.1 * pw
+    icx, icy = ICON_FROM_AVATAR
+    return {
+        "key": key, "slot": slot,
+        "avatar": [round(ax, 1), round(ay, 1), round(ar, 1)],
+        "name": ri((sx - 0.3 * pw, ny - nh / 2, 0.6 * pw, nh)),
+        "stack": [int(v) for v in stack],
+        "bet": ri((bx - hw, by - BET_CHIPS_UP * pw, 2 * hw, BET_CHIPS_UP * pw + hh)),
+        "bet_text": ri((bx - hw, by - hh, 2 * hw, 2 * hh)),
+        "icons": [[round(ax - icx * pw, 1), round(ay + icy * pw, 1)], [round(ax + icx * pw, 1), round(ay + icy * pw, 1)]],
+        "occupied": occupied,
+    }
+
+
+# 상대 좌석 고정 자리, 내 왼쪽부터 시계 방향. 9인(BL..BR, TC 제외) + 6인(BL, UL, TC, UR, BR) 의 합집합 = 10인(나 포함)
+SLOT_ORDER = ("BL", "L", "UL", "TL", "TC", "TR", "UR", "R", "BR")
+SLOT_STACK_W = 0.62     # 고정 자리 스택 칸 폭 (pw). 글자 덩어리는 tablestate 가 칸 안에서 찾음
+SLOT_STACK_H = 0.105    # 높이 (pw). 실측 스택 글자 칸 0.096~0.105
+
+
+def slot_key(slot):
+    """고정 자리 → 좌석 키. 보정 순서와 무관해서 누가 앉거나 떠나도 같은 자리는 같은 키."""
+    return f"seat_{slot}"
+
+
+def slot_seats(res):
+    """보정 결과 → 모든 고정 자리(SLOT_ORDER) + 나의 기준점 목록 (시계 방향, 나는 마지막). 매 프레임 사람이 있는지
+    tablestate 가 픽셀로 확인한다. 고정 자리를 쓸 수 없으면 None (geom 없음 / 보정 좌석이 고정 자리와 안 맞음).
+
+    occupied 는 '보정 때 사람이 있었는지' (참고용)."""
+    geom = res.get("geom")
+    if not geom or "pill_center" not in geom or "pw" not in geom or "my_stack" not in res:
+        return None
+    (pcx, pcy), pw = geom["pill_center"], geom["pw"]
+    calibrated = res.get("seats") or []
+    if any(s.get("slot") is None for s in calibrated):
+        return None  # 이 화면은 고정 자리 배치가 아님
+    seen = {s["slot"] for s in calibrated if s.get("occupied") and s["key"] != "hero"}
+    out = []
+    for slot in SLOT_ORDER:
+        sx, sy = pcx + SLOTS[slot][0] * pw, pcy + SLOTS[slot][1] * pw
+        stack = (sx - SLOT_STACK_W / 2 * pw, sy - SLOT_STACK_H / 2 * pw, SLOT_STACK_W * pw, SLOT_STACK_H * pw)
+        a = seat_anchor(slot_key(slot), [round(v) for v in stack], slot, slot in seen, geom)
+        W, H = geom.get("size", (10 ** 5, 10 ** 5))
+        ax, ay, ar = a["avatar"]
+        if ax - ar < 0 or ay - ar < 0 or ax + ar > W or sy > H:
+            continue  # 창 밖 (창이 작게 잘린 경우)
+        out.append(a)
+    hero = next((s for s in calibrated if s["key"] == "hero"), None)
+    out.append(hero or seat_anchor("hero", res["my_stack"], "HERO", True, geom))
+    return out
 
 
 def summary(res):

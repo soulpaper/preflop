@@ -272,6 +272,15 @@ class Prototypes:
             return None
         return rs[0], rs[1], ss[0], ss[1]
 
+    def suit(self, crop):
+        """확신할 수 있을 때만 무늬 한 글자, 아니면 None."""
+        seg = segment(crop)
+        ss = self._suit_scores(seg) if seg else None
+        if ss is None:
+            return None
+        suit, score, _ = best(ss[0])
+        return suit if score >= SUIT_MIN and ss[1] >= SUIT_MARGIN else None
+
     def match(self, crop):
         """(라벨, 점수) / None. 숫자와 무늬 모두 점수와 2등과의 차이가 기준을 넘어야 인정."""
         ev = self.evaluate(crop)
