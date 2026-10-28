@@ -21,6 +21,8 @@ import mss
 import numpy as np
 
 import evaluator as ev
+import glyphs
+from fastmatch import FastMatcher
 import ocr
 import odds
 import preflop as pf
@@ -48,6 +50,12 @@ CARD_MAX_SAT = 50      # 카드 앞면 = 채도 낮은(흰/회색) 영역. 노�
 CARD_MIN_VALUE = (130, 90)  # 밝기 기준: 보통 카드 / 어둡게 처리된 카드(쇼다운 패배 카드 등)
 CARD_MIN_HEIGHT = 0.6  # 가장 큰 카드 대비 이보다 낮은 영역(글자 등)은 무시
 MERGED_RATIO = 1.7     # 다른 카드보다 이만큼 넓으면 붙어 있는 카드로 보고 분리
+CARD_ASPECT = 0.8      # 카드 1장의 폭/높이 (실측 0.75~0.85)
+MERGED_ASPECT = 1.2    # 혼자 있는 영역도 폭/높이가 이보다 크면 겹친 카드인지 경계를 찾아봄 (위가 잘린 1장 ≈ 1.1)
+WAIST_SPAN = (0.35, 0.65)  # 겹친 두 카드의 경계는 영역 폭의 이 범위 안에서만 찾음
+WAIST_DEPTH = 0.15     # 경계 = 윤곽이 높이의 이만큼 이상 파인 V자 홈 (기울어진 카드 모서리끼리 만나는 곳)
+WAIST_WIDTH = 0.1      # 홈은 좁아야 함(높이 대비). 잘린 숫자/무늬가 만드는 넓은 홈은 제외
+EDGE_LENGTH = 0.75     # 홈이 없으면 영역 안을 세로로 가로지르는 이 길이(높이 대비) 이상의 테두리 선을 경계로 봄
 TOP_THRESHOLD = 0.97   # 아래가 가려진 카드: 위쪽 절반 점수 기준
 TOP_MARGIN = 0.03      # 위쪽 절반 점수가 2등 카드보다 이만큼 높아야 인정 (K♣/K♠ 위쪽 최대 0.954)
 
@@ -121,22 +129,60 @@ def parse_label(text):
     return ev.card_str(ev.parse_card(text))
 
 
+def _overlap_split(img, contour, rect):
+    """겹쳐서 한 덩어리로 잡힌 두 카드의 경계 x(rect 기준). 못 찾으면 None.
+
+    1) 윤곽의 좁고 깊은 V자 홈: 기울어진 두 카드의 모서리가 만나는 곳
+    2) 덩어리 안쪽을 세로로 가로지르는 긴 선: 위에 놓인 카드의 테두리
+    """
+    x, y, w, h = rect
+    fill = np.zeros((h, w), np.uint8)
+    cv2.drawContours(fill, [contour - (x, y)], -1, 1, -1)  # 숫자/무늬 구멍은 채움
+    lo, hi = int(w * WAIST_SPAN[0]), int(w * WAIST_SPAN[1])
+    prof = fill.sum(0).astype(np.int32)
+    depth = np.minimum(np.maximum.accumulate(prof), np.maximum.accumulate(prof[::-1])[::-1]) - prof
+    k = max(2, int(WAIST_WIDTH * h))
+    for i in sorted(range(lo, hi + 1), key=lambda i: -depth[i]):
+        if depth[i] < WAIST_DEPTH * h:
+            break
+        if 2 * max(depth[max(0, i - k)], depth[min(w - 1, i + k)]) < depth[i]:
+            return i
+    gray = cv2.cvtColor(img[y:y + h, x:x + w], cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 40, 120) * cv2.erode(fill, np.ones((7, 7), np.uint8))
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, int(EDGE_LENGTH * h / 2),
+                            minLineLength=int(EDGE_LENGTH * h), maxLineGap=max(2, int(0.08 * h)))
+    best = None
+    for x1, y1, x2, y2 in (() if lines is None else lines[:, 0]):
+        mid = (int(x1) + int(x2)) // 2
+        if abs(int(x2) - int(x1)) <= 0.25 * abs(int(y2) - int(y1)) and lo <= mid <= hi:
+            if best is None or abs(int(y2) - int(y1)) > best[0]:
+                best = (abs(int(y2) - int(y1)), mid)
+    return None if best is None else best[1]
+
+
 def _card_rects(img, min_value):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     mask = ((hsv[:, :, 1] < CARD_MAX_SAT) & (hsv[:, :, 2] > min_value)).astype(np.uint8) * 255
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    rects = [r for r in (cv2.boundingRect(c) for c in contours) if r[3] >= 12]
-    if not rects:
+    blobs = [(r, c) for r, c in ((cv2.boundingRect(c), c) for c in contours) if r[3] >= 12]
+    if not blobs:
         return []
-    max_h = max(r[3] for r in rects)
-    rects = sorted((r for r in rects if r[3] >= CARD_MIN_HEIGHT * max_h), key=lambda r: r[0])
+    max_h = max(r[3] for r, _ in blobs)
+    blobs = sorted((b for b in blobs if b[0][3] >= CARD_MIN_HEIGHT * max_h), key=lambda b: b[0][0])
     # 카드가 서로 붙어 하나의 영역으로 잡힌 경우 보통 카드 폭 기준으로 균등 분할
-    widths = sorted(r[2] for r in rects)
+    widths = sorted(r[2] for r, _ in blobs)
     typical = widths[len(widths) // 2]
     split = []
-    for x, y, w, h in rects:
+    for (x, y, w, h), contour in blobs:
         n = max(1, round(w / typical)) if w > MERGED_RATIO * typical else 1
+        # 영역이 하나뿐이면(내 카드 2장이 겹친 경우 등) 위 기준으로는 못 나누므로 모양으로 판단
+        if n == 1 and w > MERGED_ASPECT * h:
+            cut = _overlap_split(img, contour, (x, y, w, h))
+            if cut is not None:
+                split += [(x, y, cut, h), (x + cut, y, w - cut, h)]
+                continue
+            n = max(1, int(w / (CARD_ASPECT * h)))  # 경계가 안 보이면 카드 2장 폭 이상일 때만 균등 분할
         split += [(x + i * w // n, y, w // n, h) for i in range(n)]
     return split
 
@@ -159,10 +205,14 @@ class Matcher:
     def __init__(self):
         TEMPLATE_DIR.mkdir(exist_ok=True)
         self.items = []
+        self.glyphs = glyphs.Prototypes()  # 숫자/무늬 원형 (통째로 학습 안 된 카드용)
+        self.fast = FastMatcher(norm_size=NORM_SIZE, inset=INSET, corner=CORNER)
         for f in sorted(TEMPLATE_DIR.glob("*.png")):
             img = cv2.imread(str(f))
             if img is not None:
                 self.items.append((f.stem.split("_")[0], img))
+                self.glyphs.add(f.stem.split("_")[0], img)
+                self.fast.add(f.stem.split("_")[0], img)
 
     @property
     def labels(self):
@@ -172,26 +222,23 @@ class Matcher:
         norm = cv2.resize(crop, NORM_SIZE, interpolation=cv2.INTER_AREA)
         cv2.imwrite(str(TEMPLATE_DIR / f"{label}_{int(time.time() * 1000)}.png"), norm)
         self.items.append((label, norm))
+        self.glyphs.add(label, norm)
+        self.fast.add(label, norm)
 
     def match(self, crop, threshold):
         """(라벨, 점수). 매칭 실패 시 UNKNOWN.
 
         1차: 카드 전체 + 모서리 비교 (밝기 변화에 무관 → 어둡게 처리된 카드도 그대로 인식)
         2차: 아래쪽이 가려진 경우(아바타 등) 위쪽 절반만 비교, 단 2등과 차이가 충분할 때만
+        3차: 숫자와 무늬를 따로 인식해 조합 (학습 안 된 카드, 예: 6♦ + A♣ 학습 → 6♣ 인식)
         """
         norm = cv2.resize(crop, NORM_SIZE, interpolation=cv2.INTER_AREA)
-        cw, ch = CORNER
-        top_h = NORM_SIZE[1] // 2
+        # 템플릿 전체를 한 번에 비교 (카드 전체 / 모서리 / 위쪽 절반). 모서리 점수로 무늬만 다른 카드를 낮춤
+        score, corner, upper = self.fast.scores(norm)
         full, top = {}, {}
-        for label, tpl in self.items:
-            score = float(cv2.matchTemplate(norm, tpl[INSET:-INSET, INSET:-INSET], cv2.TM_CCOEFF_NORMED).max())
-            # 모서리(숫자+무늬)를 따로 비교해 무늬만 다른 카드의 점수를 낮춤
-            corner = float(cv2.matchTemplate(norm[:ch + INSET // 2, :cw + INSET // 2],
-                                             tpl[INSET // 2:ch, INSET // 2:cw], cv2.TM_CCOEFF_NORMED).max())
-            upper = float(cv2.matchTemplate(norm[:top_h + INSET], tpl[INSET // 2:top_h, INSET:-INSET],
-                                            cv2.TM_CCOEFF_NORMED).max())
-            full[label] = max(full.get(label, -1.0), min(score, corner))
-            top[label] = max(top.get(label, -1.0), upper)
+        for label, s, up in zip(self.fast.labels, np.minimum(score, corner).tolist(), upper.tolist()):
+            full[label] = max(full.get(label, -1.0), s)
+            top[label] = max(top.get(label, -1.0), up)
         if not full:
             return UNKNOWN, 0.0
         label = max(full, key=full.get)
@@ -202,6 +249,9 @@ class Matcher:
         second = ranked[1] if len(ranked) > 1 else 0.0
         if top[label] >= TOP_THRESHOLD and top[label] - second >= TOP_MARGIN:
             return label, top[label]
+        found = self.glyphs.match(crop)
+        if found:
+            return found
         return UNKNOWN, full[max(full, key=full.get)]
 
 

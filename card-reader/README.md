@@ -24,5 +24,11 @@ pyinstaller --onefile --windowed --name CardReader --collect-all winrt reader.py
 
 ## 학습 데이터
 
-`templates/`에 게임 스크린샷에서 뽑은 카드 13장(Qc 4s Kc Jc 4d 9h Kh 2d Ks 5h 5c 8h 3c)이 들어 있다.
-exe로 쓸 때는 이 폴더를 exe 옆에 두면 된다. 나머지 카드는 실행 중 `[카드 학습]`으로 추가한다.
+`templates/`에 게임 화면에서 뽑은 실제 카드 템플릿이 들어 있다 (30종). exe로 쓸 때는 이 폴더를 exe 옆에 두면 된다.
+나머지 카드는 실행 중 `[카드 학습]`으로 추가한다.
+
+전체 카드 매칭이 실패하면 숫자와 무늬를 따로 인식해 조합한다 (`glyphs.py`, 예: 6♦와 A♣를 학습했으면 6♣ 인식).
+원형은 시작할 때 `templates/`의 실제 템플릿으로 만든다. 실제 샘플이 없는 숫자(7 등)는 `font_glyphs/`의 글꼴 숫자가
+경쟁자로만 쓰인다 (그 숫자가 이기면 `?`). exe로 쓸 때는 `font_glyphs/`도 exe 옆에 둔다.
+
+라벨이 틀린 템플릿은 `templates_quarantine/`으로 옮겨 둔다 (예: 7c로 저장됐던 J♣).
