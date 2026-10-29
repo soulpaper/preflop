@@ -78,8 +78,13 @@ class Recorder:
                 return
             calib = {k: v for k, v in calib.items() if k != "debug"}
             path = self.folder / "calib.json"
-            if path.exists():  # 녹화 중에 다시 보정: 이전 것은 번호 붙여 보관
-                path.rename(self.folder / f"calib_{int(time.time())}.json")
+            if path.exists():  # 녹화 중에 다시 보정: 이전 것은 번호 붙여 보관 (1초 안에 두 번이어도 이름이 겹치지 않게)
+                stamp, i = int(time.time()), 0
+                old = self.folder / f"calib_{stamp}.json"
+                while old.exists():
+                    i += 1
+                    old = self.folder / f"calib_{stamp}_{i}.json"
+                path.rename(old)
             path.write_text(json.dumps(_json(calib), ensure_ascii=False), encoding="utf-8")
         except Exception as exc:
             self._fail(exc)

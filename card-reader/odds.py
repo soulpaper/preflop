@@ -10,9 +10,11 @@ def parse_amount(text):
     text = text.strip().replace(",", "").replace(" ", "").lower()
     if not text:
         return None
-    m = re.fullmatch(r"(\d+(?:\.\d+)?)만(\d{1,4})", text)  # '84만 7500'
-    if m:
-        return float(m.group(1)) * 1e4 + float(m.group(2))
+    # 억·만 단위를 섞어 쓴 금액: '84만 7500', '1억 2000만', '1억2000만 5000', '3억 5000'
+    m = re.fullmatch(r"(?:(\d+(?:\.\d+)?)억)?(?:(\d+(?:\.\d+)?)만)?(\d+)?", text)
+    if m and sum(g is not None for g in m.groups()) >= 2 and (m.group(1) or m.group(2)) \
+            and len(m.group(3) or "") <= (4 if m.group(2) else 8):
+        return sum(float(g) * u for g, u in zip(m.groups(), (1e8, 1e4, 1)) if g)
     m = re.fullmatch(r"(\d+(?:\.\d+)?)(만|억|k|bb)?", text)
     if not m:
         return None
@@ -22,9 +24,9 @@ def parse_amount(text):
 
 def format_amount(value):
     if value >= 1e8:
-        return f"{value / 1e8:.2f}억".replace(".00억", "억")
-    if value >= 1e4:
-        return f"{value / 1e4:.1f}만".replace(".0만", "만")
+        return f"{value / 1e8:.2f}".rstrip("0").rstrip(".") + "억"
+    if value >= 1e4:  # 소수 둘째 자리까지 ('1.23만') — 한 자리면 입력칸에 되써질 때 12345 → 1.2만 = 12000 으로 2.8% 틀어졌다
+        return f"{value / 1e4:.2f}".rstrip("0").rstrip(".") + "만"
     return f"{value:,.0f}" if value == int(value) else f"{value:,.1f}"
 
 

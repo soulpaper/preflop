@@ -607,6 +607,57 @@ gto("4벳팟 리버 낮은 SPR(1.1) 탑페어 IP 비주도 → 체크", "체크"
 gto("4벳팟 턴 낮은 SPR(0.2) 페어+양차 vs 레이즈 → 올인", "올인", ["5h", "6h"], ["3c", "6d", "8c", "4h"], 87.5, 200.0, 75.0,
     137.5, 0.678, True, None, True, freq=0.88)
 
+# --- 감사 회귀 (fuzz_advisor.py 로 찾은 버그) -------------------------------------------------------------------
+import odds
+import preflop as pf
+
+# 1) 랜덤 기준 헤즈업 보정 에쿼티가 eq × (1 - 0.5) 에 묶여, 오버벳·올인에 리버 너트(KQ 스트레이트, 99.5%)도 폴드했다
+NUT = dict(hero=["Kh", "Qd"], board=["2c", "7d", "9h", "Ts", "Js"], players=6, opponents_in_hand=1, hero_pos="BB",
+           villain_pos="BTN", to_act=True, can_check=False, equity=eqv(["Kh", "Qd"], ["2c", "7d", "9h", "Ts", "Js"], 1))
+_r = check("감사: 리버 너트 vs 팟 2배 오버벳 → 폴드 아님",
+           dict(NUT, stack_bb=300, my_stack=300, pot=40, pot_total=120, call=80), "올인")
+check("감사: 리버 너트 vs 팟 2배 올인 → 올인 콜", dict(NUT, stack_bb=80, my_stack=80, pot=40, pot_total=120, call=80,
+                                              facing_allin=True), "콜", 80)
+results.append((advisor._adj_equity(advisor._Ctx(dict(NUT, pot=40, call=80)), 0.40, "air", "하이카드", False, 1.0)[0] == 0.20,
+                "감사: 너트 바닥(NUT_K)은 낮은 에쿼티의 보정에 영향 없음 (0.40 → 0.20)", _r))
+# 2) 콜 금액이 스택보다 크면(숏스택 올인 콜) 실제로 내는 스택 기준 팟 오즈 — 예전엔 44BB 벳 기준 17% 로 계산해 폴드
+check("감사: 4.4BB 남은 숏스택 vs 44BB 올인, 팟 178BB → 올인 콜 4.4BB",
+      dict(hero=["Ac", "5c"], board=["9h", "9d", "Qh", "2h"], opponents_in_hand=1, stack_bb=4.4, my_stack=4.4, pot=178.1,
+           pot_total=222.6, call=44.5, to_act=True, can_check=False, equity=0.45, facing_allin=True), "콜", 4.4, 0.05,
+      detail_has="필요 승률 2%")
+check("감사: 콜 사이즈는 유효 스택을 넘지 않음 (my_stack 없음)",
+      dict(hero=["5c", "7s"], board=["7c", "Js", "3d", "6d"], opponents_in_hand=3, stack_bb=11.58, pot=79.26, pot_total=138.71,
+           call=59.45, to_act=True, can_check=False, equity=0.9, facing_allin=True), "콜", 11.6, 0.05)
+# 3) 필요 승률 표기에 스타일 가감(call_adj)이 빠져 '필요 20%+21% > 보정 에쿼티 44%' 처럼 숫자와 부등호가 어긋났다
+check("감사: 필요 승률 표기에 스타일 가감 포함",
+      dict(hero=["Kd", "6d"], board=["3h", "4s", "9d"], opponents_in_hand=1, pot=296.17, call=97.74, to_act=True,
+           can_check=False, equity=0.5417, looseness=-0.94, aggressor=True), "폴드", detail_has="+3%(스타일)")
+# 4) 헤즈업 올인 최소 에쿼티(턴 85%)를 팟 1/4 올인(필요 17%)에도 그대로 적용해 70% 에쿼티로 폴드 + 이유가 수치와 모순
+check("감사: 팟 1/4 짜리 작은 올인 → 에쿼티 70% 로 콜",
+      dict(hero=["Ah", "Td"], board=["2c", "7d", "9h", "Js"], opponents_in_hand=1, stack_bb=10, my_stack=10, pot=40,
+           pot_total=50, call=10, to_act=True, can_check=False, equity=0.70, facing_allin=True), "콜", 10)
+check("감사: 큰 올인을 최소 에쿼티로 접을 땐 이유에 그 기준을 적음",
+      dict(hero=["Ah", "Td"], board=["2c", "7d", "9h", "Js"], opponents_in_hand=1, stack_bb=40, my_stack=40, pot=80,
+           pot_total=120, call=40, to_act=True, can_check=False, equity=0.80, facing_allin=True), "폴드", reason_has="이상만")
+# 5) 프리플랍 표: 3벳 폭을 줄일 때(타이트 스타일·깊은 스택) 빠진 3벳 핸드가 콜로 가지 않고 폴드가 됐다 (BB/SB vs UTG 의 AKo)
+_bad = []
+for _h, _v, _st in (("BB", "UTG", 40), ("SB", "UTG", 100), ("BB", "UTG", 100), ("SB", "MP", 60)):
+    for _L in (-1.0, -0.8, -0.6, -0.3, 0.0):
+        for _n in (6, 9):
+            _v2 = _v if _v in pf.seats(_n) else "UTG"
+            _u = set().union(*(a[1] for a in pf.ranges("vsopen", _h, _v2, _n, _st, False, _L)))
+            if not {"AA", "KK", "QQ", "JJ", "AKs", "AKo"} <= _u:
+                _bad.append((_h, _v2, _n, _st, _L))
+results.append((not _bad, f"감사: vs 오픈 표에서 JJ+/AK 는 어떤 스타일에서도 폴드 아님 {_bad[:3]}", _r))
+# 6) odds: 억·만 섞인 금액, format_amount 정밀도 (입력칸에 되써질 때 12345 → '1.2만' = 12000)
+_pa = {"1억 2000만": 1.2e8, "1억2000만 5000": 120005000, "3억 5000": 300005000, "84만 7500": 847500, "1.5BB": 1.5,
+       "0BB": 0.0, "13만": 130000, "1억": 1e8, "abc": None, "": None}
+_got = {t: odds.parse_amount(t) for t in _pa}
+results.append((_got == _pa, f"감사: parse_amount 억·만 혼합 {_got}", _r))
+results.append((odds.format_amount(12345) == "1.23만" and odds.format_amount(847500) == "84.75만"
+                and odds.format_amount(130000) == "13만" and odds.format_amount(1.2e8) == "1.2억",
+                "감사: format_amount 만 단위 소수 둘째 자리", _r))
+
 # --- GTO 라이브러리 연동 (solverlib 를 가짜로 바꿔 주/보조 게이팅 확인; 풀린 플랍과 무관) -------------------------------
 import solverlib
 

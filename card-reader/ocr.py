@@ -129,9 +129,9 @@ def candidates(text):
     m = re.search(r"(\d+(?:\.\d+)?)BB", t)
     if m:
         return float(m.group(1)), "BB", True
-    m = re.search(r"(\d+)만(\d{1,4})?", t)
+    m = re.search(r"(\d+(?:\.\d+)?)만(\d{1,4})?", t)   # '1.5만' = 15000 (예전엔 소수점 뒤 '5만'만 잡혀 50000)
     if m:
-        return int(m.group(1)) * 10000 + int(m.group(2) or 0), "만", True
+        return int(round(float(m.group(1)) * 10000)) + int(m.group(2) or 0), "만", True
     m = re.search(r"(\d+(?:\.\d+)?)([^\d.]*)(\d{1,4})?", t)
     if not m:
         return None

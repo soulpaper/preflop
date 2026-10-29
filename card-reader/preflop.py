@@ -306,6 +306,9 @@ def _hand_key_3bet(h):
     return i * (0.9 if len(h) == 2 else 0.8 if h[2] == "s" else 1.0)
 
 
+_RANK = {h: i for i, h in enumerate(DATA["G"])}
+
+
 def _fit(base, target_pct, key, exclude=()):
     """base 를 target_pct(콤보 %) 폭으로. 넓힐 땐 key 가 낮은 핸드부터 추가, 줄일 땐 key 가 높은 핸드부터 제거."""
     base = set(base)
@@ -318,7 +321,8 @@ def _fit(base, target_pct, key, exclude=()):
             base.add(h)
             cur += combos(h)
     elif limit < cur - 1e-9:
-        for h in sorted(base, key=key, reverse=True):
+        # 동점 key 는 강도 순위로 (set 순서 = PYTHONHASHSEED 에 따라 실행마다 다른 핸드가 빠지지 않게)
+        for h in sorted(base, key=lambda h: (key(h), _RANK[h]), reverse=True):
             if cur <= limit + 1e-9:
                 break
             base.discard(h)
@@ -361,8 +365,14 @@ def defend_ranges(tb, call, hero, villain, players, ante=False, style="standard"
             t_tb += sp["ante_defend"] * max(0.0, tgt[1] - cur_tb)
     t_all *= sp["defend"]
     t_tb = min(t_tb * sp["defend"] * sp["threebet"] * (depth_mult(DEPTH_3BET, stack_bb) if stack_bb else 1.0), t_all)
+    moved = set()
     if abs(t_tb - cur_tb) > 1e-9:
-        tb = _fit(tb, t_tb, _hand_key_3bet)
+        new_tb = _fit(tb, t_tb, _hand_key_3bet)
+        # 3벳 폭을 줄일 때 빠진 핸드는 폴드가 아니라 콜로 (콜 폭을 줄일 때도 맨 나중에 뺀다).
+        # 예전엔 타이트 스타일·깊은 스택 BB/SB vs UTG 에서 AKo 가 3벳에서 빠지며 그대로 폴드였다.
+        moved = tb - new_tb
+        call |= moved
+        tb = new_tb
     call_t = max(0.0, t_all - range_pct(tb))
     key = _hand_key_call
     call = call - tb
@@ -370,7 +380,8 @@ def defend_ranges(tb, call, hero, villain, players, ante=False, style="standard"
         # 1) 얕은 스택(30BB 아래부터 연속, 18BB 이하 전부): 투기 핸드를 콜 범위에서 약한 것부터 뺀다 (내재 배당이 없다)
         f = min(1.0, max(0.0, (30 - stack_bb) / 12))
         if f > 0:
-            spec_hands = sorted((h for h in call if is_speculative(h)), key=_hand_key_call, reverse=True)
+            spec_hands = sorted((h for h in call if is_speculative(h)), key=lambda h: (_hand_key_call(h), _RANK[h]),
+                                reverse=True)
             goal, removed = f * sum(combos(h) for h in spec_hands), 0
             for h in spec_hands:
                 if removed >= goal - 1e-9:
@@ -384,7 +395,8 @@ def defend_ranges(tb, call, hero, villain, players, ante=False, style="standard"
             call_t = cur + min(1.0, max(0.0, (stack_bb - 20) / 15)) * (call_t - cur)
         spec = depth_mult(DEPTH_SPEC, stack_bb)
         key = lambda h: _hand_key_call(h) + (60 * spec if is_speculative(h) else 0.0)
-    call = _fit(call, call_t, key, exclude=tb)
+    base_key = key
+    call = _fit(call, call_t, lambda h: base_key(h) - (1e3 if h in moved else 0.0), exclude=tb)
     return tb, call
 
 

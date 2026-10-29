@@ -241,6 +241,12 @@ t = time.perf_counter()
 hr.estimate(many, B5T, 9, dead=["Ah", "Qd"])
 print(f"  5명 동시(콜드): {(time.perf_counter() - t) * 1000:.1f} ms 총 / {(time.perf_counter() - t) * 200:.1f} ms 상대당")
 
+# --- 회귀: 보드 dict 의 문자열 플랍 --------------------------------------------------------------------
+_r1 = hr.estimate({"V": {"pos": "CO", "preflop": ["open"], "flop": ["bet"]}}, {"flop": "As7d2c"}, 9)["V"]
+_r2 = hr.estimate({"V": {"pos": "CO", "preflop": ["open"], "flop": ["bet"]}}, {"flop": ["As", "7d", "2c"]}, 9)["V"]
+test("board dict flop 문자열 'As7d2c' 도 플랍으로 반영", _r1["n_actions"] == 1 and _r1["range"] == _r2["range"],
+     f"{_r1['street']} {_r1['n_actions']}")
+
 # --- 결과 ---------------------------------------------------------------------------------------
 failed = 0
 for ok, name, info in results:

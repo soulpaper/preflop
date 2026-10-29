@@ -49,6 +49,7 @@ except Exception:
 BASE = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 CONFIG_PATH = BASE / "config.json"
 TEMPLATE_DIR = BASE / "templates"
+NEG_DIR = BASE / "templates_neg"   # [학습]에서 '카드 아님'으로 표시한 덩어리 (사용자 로컬 데이터)
 LOG_PATH = BASE / "debug.log"
 LOG_MAX = 1_000_000     # 이 크기를 넘으면 debug.log.1 로 넘기고 새로 씀
 
@@ -92,6 +93,8 @@ WAIST_WIDTH = 0.1      # 홈은 좁아야 함(높이 대비). 잘린 숫자/무�
 EDGE_LENGTH = 0.75     # 홈이 없으면 영역 안을 세로로 가로지르는 이 길이(높이 대비) 이상의 테두리 선을 경계로 봄
 TOP_THRESHOLD = 0.97   # 아래가 가려진 카드: 위쪽 절반 점수 기준
 TOP_MARGIN = 0.03      # 위쪽 절반 점수가 2등 카드보다 이만큼 높아야 인정 (K♣/K♠ 위쪽 최대 0.954)
+NEG_THRESHOLD = 0.90   # '카드 아님' 템플릿 점수가 이 이상이면 버림 (카드 템플릿 점수가 인정 기준 미만일 때만).
+                       # 실측: 휴식 타이머의 같은 숫자 '0' 끼리 0.997 (다른 숫자는 0.38 이하), 실제 카드 crop 65장의 최고 '카드 아님' 점수 0.51
 
 DEFAULT_CONFIG = {
     "regions": {},
@@ -193,12 +196,26 @@ NODRAG_TAGS = ("btn_", "badge", "tab", "sum")  # 이 태그가 붙은 것을 누
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():
-        cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+        try:
+            saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            if not isinstance(saved, dict):
+                raise ValueError("config.json 이 객체가 아님")
+            cfg.update(saved)
+        except (ValueError, OSError):  # 깨진 설정(쓰는 도중 꺼짐 등) 때문에 앱이 안 켜지면 안 됨 → 옮겨 두고 기본값
+            log_debug("load_config")
+            try:
+                os.replace(CONFIG_PATH, CONFIG_PATH.with_name("config.json.bad"))
+            except OSError:
+                pass
     return cfg
 
 
 def save_config(cfg):
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+    """임시 파일에 다 쓴 뒤 바꿔치기 → 쓰는 도중 꺼져도 config.json 이 반쯤 쓰인 채로 남지 않음.
+    (상태 스레드가 cfg 에 키를 더할 수 있어 얕은 사본을 직렬화)"""
+    tmp = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
+    tmp.write_text(json.dumps(dict(cfg), indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, CONFIG_PATH)
 
 
 def grab(sct, rect):
@@ -374,6 +391,27 @@ def is_card_back(crop):
             and v.std() < BACK_MAX_STD)
 
 
+CARD_ASPECT_RANGE = (0.9, 2.0)  # 카드 후보의 높이/폭 (앞면 실측 1.20~1.46, 위가 잘린 내 카드는 더 납작, 겹친 뒷면 1.81)
+CARD_MIN_FACE = 0.3             # 카드 후보에서 밝은 저채도(카드 면) 픽셀 비율 최소 (실측 앞면 0.41 이상)
+
+def looks_like_card(crop):
+    """템플릿과 맞지 않는 밝은 덩어리가 정말 카드 앞면인가 (아니면 버림 → '?' 로 보이지 않음).
+    휴식 타이머 숫자('01:06')·로고 같은 흰 글자는 큰 글리프만 있고 코너 숫자/무늬가 없다.
+    카드 = 그럴듯한 비율 + 카드 면이 충분 + 큰 숫자와 코너 숫자·무늬(위가 잘렸으면 코너 무늬만)가 면 안에 있음."""
+    h, w = crop.shape[:2]
+    if w < 4 or h < 4 or not CARD_ASPECT_RANGE[0] <= h / w <= CARD_ASPECT_RANGE[1]:
+        return False
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    face = ((hsv[:, :, 1] < CARD_MAX_SAT) & (hsv[:, :, 2] > CARD_MIN_VALUE[1])).mean()
+    if face < CARD_MIN_FACE:
+        return False
+    seg = glyphs.segment(crop)
+    parts = seg["parts"] if seg else {}
+    # 코너 줄이 하나뿐이면 glyphs 가 무늬(corner_suit)로 둔다. 글리프 크기·비율은 실제 카드끼리도 편차가 커서
+    # (큰 숫자 높이 0.37~0.73, 잘린 코너 등) 기준으로 쓰지 않는다 — 템플릿 46장 중 45장 통과, 타이머 숫자 0/4
+    return "big" in parts and "corner_suit" in parts
+
+
 def detect_cards(img):
     """영역 이미지에서 카드들을 찾아 왼쪽→오른쪽 순서의 crop 리스트로 반환.
 
@@ -400,6 +438,34 @@ class Matcher:
                 self.items.append((f.stem.split("_")[0], img))
                 self.glyphs.add(f.stem.split("_")[0], img)
                 self.fast.add(f.stem.split("_")[0], img)
+        # '카드 아님'으로 학습한 덩어리 (카드 라벨·글리프 원형과 섞지 않는 별도 비교기)
+        self.neg = FastMatcher(norm_size=NORM_SIZE, inset=INSET, corner=CORNER)
+        for f in sorted(NEG_DIR.glob("*.png")) if NEG_DIR.is_dir() else []:
+            img = cv2.imread(str(f))
+            if img is not None:
+                self.neg.add("neg", cv2.resize(img, NORM_SIZE, interpolation=cv2.INTER_AREA))
+
+    def add_negative(self, crop):
+        """[학습]에서 '카드 아님'으로 표시한 crop 을 저장하고 바로 반영."""
+        NEG_DIR.mkdir(exist_ok=True)
+        norm = cv2.resize(crop, NORM_SIZE, interpolation=cv2.INTER_AREA)
+        ts = int(time.time() * 1000)
+        while (NEG_DIR / f"neg_{ts}.png").exists():  # 한 번에 여러 장 저장해도 이름이 겹치지 않게
+            ts += 1
+        cv2.imwrite(str(NEG_DIR / f"neg_{ts}.png"), norm)
+        self.neg.add("neg", norm)
+
+    def is_negative(self, crop, threshold):
+        """'카드 아님' 템플릿과 강하게 같고(NEG_THRESHOLD 이상) 카드 템플릿과는 인정 기준(전체 threshold / 위쪽 절반
+        TOP_THRESHOLD)만큼 맞지 않으면 True. 둘 다 맞으면 카드 쪽이 이긴다 (진짜 카드는 절대 버리지 않음)."""
+        if not len(self.neg):
+            return False
+        norm = cv2.resize(crop, NORM_SIZE, interpolation=cv2.INTER_AREA)
+        if float(self.neg.scores(norm)[0].max()) < NEG_THRESHOLD:
+            return False
+        score, corner, upper = self.fast.scores(norm)
+        return not (len(score) and (float(np.minimum(score, corner).max()) >= threshold
+                                    or float(upper.max()) >= TOP_THRESHOLD))
 
     @property
     def labels(self):
@@ -685,7 +751,8 @@ class LearnDialog:
             anchor="w", padx=20, pady=(16, 2))
         tk.Label(self.win, bg=BG, fg=MUTED, font=(F_UI, 9), justify="left",
                  text="화면에서 찾은 카드입니다. 틀렸거나 ? 인 칸에 카드를 입력하세요.\n"
-                      "예: Ah  Td  10s  7c   ·   비워 두거나 ? 이면 저장하지 않습니다.").pack(
+                      "예: Ah  Td  10s  7c   ·   비워 두거나 ? 이면 저장하지 않습니다.\n"
+                      "카드가 아닌데 잡힌 것(타이머 숫자·로고 등)은 [카드 아님]을 누르면 다음부터 무시합니다.").pack(
             anchor="w", padx=20, pady=(0, 12))
 
         self.photos, self.entries = [], []
@@ -708,7 +775,12 @@ class LearnDialog:
                                  highlightcolor=ACCENT)
                 entry.insert(0, label)
                 entry.grid(row=2, column=i, padx=5, pady=(8, 0), ipady=3)
-                self.entries.append((entry, crop, label))
+                neg = tk.BooleanVar(value=False)
+                toggle = tk.Label(box, text="카드 아님", bg=CHIP, fg=MUTED, font=(F_UI, 11, "bold"),
+                                  padx=8, pady=4, cursor="hand2")
+                toggle.grid(row=3, column=i, padx=5, pady=(6, 0))
+                toggle.bind("<Button-1>", lambda e, v=neg, t=toggle, en=entry: self._toggle_neg(v, t, en))
+                self.entries.append((entry, crop, label, neg))
 
         self.error = tk.Label(self.win, bg=BG, fg=LOSE_C, font=(F_UI, 9))
         self.error.pack(anchor="w", padx=20)
@@ -729,19 +801,31 @@ class LearnDialog:
         b.bind("<Leave>", lambda e: b.config(bg=normal))
         return b
 
+    @staticmethod
+    def _toggle_neg(var, toggle, entry):
+        """[카드 아님] 켜기/끄기: 켜면 라벨 칸은 쓰지 않음 (저장 때 '카드 아님' 템플릿으로)."""
+        var.set(not var.get())
+        on = var.get()
+        toggle.config(bg=LOSE_C if on else CHIP, fg=BG if on else MUTED)
+        entry.config(state="disabled" if on else "normal", disabledbackground=PANEL)
+
     def save(self):
-        try:
-            labels = [(parse_label(e.get()), crop, old) for e, crop, old in self.entries]
+        try:  # '카드 아님'으로 표시한 칸은 라벨을 읽지 않는다
+            labels = [(None if neg.get() else parse_label(e.get()), crop, old, neg.get())
+                      for e, crop, old, neg in self.entries]
         except ValueError as exc:
             self.error.config(text=str(exc))
             return
-        saved = 0
-        for label, crop, old in labels:
-            if label is not None and label != old:
+        saved = negs = 0
+        for label, crop, old, neg in labels:
+            if neg:
+                self.matcher.add_negative(crop)
+                negs += 1
+            elif label is not None and label != old:
                 self.matcher.add(label, crop)
                 saved += 1
         self.win.destroy()
-        self.on_saved(saved)
+        self.on_saved(saved, negs)
 
 
 # --- 자동 지정 확인 -----------------------------------------------------------
@@ -1102,6 +1186,7 @@ class App:
             "loose_up": Button(self, "loose_up", lambda: self.step_looseness(1)),
         }
         self.make_inputs()
+        self.reset_ocr()  # 저장돼 있던 팟·콜 금액도 자동 값으로 (화면에서 사라지면 지움)
         self.root.bind("<Configure>", self.on_configure)
         self.canvas.bind("<ButtonPress-1>", self.drag_press, add="+")
         self.canvas.bind("<B1-Motion>", self.drag_move, add="+")
@@ -1405,7 +1490,11 @@ class App:
                     self.ocr_queue.put({"error": str(exc)})
 
     def reset_ocr(self):
-        self.ocr_values, self.ocr_pending, self.ocr_written = {}, None, {}
+        """화면 자동 입력 상태 초기화. 팟·콜 금액 칸에 이미 들어 있는 값(지난 실행에서 저장된 값 등)도 자동 값으로 본다 →
+        콜 버튼·POT 가 사라지면 지울 수 있게 (안 그러면 다시 켠 뒤 지난 핸드의 '팟 7.5BB · 콜 1BB' 가 계속 남음)."""
+        inputs = getattr(self, "inputs", None) or {}
+        self.ocr_values, self.ocr_pending = {}, None
+        self.ocr_written = {k: inputs[k].get() for k in ("pot", "bet") if k in inputs and inputs[k].get()}
 
     def apply_ocr(self):
         values = None
@@ -1425,8 +1514,19 @@ class App:
         for key in ("pot", "my_stack"):  # "pot": 예전 방식 영역 (읽은 값을 그대로 팟으로)
             if values.get(key):
                 self.auto_set(key, ocr.format_value(*values[key]))
-        if values.get("call"):  # 콜 버튼 금액 = 상대 벳. 내 차례에만 보임 → 안 보이면 입력값을 그대로 둠
+        if values.get("call"):  # 콜 버튼 금액 = 상대 벳 (내 차례/미리 선택 때만 보임)
             self.auto_set("bet", ocr.format_value(*values["call"]))
+        elif "call" in (self.cfg.get("number_regions") or {}) and self.ocr_written.get("bet") \
+                and self.inputs["bet"].get() == self.ocr_written["bet"]:
+            # 버튼이 사라짐 = 지금 콜할 벳 없음. 자동으로 넣었던 예전 콜 금액이 남아 있으면 다음 스트리트 팟에서
+            # 빠져 팟 오즈가 50% 가까이 튐 → 지운다 (직접 입력한 값은 그대로)
+            self.ocr_written["bet"] = ""
+            self.set_input("bet", "")
+        if "pot_total" in (self.cfg.get("number_regions") or {}) and not values.get("pot_total") \
+                and self.ocr_written.get("pot") and self.inputs["pot"].get() == self.ocr_written["pot"]:
+            # 화면 POT 가 안 보임 = 진행 중인 핸드 없음 (휴식·핸드 사이) → 지난 핸드 팟을 지금 값처럼 두지 않는다
+            self.ocr_written["pot"] = ""
+            self.set_input("pot", "")
         self.fill_pot()
         opp = self.villain_stack()
         if opp:
@@ -1525,7 +1625,8 @@ class App:
             self.show_toast("먼저 [자동 지정] 또는 [카드]로 영역을 지정하세요")
             return
         LearnDialog(self.root, dict(self.detected), self.matcher,
-                    lambda n: (self.show_toast(f"카드 {n}장을 학습했습니다"), self.reset_state()))
+                    lambda n, k=0: (self.show_toast(f"카드 {n}장을 학습했습니다" + (f" · 카드 아님 {k}개" if k else "")),
+                                    self.reset_state()))
 
     def change_opponents(self, delta):
         self.cfg["opponents"] = max(1, min(9, self.opponents() + delta))
@@ -1660,9 +1761,10 @@ class App:
 
     def track_frame(self, img, calib, st, now):
         """프레임 하나: 기록 모드 → 닉네임 → 핸드 기록 → 통계 → (내 차례에만) 상대 핸드 리딩."""
-        view = self.view
-        hero = [c for c in view.get("hero", []) if ev.is_card(c)]
-        board = [c for c in view.get("board", []) if ev.is_card(c)]
+        # 폴드 후 복기 화면(fold_view)은 지난 핸드 카드를 보여주므로, 핸드 기록에는 실제 화면 카드를 넘긴다
+        live_hero, live_board = getattr(self, "live_cards", None) or (self.view.get("hero", []), self.view.get("board", []))
+        hero = [c for c in live_hero if ev.is_card(c)]
+        board = [c for c in live_board if ev.is_card(c)]
         if calib is not None and calib is not self.calib_seen:
             self.calib_seen = calib
             self.track_new_session(calib)
@@ -1705,7 +1807,8 @@ class App:
     def refresh_reads(self, reads, st, hero, board, live, profiles):
         """남은 상대가 바뀌었거나 새 액션이 있으면 상대 예상을 다시 계산 (아니면 그대로)."""
         in_hand = sorted(x["key"] for x in st["seats"] if x.get("in_hand") and x["key"] != "hero" and x["key"] in live)
-        key = (tuple(hero), tuple(board), tuple(in_hand), repr([live[k] for k in in_hand]))
+        ante = bool((odds.parse_amount((self.cfg.get("inputs") or {}).get("ante")) or 0) > 0)
+        key = (tuple(hero), tuple(board), tuple(in_hand), repr([live[k] for k in in_hand]), ante, self.looseness())
         if in_hand and (reads is None or reads["key"] != key):
             reads = self.make_reads(st, hero, board, live, profiles, in_hand, key)
         return reads
@@ -1793,6 +1896,16 @@ class App:
                 self.schedule_advice()
             return
         self.state_errors = 0
+        if st.get("layout_ok") is False:  # 게임 창이 옮겨졌거나 크기가 바뀜 → 잘못된 인원/포지션을 쓰지 않음
+            self.layout_bad = getattr(self, "layout_bad", 0) + 1
+            if self.layout_bad >= 3:
+                if self.table_state is not None:
+                    self.table_state, self.state_key = None, None
+                    self.schedule_advice()
+                if self.layout_bad % 30 == 3:  # 약 30초마다 한 번만 알림
+                    self.show_toast("게임 창 위치·크기가 바뀐 것 같습니다 — [자동 지정]을 다시 해 주세요")
+            return
+        self.layout_bad = 0
         key = repr([st.get(k) for k in STATE_KEYS])
         if key != self.state_pending:  # 같은 결과가 두 번 연속 나와야 반영
             self.state_pending = key
@@ -2009,8 +2122,8 @@ class App:
             return (f"추천 대기: {where} 학습 필요 (?) —", "warn", ("learn",))
         if title in ("딜링 중", "중복 인식"):
             return ("추천 대기: 카드 인식 중", "info", ())
-        if title == "핸드 대기 중":
-            return ("추천 대기: 내 카드 2장이 보이면 시작", "info", ())
+        if title == "핸드 대기 중":  # 카드가 안 돌았음 (핸드 사이·휴식 타이머)
+            return ("핸드 대기 / 휴식 중 — 내 카드 2장이 보이면 시작", "info", ())
         if why == "noequity":
             if not self.heavy_allowed():
                 return (self.wait_text(), "info", ("calc",))
@@ -2075,19 +2188,22 @@ class App:
             self.advice_why = "noequity"
             return None
         st = self.preflop_state()
-        bb = self.amount("bb")
 
-        def in_bb(v):  # 추천 모듈은 BB 단위
-            return round(v / bb, 2) if v is not None and bb else None
+        def in_bb(key):  # 추천 모듈은 BB 단위. 입력칸마다 단위(BB/칩)가 달라도 맞게 (amount_bb)
+            v = self.amount_bb(key)
+            return round(v, 2) if v is not None else None
         board = res["board"]
-        pot = self.amount("pot")
-        call = in_bb(self.amount("bet"))
+        pot = in_bb("pot")
+        call = in_bb("bet")
         if ts.get("to_act") is not None:  # 테이블 상태의 콜 금액은 이미 BB 단위. 내 차례가 아니면 콜 금액 없음
             ts_call = _number(ts.get("call"))
             call = ts_call if ts_call is not None else (call if ts.get("to_act") else None)
         total = self.ocr_values.get("pot_total") if self.cfg.get("auto_numbers") else None
-        pot_total = _number(total)
-        ante = self.amount("ante")
+        pot_total = None
+        if total:  # OCR (값, 단위): 'BB' 표기면 그대로, '만' 이면 칩
+            pot_total = self.bb_value(_number(total), {"BB": "BB", "만": "chips"}.get(total[1]))
+            pot_total = round(pot_total, 2) if pot_total is not None else None
+        ante = in_bb("ante")
         facing_allin = bool(ts.get("facing_allin")) or any(
             isinstance(seat, dict) and seat.get("in_hand", True) and seat.get("allin")
             and (_number(seat.get("bet")) or 0) > 0 for seat in ts.get("seats") or [])
@@ -2109,13 +2225,13 @@ class App:
             "villain_pos": st.get("villain") if st["villains"] else None,
             "stack_bb": st["stack_bb"],   # 프리플랍 가이드 격자와 같은 유효 스택
             "looseness": self.looseness(),
-            "my_stack": in_bb(self.amount("my_stack")),
-            "pot": in_bb(pot),
-            "pot_total": in_bb(pot_total),
+            "my_stack": in_bb("my_stack"),
+            "pot": pot,
+            "pot_total": pot_total,
             "call": call,
             "to_act": ts.get("to_act"),
             "can_check": ts.get("can_check"),
-            "ante": in_bb(ante) if ante else False,
+            "ante": ante if ante else False,
             "equity": res["equity"]["equity"],
             "outs": res.get("outs"),
             "hand_name": res["hand"],
@@ -2123,9 +2239,9 @@ class App:
         }
         if board:  # 포스트플랍: 위치·주도권·라인 (프리플랍 선택값 대신 이번 핸드에서 읽은 값으로 덮어쓴다)
             try:
-                turn_pot = in_bb(pot)
+                turn_pot = pot
                 if turn_pot is None and pot_total and call is not None:
-                    turn_pot = in_bb(pot_total) - call
+                    turn_pot = pot_total - call
                 ctx.update(self.postflop_ctx(ts, hero_str, len(board), res["opponents"], turn_pot))
             except Exception:
                 self.log_once("postflop_ctx")
@@ -2159,7 +2275,8 @@ class App:
                 self.root.after(self.cfg["interval_ms"], self.tick)
 
     def read_cards(self, key, img):
-        """영역 이미지 → [(crop, 라벨)]. 자리별로 카드 그림이 그대로면(반짝임·노이즈 무시) 지난 라벨을 재사용."""
+        """영역 이미지 → [(crop, 라벨)]. 자리별로 카드 그림이 그대로면(반짝임·노이즈 무시) 지난 라벨을 재사용.
+        템플릿과 안 맞고 카드 모양도 아닌 덩어리는 버린다 (캐시에는 라벨 None 으로 기억)."""
         crops = detect_cards(img)
         cache = self.card_cache.get(key)
         if cache is None or len(cache) != len(crops):
@@ -2172,8 +2289,13 @@ class App:
                 label = hit[1]
             else:
                 label = BACK if is_card_back(crop) else self.matcher.match(crop, self.cfg["threshold"])[0]
+                if label != BACK and self.matcher.is_negative(crop, self.cfg["threshold"]):
+                    label = None  # [학습]에서 '카드 아님'으로 표시한 것
+                elif label == UNKNOWN and not looks_like_card(crop):
+                    label = None  # 카드가 아님 (휴식 타이머 숫자·로고 등) → '?' 로 보이지 않게 버림
                 cache[i] = (sig, label)
-            out.append((crop, label))
+            if label is not None:
+                out.append((crop, label))
         self.card_cache[key] = cache
         return out
 
@@ -2186,6 +2308,7 @@ class App:
         self.detected = {key: self.read_cards(key, grab(self.sct, regions[key])) for key, _ in REGIONS}
         hero = self.hold("hero", [label for _, label in self.detected["hero"]][:2])
         board = self.hold("board", [label for _, label in self.detected["board"] if label != BACK][:5])
+        self.live_cards = (list(hero), list(board))  # 실제 화면 (폴드 후 복기 화면과 별개, 핸드 기록용)
         state = self.read_state(hero, board)
 
         # 같은 결과가 두 번 연속 나와야 화면에 반영 (딜링/뒤집기 애니메이션 중 깜빡임 방지)
@@ -3234,6 +3357,10 @@ class App:
         """상태 칩 한 줄 (넘치면 줄바꿈)."""
         s = self.s
         board = [b for b in self.view.get("board", []) if ev.is_card(b)]
+        if _number(ts.get("in_hand")) == 0 and not ts.get("hero_in_hand"):
+            # 아무도 카드를 받지 않음 (휴식 타이머·핸드 사이): '1명 중 0명 참여 · 프리플랍 · 대기' 대신 한 칩
+            chips = [("핸드 대기 / 휴식 중", MUTED)]
+            return self._chip_row(c, x0, y, width, chips)
         chips = [(STREET_NAMES.get(len(board), "딜링 중"), TEXT)]
         if ts.get("hero_pos"):
             chips.append((str(ts["hero_pos"]), TEXT))
@@ -3252,6 +3379,11 @@ class App:
             chips.append((f"콜 {round(call, 1):g}BB", TEXT))
         elif ts.get("can_check") and ts.get("to_act"):
             chips.append(("체크 가능", TEXT))
+        return self._chip_row(c, x0, y, width, chips)
+
+    def _chip_row(self, c, x0, y, width, chips):
+        """[(글자, 색)] 칩들을 한 줄로 (넘치면 줄바꿈). 마지막 줄 아래 y."""
+        s = self.s
         h = self.measure("가", FS_BODY) + s(12)
         x = x0
         for text, color in chips:
@@ -3453,14 +3585,13 @@ class App:
             st["players"] = max(6, min(10, int(st["players"])))
         except (TypeError, ValueError):
             st["players"] = DEFAULT_PREFLOP["players"]
-        stacks = [v for v in (self.amount("my_stack"), self.amount("opp_stack")) if v] if self.inputs else []
-        bb = self.amount("bb") if self.inputs else None
-        st["stack_bb"] = min(stacks) / bb if stacks and bb else None
+        stacks = [v for v in (self.amount_bb("my_stack"), self.amount_bb("opp_stack")) if v] if self.inputs else []
+        st["stack_bb"] = min(stacks) if stacks else None
         # 추천(advice_ctx)과 격자가 같은 유효 스택을 쓰도록: 프리플랍이면 테이블 상태의 스택, 내 스택보다 크지 않게
         board_seen = [b for b in self.view.get("board", []) if ev.is_card(b)]
         ts_stack = None if board_seen else _number(((self.table_state or {}).get("preflop") or {}).get("stack_bb"))
         base = ts_stack or st["stack_bb"]
-        mine = self.amount("my_stack") / bb if self.inputs and bb and self.amount("my_stack") else None
+        mine = (self.amount_bb("my_stack") or None) if self.inputs else None
         st["stack_bb"] = min(base, mine) if base and mine else (base or mine)
         st["short"] = st["stack_bb"] is not None and st["stack_bb"] <= pf.SHORT_STACK_BB
         st["ante"] = bool(self.inputs and (self.amount("ante") or 0) > 0)
@@ -3674,6 +3805,27 @@ class App:
     def amount(self, key):
         return odds.parse_amount(self.inputs[key].get())
 
+    def bb_value(self, v, unit):
+        """금액 v → BB 단위. unit: 'BB'(이미 BB) / 'chips'(칩·만) / None(단위 없는 숫자).
+        화면 숫자는 BB 표기인데 블라인드 입력은 칩(예: '20만')인 식으로 단위가 섞여도 맞게 바꾼다. 모르면 None."""
+        if v is None:
+            return None
+        if unit == "BB":
+            return v
+        bb_text = self.inputs["bb"].get().lower()
+        bb = odds.parse_amount(bb_text)
+        if not bb:
+            return None
+        if "bb" in bb_text and unit == "chips":  # BB 입력이 'xBB' 인데 값은 칩: 1BB 가 몇 칩인지 모름
+            return None
+        return v / bb
+
+    def amount_bb(self, key):
+        """입력칸 값을 BB 단위로 (bb_value). 'BB' 가 붙은 값은 그대로, '만'·'억'·'k' 가 붙은 값은 칩."""
+        text = self.inputs[key].get().lower()
+        unit = "BB" if "bb" in text else "chips" if any(u in text for u in ("만", "억", "k")) else None
+        return self.bb_value(odds.parse_amount(text), unit)
+
     def apply_preset(self, key, frac):
         pot = self.amount("pot")
         if pot:
@@ -3698,12 +3850,13 @@ class App:
         hero = res["hero"] if res else []
         info["preflop"] = bool(res) and not res["board"]
         info["pocket_pair"] = len(hero) == 2 and hero[0] >> 2 == hero[1] >> 2
-        sb, bb, ante = values["sb"] or 0, values["bb"] or 0, values["ante"] or 0
         vis, waiting = [], []
         if pot and bet:
             vis.append("pot")
         else:
             waiting.append("팟 오즈 (팟·상대 벳)")
+        if not (info["outs"] and info["outs"]["count"]):  # 아웃츠 0장 = 드로우 없음 (내재 배당이 무한대 '∞억'으로 보임)
+            info["outs"] = None
         if (info["preflop"] and info["pocket_pair"] and bet and info["eff"]) or (info["outs"] and pot and bet):
             vis.append("implied")
         if info["eff"] and pot:
@@ -3712,7 +3865,11 @@ class App:
             waiting.append("SPR (스택·팟)")
         if pot and values["my_bet"]:
             vis.append("fold")
-        if values["my_stack"] and sb + bb + ante:
+        # M-ratio 는 BB 단위로 맞춰서 (스택은 화면 BB 표기, 블라인드는 칩 '10만/20만' 처럼 섞이면 0.0 이 나왔음)
+        stack_bb = self.amount_bb("my_stack") if values["my_stack"] else None
+        orbit = [self.amount_bb(k) for k in ("sb", "bb", "ante") if values[k]]
+        if stack_bb and orbit and None not in orbit and sum(orbit) > 0:
+            info["m"] = (stack_bb / sum(orbit), sum(orbit))
             vis.append("m")
         info["visible"], info["waiting"] = vis, waiting
         return info
@@ -3815,10 +3972,9 @@ class App:
                 line("상대 폴드율을 입력하면 벳 EV를 계산합니다")
         elif which == "m":
             title("M-ratio", "m")
-            sb, bb, ante = values["sb"] or 0, values["bb"] or 0, values["ante"] or 0
-            m = odds.m_ratio(values["my_stack"], sb, bb, ante)
+            m, orbit = info["m"]
             zone, tip = odds.m_zone(m)
-            big(f"{m:.1f}", f"내 스택 ÷ (SB + BB + 앤티) = {odds.format_amount(sb + bb + ante)}", zone)
+            big(f"{m:.1f}", f"내 스택 ÷ (SB + BB + 앤티) = {round(orbit, 2):g}BB", zone)
             line(tip)
         return y
 

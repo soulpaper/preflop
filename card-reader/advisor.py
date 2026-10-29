@@ -249,7 +249,9 @@ HU_GTO_SCORE = {
     "range": {"agree": (0.628, 0.683), "share": (0.595, 0.653), "agree_min": (0.628, 0.663), "agree_spr<4": (0.651, 0.706)},
     "random": {"agree": (0.578, 0.665), "share": (0.551, 0.637), "agree_min": (0.578, 0.643), "agree_spr<4": (0.583, 0.692)},
 }
-HU_THIN = 0.25          # 상대 프로필(벳에 안 접음 / 루즈) 일 때 헤즈업 밸류 벳 기준을 이만큼 낮춘다 (얇은 밸류: 리버 0.85 → 0.60)
+NUT_K = 5.0            # _adj_equity 바닥: 보정 에쿼티 >= 1 - (1 - 에쿼티) × NUT_K  (에쿼티 0.9 이하는 영향 없음)
+ALLIN_EQ_FULL_FRAC = 0.5   # 헤즈업 올인 콜 최소 에쿼티(allin_eq)는 팟의 절반 이상 올인에 전부, 그보다 작은 올인엔 비례해서만
+HU_THIN = 0.25         # 상대 프로필(벳에 안 접음 / 루즈) 일 때 헤즈업 밸류 벳 기준을 이만큼 낮춘다 (얇은 밸류: 리버 0.85 → 0.60)
 STANDARD_PEN = 0.40     # post_params 표준 pen — 느슨함에 따른 pen 변화분만 HU_GTO['random']['pen'] 위에 더한다
 
 
@@ -407,6 +409,14 @@ class _Ctx:
         call = _num(g("call"))
         self.call = call if call and call > 0 else 0.0
         self.call_known = call is not None
+        mine = self.my_stack or self.eff   # 내 뒷스택 (없으면 유효 스택)
+        if mine and self.call > mine:
+            # 콜 금액이 내 스택보다 크면 실제로 내는 건 스택까지 — 넘는 상대 벳은 돌려받으므로 팟(화면 POT)에서도 뺀다
+            # (안 그러면 숏스택 올인 콜의 팟 오즈가 과대: 4BB 남았는데 44BB 벳 기준으로 필요 승률을 계산했다)
+            excess = self.call - mine
+            self.call = mine
+            if self.pot_total:
+                self.pot_total = max(self.call, self.pot_total - excess)
         self.can_check = g("can_check")
         if self.can_check is None and self.call_known:
             self.can_check = self.call == 0
@@ -1280,7 +1290,9 @@ def _adj_equity(c, eq, cls, made, twopair_plus, bet_frac):
             cap += sp["river_cap"]
         red = min(red, cap)
     mw_red = min(1 - (1 - disc) * (1 - vuln), red)
-    return eq * (1 - red), mw_red
+    # 바닥: 벳하는 레인지 안에서 나를 이기는 몫은 랜덤 대비 최대 NUT_K 배 — 에쿼티가 1 에 가까우면 보정 에쿼티도 1 에 가깝다.
+    # (곱셈 보정만 쓰면 랜덤 기준 헤즈업에서 보정 에쿼티가 50% 에 묶여, 오버벳·올인에 리버 너트도 폴드했다)
+    return max(eq * (1 - red), 1 - (1 - eq) * NUT_K), mw_red
 
 
 def _prof_facing(c, cls, twopair_plus, bet_frac):
@@ -1332,8 +1344,11 @@ def _facing_bet(c, cls, made, tp_plus, twopair_plus, tex, eq, eq_src, outs, stro
         hu_pad = _hu_margin(T, c.street, bet_frac, allin_call, pot)
     else:
         hu_pad = 0.0 if allin_call else _hu_margin(T, c.street, bet_frac, False, pot)
-    need_eff = need + pad + ppad + c.post["call_adj"] + hu_pad
+    cadj = c.post["call_adj"]
+    need_eff = need + pad + ppad + cadj + hu_pad
+    # 표기에 필요 승률의 모든 가산을 보인다 (스타일 가감이 빠져 '필요 41% > 보정 에쿼티 44%' 처럼 숫자와 부등호가 어긋났다)
     odds_line = f"필요 승률 {_pct(need)}" + (f"+{_pct(pad)}(뒤 레이즈 위험)" if pad else "") +         (f"{'+' if ppad > 0 else '-'}{_pct(abs(ppad))}(상대 성향)" if ppad else "") + \
+        (f"{'+' if cadj > 0 else '-'}{_pct(abs(cadj))}(스타일)" if abs(cadj) >= 0.005 else "") + \
         (f"{'+' if hu_pad > 0 else '-'}{_pct(abs(hu_pad))}(실현 보정)" if abs(hu_pad) >= 0.005 else "") + \
         f" {'<' if adj >= need_eff else '>'} 보정 에쿼티 {_pct(adj)}" + (f"(상대 {c.opp}명 -{_pct(disc)})" if mw else "")
     margin = adj - need_eff
@@ -1342,11 +1357,13 @@ def _facing_bet(c, cls, made, tp_plus, twopair_plus, tex, eq, eq_src, outs, stro
 
     if allin_call:
         size = min(call, c.my_stack) if c.my_stack else call
-        if adj >= need_eff and (not hu or eq >= T["allin_eq"][c.street]):
+        # 헤즈업 올인 최소 에쿼티: 솔버 데이터의 큰 올인 기준이라 팟 대비 작은 올인(좋은 팟 오즈)엔 비례해서만 적용
+        floor = T["allin_eq"][c.street] * min(1.0, bet_frac / ALLIN_EQ_FULL_FRAC) if hu else 0.0
+        if adj >= need_eff and eq >= floor:
             return _out(CALL, size, f"{_bb(size)} (올인 콜)", f"{made}: 에쿼티가 팟 오즈를 넘음 → 올인 콜",
                         [odds_line, eq_src, head], sure)
-        return _out(FOLD, reason=f"{made}: 올인에 에쿼티 부족 → 폴드", detail=[odds_line, eq_src, head],
-                    confidence=sure)
+        why = "올인에 에쿼티 부족" if adj < need_eff else f"큰 올인 콜은 에쿼티 {_pct(floor)} 이상만 (현재 {_pct(eq)})"
+        return _out(FOLD, reason=f"{made}: {why} → 폴드", detail=[odds_line, eq_src, head], confidence=sure)
 
     spr_after = stack_after / (pot + call) if stack_after is not None and pot + call > 0 else None
     spr_line = f"SPR(콜 후) {spr_after:.1f}" if spr_after is not None else None

@@ -13,3 +13,5 @@ recordings/
 debug.log
 test_userinfo.py
 gto_lib/
+templates_neg/
+config.json.*

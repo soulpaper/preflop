@@ -362,6 +362,13 @@ def _sorted_board(b):
     return sorted(b, key=lambda c: (-(c >> 2), c & 3))
 
 
+def _map_order(b, hero):
+    """무늬 순열(_suit_map)용 보드 순서. _sorted_board 와 같되 같은 랭크(페어 보드)끼리는 히어로(높은 카드 먼저)와
+    무늬를 공유하는 카드를 앞에 둔다 — 무늬 번호 순으로 정하면 근사 플랍에서 결과가 실제 무늬 이름에 따라 달라진다."""
+    hs = [c & 3 for c in sorted(hero, key=lambda c: -(c >> 2))]
+    return sorted(b, key=lambda c: (-(c >> 2), hs.index(c & 3) if (c & 3) in hs else len(hs), c & 3))
+
+
 def flop_features(board):
     b = _sorted_board(parse_board(board) if isinstance(board, str) else cards(board))
     r = [c >> 2 for c in b]
@@ -473,7 +480,7 @@ def _rank_map(src_ranks, dst_ranks, r):
 def map_hand(hero, board, target):
     """실제 (hero, board) → 대상 플랍 target 위의 hero 카드. (카드 2장, 메모 목록). 보드는 플랍 3장."""
     h = cards(hero)
-    b = _sorted_board(cards(board))
+    b = _map_order(cards(board), h)
     t = _sorted_board(parse_board(target))
     smap = _suit_map(b, t)
     src_r, dst_r = [c >> 2 for c in b], [c >> 2 for c in t]
@@ -753,6 +760,29 @@ def decode(node, combo, board):
     return [v / s for v in vals]
 
 
+def decode_sym(node, combo, board):
+    """decode 의 수트 동형 평균: 보드를 그대로 두는 무늬 순열로 옮긴 콤보(전략상 같은 핸드)들의 빈도 평균.
+    TexasSolver 덤프는 동형 콤보끼리도 전략이 크게 다를 수 있어(무차별한 핸드가 서로 다른 순수 전략으로 수렴,
+    예: 9s5s3s 에서 Jh3h 콜 100% / Jd3d 폴드 100%) 그대로 쓰면 결과가 실제 무늬 이름에 따라 달라진다."""
+    base = decode(node, combo, board)
+    if base is None:
+        return None
+    key = combo_key(*combo)
+    seen = {key}
+    acc, k = list(base), 1
+    for p in _board_perms(board):
+        c2 = combo_key((key[0] >> 2) * 4 + p[key[0] & 3], (key[1] >> 2) * 4 + p[key[1] & 3])
+        if c2 in seen:
+            continue
+        seen.add(c2)
+        f = decode(node, c2, board)
+        if f is None:
+            continue
+        acc = [a + b for a, b in zip(acc, f)]
+        k += 1
+    return [a / k for a in acc]
+
+
 # --- 스팟 / 노드 해석 ------------------------------------------------------------------
 CANON_OPENER = {2: "BTN", 3: "CO", 4: "HJ", 5: "HJ"}   # 뒤 인원 → 대표 오프너 (6 이상 UTG)
 
@@ -883,17 +913,20 @@ def _alt_combos(mapped, tboard, nodeflop_board):
     if not pair:
         deltas += [(d1, d2) for d1 in (1, -1) for d2 in (1, -1)]
 
-    def suit_opts(si):
+    def suit_opts(si, ri, d):
         flushy = suit_cnt.get(si, 0) >= 2
         alts = [x for x in range(4) if x != si and ((suit_cnt.get(x, 0) >= 2) == flushy)]
-        return [si] + alts
+        opts = [si] + alts
+        if d == 0 and ri * 4 + si in dead:   # 보드 카드와 겹친 카드: 랭크(보드와 페어)를 지키는 게 무늬 성질보다 우선
+            opts += [x for x in range(4) if x not in opts]
+        return opts
 
     for d1, d2 in deltas:
         r1, r2 = r[0] + d1, r[1] + d2
         if not (0 <= r1 <= 12 and 0 <= r2 <= 12):
             continue
-        for s1 in suit_opts(s[0]):
-            for s2 in suit_opts(s[1]):
+        for s1 in suit_opts(s[0], r1, d1):
+            for s2 in suit_opts(s[1], r2, d2):
                 c1, c2 = r1 * 4 + s1, r2 * 4 + s2
                 if c1 == c2 or c1 in dead or c2 in dead:
                     continue
@@ -946,9 +979,10 @@ def _turn_stacks(spot, stacks):
     return [s for s in stacks if any(glob.glob(os.path.join(d, "turn", f"{spot}_{s}bb", "*.json.gz")) for d in lib_dirs())]
 
 
-def _map_turn(turn, b, tboard, hero_mapped):
-    """실제 턴 카드 → 대상 플랍 위의 턴 카드 (랭크 보간 + 같은 무늬 순열). 겹치면 가까운 대안. (카드, 바뀜 여부)"""
-    bs = _sorted_board(b)
+def _map_turn(turn, b, tboard, hero_mapped, hero=()):
+    """실제 턴 카드 → 대상 플랍 위의 턴 카드 (랭크 보간 + 같은 무늬 순열). 겹치면 가까운 대안. (카드, 바뀜 여부)
+    hero: 실제 히어로 카드 — map_hand 와 같은 무늬 순열을 쓰도록 같은 보드 순서를 만든다."""
+    bs = _map_order(b, hero)
     ts = _sorted_board(tboard)
     smap = _suit_map(bs, ts)
     r, _f = _rank_map([c >> 2 for c in bs], [c >> 2 for c in ts], turn >> 2)
@@ -1050,7 +1084,7 @@ def lookup(hero_pos, villain_pos, stack_bb, hero_cards, board, node, players=PLA
         if line is None and line_used != "x_x":
             notes = notes + [f"플랍 라인 추정 {line_used}"]
         L = td["lines"][line_used]
-        tt, tchanged = _map_turn(turn, b, tboard, mapped)
+        tt, tchanged = _map_turn(turn, b, tboard, mapped, h)
         if tt is None:
             return None
         if tchanged:
@@ -1078,18 +1112,21 @@ def lookup(hero_pos, villain_pos, stack_bb, hero_cards, board, node, players=PLA
     if len(nd["a"]) == 1:
         freqs = [1.0]
     elif len(set(mapped)) == 2 and not (set(mapped) & set(dboard)):
-        freqs = decode(nd, mapped, dboard)
+        freqs = decode_sym(nd, mapped, dboard)
     if freqs is None:
         combo_exact = False
-        for alt in _alt_combos(mapped, dboard, tkey)[1:]:
-            freqs = decode(nd, alt, dboard)
+        # 첫 후보가 mapped 자신일 때만 건너뛴다 (mapped 가 보드와 겹치면 첫 후보는 이미 다른 콤보 → 버리면 안 됨)
+        for alt in _alt_combos(mapped, dboard, tkey):
+            if alt == used:
+                continue
+            freqs = decode_sym(nd, alt, dboard)
             if freqs is not None:
                 used = alt
                 break
     if freqs is None:   # 그래도 없으면 (예: 프리플랍에 3벳했어야 할 핸드) 보드 위 족보 강도 순위가 가장 가까운 범위 안 콤보
         alt = _nearest_by_strength(nd, mapped, dboard)
         if alt is not None:
-            freqs, used = decode(nd, alt, dboard), alt
+            freqs, used = decode_sym(nd, alt, dboard), alt
     if freqs is None:
         return None
     if "rank_collision" in mnotes:

@@ -93,6 +93,7 @@ class _Hand:
         self.allin_runout = False
         self.blind_keys = {}
         self.pos_players = Counter()
+        self.late = {}           # 핸드 중간에 처음 카드를 받은 듯 보인 자리 -> 연속 프레임 수 (2프레임째에 추가)
 
     def issue(self, code, detail=None):
         if not any(i["code"] == code and i.get("detail") == detail for i in self.issues):
@@ -185,6 +186,8 @@ class Tracker:
             out += self._finish(self.last_t, "stale")
         if not isinstance(state, dict) or not state.get("seats") or "error" in state or "empty" in state:
             return out
+        if state.get("layout_ok") is False:
+            return out  # 화면이 보정과 어긋남 (tablestate): 좌석 판정이 엉터리라 이 프레임은 버림
         board = [c for c in board if _is_card(c)]
         hero = [c for c in hero_cards if _is_card(c)][:2]
         seats = {s["key"]: s for s in state["seats"] if isinstance(s, dict) and "key" in s}
@@ -220,6 +223,7 @@ class Tracker:
             h.dealer[state["dealer"]] += 1
         if state.get("pos_players"):
             h.pos_players[state["pos_players"]] += 1
+        late = {}
         for k, s in seats.items():
             if not s.get("dealt"):
                 continue
@@ -227,6 +231,12 @@ class Tracker:
             if seat is None:
                 if h.frames > 1 and h.street > 0:
                     continue  # 핸드 중간에 새로 카드를 받은 듯 보이는 자리는 무시 (오판)
+                if h.frames > 1:
+                    # 프리플랍 중간에 처음 보인 자리 (딜링 애니메이션): 2프레임 연속일 때만. 한 프레임짜리 오판(아이콘/흑백)을
+                    # 넣으면 행동 없이 남아서 스트리트 끝에 콜로 추정되고(VPIP), 남은 사람으로 세여 핸드가 안 끝남
+                    late[k] = h.late.get(k, 0) + 1
+                    if late[k] < 2:
+                        continue
                 seat = h.seats[k] = _Seat(k)
                 seat.bubble = s.get("bubble")
             seat.slot = s.get("slot", seat.slot)
@@ -235,6 +245,7 @@ class Tracker:
             nm = names.get(k)
             if nm and nm[0]:
                 seat.names[(nm[0], bool(nm[1]))] += 1
+        h.late = late
         for kind in ("sb", "bb"):
             k = (state.get("blind_seats") or {}).get(kind)
             if k:
@@ -564,6 +575,10 @@ class Tracker:
             return []  # 한 프레임만 보고 끝남: 기록할 것 없음
         if reason in ("flush", "stale", "new_session") and not h.over and h.street < 3:
             h.issue("incomplete", reason)
+        elif h.street == 0 and not h.over and not h.allin_runout and len(h.live()) >= 2:
+            # 보드 없이 2명 이상 남은 채 끝남 = 실제로는 없는 일 (마지막 폴드를 놓쳤거나 잘못된 핸드 경계).
+            # 남은 사람을 콜로 추정하면 아직 행동 안 한 사람이 모두 VPIP 로 쌓임 → 통계에 넣지 않음
+            h.issue("incomplete", reason)
         if "incomplete" not in {i["code"] for i in h.issues}:
             self._close_street(h)  # 끝까지 못 본 핸드는 남은 액션을 추정하지 않음
         live = [k for k, s in h.seats.items() if not s.folded]
@@ -585,8 +600,10 @@ class Tracker:
         }
         for k, seat in h.seats.items():
             name = seat.names.most_common(1)[0][0] if seat.names else (None, False)
+            # 같은 이름이 한 번이라도 잘린 이름('…')으로 읽혔으면 잘린 이름 (점을 놓친 프레임이 더 많아도 DB 에 쓰지 않게)
+            truncated = any(t for (n, t) in seat.names if n == name[0])
             rec["seats"][k] = {
-                "name": name[0], "truncated": bool(name[1]), "hero": seat.hero,
+                "name": name[0], "truncated": truncated, "hero": seat.hero,
                 "pos": seat.pos.most_common(1)[0][0] if seat.pos else None, "slot": seat.slot,
                 "folded": STREETS[seat.fold_street] if seat.folded and seat.fold_street is not None else None,
                 "allin": seat.allin, "shown": h.shown.get(k),
@@ -620,7 +637,8 @@ def derive(rec):
                         st["threebet"] = 1
                 break
         folded_pre = seat.get("folded") == "preflop"
-        st["saw_flop"] = int(reached >= 1 and not folded_pre)
+        # 프리플랍 올인 쇼다운은 보드를 못 읽었어도 플랍을 본 것 (WTSD 분모; 분자만 쌓여 100% 를 넘지 않게)
+        st["saw_flop"] = int((reached >= 1 or k in sd) and not folded_pre)
         for street in STREETS[1:]:
             mine = [a for a in acts.get(street, []) if a["seat"] == k]
             first_facing = next((a for a in mine if a.get("facing")), None)

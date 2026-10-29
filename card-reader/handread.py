@@ -178,7 +178,7 @@ def _board_cards(board):
             v = board.get(k)
             if v is None:
                 continue
-            seq.extend(_cards(v if isinstance(v, (list, tuple)) else [v]))
+            seq.extend(_cards(v if isinstance(v, (list, tuple, str)) else [v]))   # 'As7d2c' 문자열도 (전엔 통째로 버려짐)
         return _cards(seq)
     return _cards(board)
 

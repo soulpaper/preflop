@@ -216,6 +216,41 @@ if real and dry:
 else:
     skip("실제 솔브 상식 검사", "gto_lib/BTN_BB_40bb.json.gz 에 A 하이 레인보우 플랍이 아직 없음")
 
+# --- 회귀: 대안 콤보 / 수트 동형 불변 ------------------------------------------------------------
+_tb = sl.parse_board("Qs8h4s")
+_alts = sl._alt_combos(sl.parse_board("Qs7d"), _tb, "Qs8h4s")   # mapped 가 보드 Qs 와 겹침
+test("대안 콤보: 보드와 겹친 카드는 같은 랭크(페어 유지)부터", sl.combo_str(*_alts[0]) == "Qh7d",
+     str([sl.combo_str(*a) for a in _alts[:3]]))
+_nd = {"a": ["call", "fold"], "s": ""}
+_b = sl.parse_board("9s5s3s")
+_idx, _lst = sl.combo_order(_b)
+_s = ["A"] * len(_lst)   # 전부 콜 0 → 폴드 100%
+_s[_idx[sl.combo_key(sl.card("Jh"), sl.card("3h"))]] = sl.ALPH[sl.QMAX]   # Jh3h 만 콜 100%
+_nd["s"] = "".join(_s)
+_f = [sl.decode_sym(_nd, (sl.card(a), sl.card(b)), _b) for a, b in (("Jh", "3h"), ("Jd", "3d"), ("Jc", "3c"))]
+test("decode_sym: 동형 콤보(Jh3h/Jd3d/Jc3c on 9s5s3s)는 같은 빈도 (평균)",
+     all(abs(f[0] - 1 / 3) < 1e-9 for f in _f), str(_f))
+if avail:
+    import random as _random
+    _rng = _random.Random(5)
+    _bad = _n = 0
+    _sp = [("BTN", "BB"), ("BB", "BTN"), ("SB", "BB"), ("BB", "SB"), ("CO", "BB"), ("BB", "CO")]
+    _nodes = ["oop_first", "ip_vs_check", ("oop_vs_bet", 75), ("ip_vs_bet", 33), "oop_vs_raise", "ip_vs_raise"]
+    for _ in range(400):
+        hp, vp = _rng.choice(_sp)
+        nd_ = _rng.choice(_nodes)
+        cs = _rng.sample(range(52), 5)
+        r0 = sl.lookup(hp, vp, 40, cs[:2], cs[2:], nd_)
+        if not r0:
+            continue
+        p = _rng.choice(sl._PERMS)
+        f = lambda c: (c >> 2) * 4 + p[c & 3]
+        r1 = sl.lookup(hp, vp, 40, [f(c) for c in cs[:2]], [f(c) for c in cs[2:]], nd_)
+        _n += 1
+        if not r1 or max(abs(r0["actions"].get(a, 0) - r1["actions"].get(a, 0)) for a in set(r0["actions"]) | set(r1["actions"])) > 1e-9:
+            _bad += 1
+    test("조회: 보드+핸드 무늬를 똑같이 바꿔도 (플랍) 같은 빈도", _n > 50 and _bad == 0, f"{_bad}/{_n} 다름")
+
 # --- 결과 -------------------------------------------------------------------------------
 failed = 0
 for st, name, info in results:

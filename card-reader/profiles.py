@@ -22,6 +22,7 @@ reliable = hands ≥ 30.
 모든 공개 메서드는 예외를 밖으로 내지 않는다 (실패하면 errors 증가, 빈 값 반환).
 """
 import json
+import re
 import sqlite3
 import sys
 import threading
@@ -178,7 +179,10 @@ class Store:
     def _observe(self, rec):
         if not isinstance(rec, dict) or "seats" not in rec:
             return False
-        self._jsonl(rec)
+        try:
+            self._jsonl(rec)
+        except Exception as exc:  # 기록 파일 실패(폴더 권한/디스크)로 통계까지 잃지 않게
+            self._fail(exc)
         session = rec.get("session")
         for k, seat in rec["seats"].items():
             if seat.get("name"):
@@ -358,10 +362,15 @@ class Store:
             with self.lock:
                 best, score = None, 0.0
                 for n, f in self._fps():
+                    if n == name:
+                        return name  # 이미 아는 닉네임 그대로 읽힘
                     s = names_mod.fp_similarity(fp, f)
                     if s > score:
                         best, score = n, s
-            return best if best is not None and score >= FP_MATCH else name
+            # 숫자가 다르면 다른 사람 ('User854834280' / 'User854839280' 은 글자 지문이 0.9 넘게 닮음 → 합치면 남의 통계)
+            if best is not None and score >= FP_MATCH and re.sub(r"\D", "", best) == re.sub(r"\D", "", name or ""):
+                return best
+            return name
         except Exception as exc:
             self._fail(exc)
             return name

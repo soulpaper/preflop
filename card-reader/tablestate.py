@@ -306,7 +306,8 @@ class TableReader:
         hero_backs = False
         if hero is not None and "hero" in calib:
             import reader  # 카드 찾기 재사용 (순환 import 방지로 여기서)
-            cards = reader.detect_cards(_crop(img, calib["hero"]))
+            hero_crop = _crop(img, calib["hero"])
+            cards = reader.detect_cards(hero_crop) if hero_crop.size else []  # 창 밖(다른 크기의 캡처)이면 빈 영역
             hero_cards = len(cards)
             hero_backs = hero_cards >= 2 and all(reader.is_card_back(c) for c in cards)
         for s in seats:
@@ -400,8 +401,15 @@ class TableReader:
 
         hero_folded = bool(hero and hero["folded"])
         in_hand = [s for s in seats if s["in_hand"]]
+        # 내 스택 글자는 앉아 있는 한 늘 보임 (samples/ 7장 모두). 안 보이면 화면이 보정과 어긋남 (창 이동/크기 변경,
+        # 다른 화면에서 보정) → 좌석 판정을 믿을 수 없음. 내 자리는 늘 '사람 있음'으로 세므로 그대로 두면 '1명 중 0명'
+        layout_ok = hero is None or hero["stack_box"] is not None
+        if not layout_ok:
+            notes.append("내 스택이 안 보임: 화면이 보정과 다름 (창 이동/크기 변경?) → 다시 자동 지정")
         state = {
-            "players": sum(1 for s in seats if s["occupied"]),
+            "players": sum(1 for s in seats if s["occupied"]) if layout_ok else None,
+            "layout_ok": layout_ok,
+            "no_hand": n < 2,  # 카드 받은 사람이 2명 미만 (핸드 사이/휴식 시간/대기)
             "dealt": n,
             "in_hand": len(in_hand),
             "opponents_in_hand": sum(1 for s in in_hand if s["key"] != "hero"),
@@ -607,6 +615,8 @@ class TableReader:
             return sorted(dealt_keys, key=lambda k: (idx[k] - start - 1) % len(keys))
         if dealer is not None:
             seq = after(dealer)            # SB, BB, ..., 딜러
+            if n == 2:                     # 헤즈업: 딜러가 SB → [BB, 딜러] 를 다른 경우와 같은 SB, BB 순서로
+                seq = seq[::-1]
         elif disc_seat.get("BB") in dealt_keys:
             notes.append("no dealer disc: positions from BB disc")
             seq = after(disc_seat["BB"])   # UTG, ..., BB
@@ -618,8 +628,8 @@ class TableReader:
         else:
             notes.append("no dealer/blind disc: positions unknown")
             return {}
-        if n == 2:  # 헤즈업: 딜러가 SB
-            return {seq[1]: "SB", seq[0]: "BB"}
+        if n == 2:  # 헤즈업: seq = [SB(딜러), BB]
+            return {seq[0]: "SB", seq[1]: "BB"}
         names = pf.seats(min(10, max(6, n)))[-n:] if n <= 10 else pf.seats(10)
         action = seq[2:] + seq[:2]         # UTG.. 딜러, SB, BB
         return {k: names[i] for i, k in enumerate(action[:len(names)])}
