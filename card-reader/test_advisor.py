@@ -1001,6 +1001,73 @@ for k in range(5):
 ms = (time.perf_counter() - t0) / 5 * 1000
 results.append((ms < 30, f"ICM 포함 recommend (새 스택, 캐시 없음) {ms:.1f} ms (< 30)", recommend(JAMCALL)))
 
+# --- 2026-10-30 라이브 회귀: 체크 가능한데 폴드 / 3벳·4벳 팟 KK 폴드 ------------------------------------------
+# p_014947: CO 아이솔레이션 레이즈 5인 팟, 플랍 A♥9♦4♣ 에 K♥K♣, 넷 다 체크 → 내 차례 (체크 버튼).
+# 예전: 체크 버튼 글자를 '콜 41BB' 로 읽음 + 상대 범위 기준 에쿼티 16% → '폴드'.
+LIVE_KK = dict(hero=["Kh", "Kc"], board=["Ah", "9d", "4c"], street="flop", players=6, opponents_in_hand=4,
+               hero_pos="CO", situation="open", pre_raises=1, stack_bb=371, my_stack=481.2, pot=25, pot_total=25,
+               to_act=True, equity=0.164, equity_basis="range", hand_name="원페어", aggressor=True)
+check("라이브 p_014947: 체크 버튼 + 엉뚱한 콜 41BB 가 같이 와도 → 체크 (폴드 아님)",
+      dict(LIVE_KK, call=41, can_check=True), "체크")
+check("라이브 p_014947: 체크 가능 (콜 0) → 체크", dict(LIVE_KK, call=0.0, can_check=True), "체크")
+check("라이브 p_014947: can_check 모름 + 콜 0 → 체크", dict(LIVE_KK, call=0.0, can_check=None), "체크")
+check("라이브 p_014947: 차례 전(미리 계산) 체크 가능 → 체크 계획", dict(LIVE_KK, call=0.0, can_check=True, to_act=False),
+      "체크", detail_has="차례가 오면: 체크")
+check("체크 가능: 에쿼티 0% 에어 멀티웨이도 폴드 아님",
+      dict(LIVE_KK, hero=["7s", "2h"], equity=0.0, call=0.0, can_check=True), "체크")
+check("프리플랍 BB 옵션 (림프 팟, 체크 가능) 72o → 체크 (폴드 아님)",
+      dict(PF, hero=["7c", "2d"], players=6, opponents_in_hand=3, hero_pos="BB", situation="open", stack_bb=100,
+           my_stack=100, pot=4.5, pot_total=4.5, call=0.0, can_check=True), "체크")
+# 3벳/4벳 팟 낮은 보드 오버페어: 상대 범위를 좁게(셋·투페어 위주) 잘못 읽어 에쿼티가 낮게 나와도 보통 벳에는 콜
+KK_4B = dict(hero=["Kh", "Kc"], board=["7d", "4s", "2c"], street="flop", players=6, opponents_in_hand=1, hero_pos="CO",
+             villain_pos="BTN", situation="vs3bet", pre_raises=3, stack_bb=75, my_stack=75, pot=50, pot_total=75,
+             call=25, to_act=True, can_check=False, equity=0.12, equity_basis="range", aggressor=True)
+r = recommend(KK_4B)
+results.append((r["action"] != "폴드", "4벳 팟 KK 742 헤즈업 하프 벳, 좁게 읽힌 범위 에쿼티 12% → 폴드 아님", r))
+for frac in (0.33, 0.5, 0.75, 1.0):
+    for eq in (0.05, 0.25, 0.6):
+        ctx = dict(KK_4B, call=round(50 * frac, 1), pot_total=round(50 + 50 * frac, 1), equity=eq,
+                   board=["8d", "5s", "3c", "2h"], street="turn", stack_bb=300, my_stack=300, pre_raises=2)
+        r = recommend(ctx)
+        results.append((r["action"] != "폴드", f"3벳 팟 KK 8532 턴 헤즈업 벳 {frac:.0%} 에쿼티 {eq:.0%} → 폴드 아님", r))
+r = recommend(dict(KK_4B, situation=None, pre_raises=2, equity=0.05, call=50, pot_total=100, stack_bb=300, my_stack=300,
+                   board=["9d", "7s", "2c", "2h", "4d"], street="river"))
+results.append((r["action"] != "폴드", "3벳 팟(pre_raises=2, 상황 모름) KK 97224 리버 팟 벳 에쿼티 5% → 폴드 아님", r))
+check("싱글 레이즈 팟은 대상 아님: 팟 벳·에쿼티 5% → 폴드 가능",
+      dict(KK_4B, situation="open", pre_raises=1, equity=0.05, call=50, pot_total=100, stack_bb=300, my_stack=300),
+      "폴드")
+check("3벳 팟 오버페어 + 팟 2배 오버벳은 '보통 벳' 아님 → 불변식 대상 아님 (에쿼티 5% 폴드)",
+      dict(KK_4B, equity=0.05, call=100, pot_total=150, stack_bb=300, my_stack=300), "폴드")
+check("높은 보드(A 있음)는 대상 아님: 3벳 팟 KK A72 에쿼티 5% 팟 벳 → 폴드 가능",
+      dict(KK_4B, board=["Ad", "7s", "2c"], equity=0.05, call=50, pot_total=100, stack_bb=300, my_stack=300), "폴드")
+check("멀티웨이(상대 2명)는 대상 아님: 3벳 팟 KK 742 에쿼티 5% 팟 벳 → 폴드 가능",
+      dict(KK_4B, opponents_in_hand=2, equity=0.05, call=50, pot_total=100, stack_bb=300, my_stack=300), "폴드")
+
+# --- 2026-10-30 라이브 회귀: CO QJo 림프 → BTN 4BB 레이즈 (BB·MP 콜), 콜 3BB 남음 ----------------------------------
+# 예전: 이미 낸 1BB 를 몰라 '첫 진입'·림퍼 7명으로 보고 폴드/체크. 맞는 답: 팟 11.5 에 3 콜 (필요 21%) → 콜
+QJ_LIMP = dict(PF, hero=["Js", "Qc"], players=6, opponents_in_hand=3, hero_pos="CO", situation="open", stack_bb=238,
+               my_stack=238, pot=11.5, pot_total=11.5, call=3.0, can_check=False, hero_bet=1.0, equity=0.24,
+               equity_basis="range")
+check("라이브 QJo 림프 후 BTN 레이즈 4BB (팟 11.5) → 콜 3BB", QJ_LIMP, "콜", 3.0, 0.01, reason_has="림프 후 레이즈")
+check("QJo 림프-레이즈: 상황 정보가 vsopen(상대 BTN, 차트 밖)이어도 → 콜",
+      dict(QJ_LIMP, situation="vsopen", villain_pos="BTN"), "콜", 3.0, 0.01)
+check("QJo 림프-레이즈: 상황 모름 + 에쿼티 없음 → 팟 오즈로 콜", dict(QJ_LIMP, situation=None, equity=None,
+                                                         equity_basis=None), "콜", 3.0, 0.01)
+check("QJo 림프-레이즈: 차례 전(미리 계산) → '차례가 오면: 콜'", dict(QJ_LIMP, to_act=False), "콜",
+      detail_has="차례가 오면: 콜")
+check("림프-레이즈: 큰 레이즈 (15BB, 팟 20) + 약한 에쿼티 → 폴드",
+      dict(QJ_LIMP, call=14.0, pot=20.0, pot_total=20.0, equity=0.2), "폴드")
+check("림프-레이즈: AA 는 다시 레이즈", dict(QJ_LIMP, hero=["Ah", "Ad"]), "레이즈")
+check("림프-레이즈: 72o 는 에쿼티 낮으면 폴드", dict(QJ_LIMP, hero=["7h", "2d"], equity=0.12), "폴드")
+r = recommend(dict(QJ_LIMP, hero_bet=None))
+results.append((r["action"] != "체크", "hero_bet 모름 + 콜 3: 체크 아님 (콜할 금액이 있음)", r))
+check("BB 블라인드 1BB 는 림프가 아님 (BB vs 오픈 기존 경로)",
+      dict(QJ_LIMP, hero_pos="BB", hero_bet=1.0, situation="vsopen", villain_pos="BTN", hero=["Js", "Qc"]),
+      "콜")
+check("림프 없이 첫 진입 (hero_bet 0, 콜 1) 은 그대로 오픈 판단",
+      dict(PF, hero=["Ah", "Kd"], players=6, hero_pos="CO", situation="open", stack_bb=100, my_stack=100,
+           pot=1.5, pot_total=1.5, call=1.0, hero_bet=0.0), "레이즈")
+
 # --- 결과 -----------------------------------------------------------------------
 failed = 0
 for ok, name, res in results:

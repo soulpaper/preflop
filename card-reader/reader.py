@@ -122,7 +122,7 @@ TOURNEY_INTERVAL = 5.0  # 토너먼트 머리글(총 상금 / 내 순위) 읽기
 TOURNEY_REFRESH = 60.0  # 머리글 화면이 그대로여도 이 시간마다 다시 읽음
 TOURNEY_JUMP = 1.5      # 총 상금이 이 배수 이상 바뀌면 다른 토너먼트 (자동 참가자 수 추정을 새로 시작)
 TOURNEY_STRUCTURES = (("standard", "표준"), ("flat", "평평"), ("top_heavy", "상위 집중"))
-TURN_KEYS = ("to_act", "preaction", "call", "can_check", "can_raise")  # 액션 바에서 나오는 값 (내 차례 신호와 함께 바로 반영)
+TURN_KEYS = ("to_act", "preaction", "bar", "call", "can_check", "can_raise")  # 액션 바에서 나오는 값 (내 차례 신호와 함께 바로 반영)
 # 카드 잠금: 확정된 내 카드/보드 카드는 핸드가 끝날 때까지 다시 매칭하지 않는다 (반짝임·말풍선·글로우와 무관)
 LOCK_STRIKES = 2       # 잠금을 푸는 화면 신호(뒷면 / 카드 사라짐)가 이만큼 연속 프레임이어야 풂
 PRESENT_MIN_FACE = 0.15  # 잠근 자리에 카드 면(밝은 저채도)이 이 비율 미만이고 뒷면도 아니면 '카드 없음' (실측 앞면 0.57+, 뒷면 0.32+)
@@ -245,6 +245,31 @@ def signature(img):
     f = min(1.0, SIG_SIDE / max(1, h, w))
     return cv2.resize(gray, (max(1, round(w * f)), max(1, round(h * f))),
                       interpolation=cv2.INTER_AREA).astype(np.float32)
+
+
+def guess_situation(ts):
+    """테이블 상태의 preflop 이 상황을 못 정했을 때 바닥 벳으로 대략: 내 벳보다 큰 레이즈가 있으면 1단계 = 'vsopen',
+    2단계 이상 = 'vs3bet'. 레이즈가 없거나 내가 가장 크게 냈으면 None (모름)."""
+    seats = ts.get("seats") or []
+    bets = {x.get("key"): _number(x.get("bet")) for x in seats if x.get("in_hand") or x.get("key") == "hero"}
+    mine = bets.get("hero") or _number((ts.get("preflop") or {}).get("hero_bet")) or 0.0
+    levels = []
+    for v in sorted(v for v in bets.values() if v is not None and v > 1.05):
+        if not levels or v - levels[-1] > 0.05:
+            levels.append(v)
+    if not levels or mine >= levels[-1] - 0.05:
+        return None
+    return "vsopen" if len(levels) == 1 else "vs3bet"
+
+
+def _occluded(labels, prev):
+    """labels 가 prev 에서 몇 장이 가려진 모습인가: 보이는 카드(1장 이상)가 전부 prev 안에 같은 순서로 있고
+    ? 가 아닌 다른 카드가 없음."""
+    known = [x for x in labels if ev.is_card(x)]
+    if not known or any(x != UNKNOWN and not ev.is_card(x) for x in labels):
+        return False
+    it = iter(p for p in prev if ev.is_card(p))
+    return all(any(k == p for p in it) for k in known)
 
 
 def sig_changed(prev, cur):
@@ -1949,9 +1974,13 @@ class App:
         for key in ("pot", "my_stack"):  # "pot": 예전 방식 영역 (읽은 값을 그대로 팟으로)
             if values.get(key):
                 self.auto_set(key, ocr.format_value(*values[key]))
-        if values.get("call"):  # 콜 버튼 금액 = 상대 벳 (내 차례/미리 선택 때만 보임)
+        ts = self.table_state
+        # 콜 금액 영역은 파란 '콜' 버튼일 때만 믿는다: 초록 '체크' 버튼 글자·빈 바닥을 숫자로 읽은 값('41')이 입력칸에 남아
+        # 다음 결정의 콜 금액으로 쓰였다. 테이블 상태가 없으면 (예전 방식) 그대로
+        call_bar = not ts or ts.get("bar", "call") == "call"
+        if values.get("call") and call_bar:  # 콜 버튼 금액 = 상대 벳 (내 차례/미리 선택 때만 보임)
             self.auto_set("bet", ocr.format_value(*values["call"]))
-        elif "call" in (self.cfg.get("number_regions") or {}) and self.ocr_written.get("bet") \
+        elif ("call" in (self.cfg.get("number_regions") or {}) or values.get("call")) and self.ocr_written.get("bet") \
                 and self.inputs["bet"].get() == self.ocr_written["bet"]:
             # 버튼이 사라짐 = 지금 콜할 벳 없음. 자동으로 넣었던 예전 콜 금액이 남아 있으면 다음 스트리트 팟에서
             # 빠져 팟 오즈가 50% 가까이 튐 → 지운다 (직접 입력한 값은 그대로)
@@ -2095,8 +2124,12 @@ class App:
     def hold(self, key, labels):
         """같은 핸드 동안 이미 읽은 카드는 말풍선·이펙트에 가려 ?가 돼도 유지.
 
-        카드 수가 줄거나, 뒷면이 보이거나, 읽힌 카드가 다른 카드로 바뀌면 새 핸드로 보고 기억을 지운다."""
+        칩 더미·기울어진 카드에 한 장이 통째로 가려져 장수가 줄어도, 보이는 카드가 모두 기억한 카드(같은 순서)면 그대로 유지
+        (리버 9♦ 위에 칩이 올라가 보드가 턴으로, 기울어진 7♥ 이 빠져 내 카드가 1장으로 보였다).
+        카드가 다 사라지거나, 뒷면이 보이거나, 읽힌 카드가 다른 카드로 바뀌면 새 핸드로 보고 기억을 지운다."""
         prev = self.memory.get(key, [])
+        if BACK not in labels and 0 < len(labels) < len(prev) and _occluded(labels, prev):
+            return list(prev)
         if BACK in labels or len(labels) < len(prev) or any(
                 ev.is_card(a) and ev.is_card(b) and a != b for a, b in zip(labels, prev)):
             prev = []
@@ -2402,16 +2435,62 @@ class App:
                 auto["players"] = max(6, min(10, int(players)))
             if pre.get("situation"):
                 auto["situation"] = pre["situation"]
+            elif ts.get("hero_in_hand"):
+                guess = guess_situation(ts)
+                if guess:  # 테이블이 상황을 못 정함 (림프 후 레이즈·콜드 3벳 …) → 저장된 '첫 진입' 을 그대로 쓰지 않는다
+                    auto["situation"] = guess
             if ts.get("hero_pos"):
                 auto["hero"] = ts["hero_pos"]
             if pre.get("villain_pos"):
                 auto["villain"] = pre["villain_pos"]
             if auto:
                 out["preflop"] = auto
+                hero = tuple(c for c in self.view.get("hero", []) if ev.is_card(c))
+                if len(hero) == 2:  # 플랍 뒤 '프리플랍: …' 요약용 (칩이 치워진 뒤 프레임은 상황이 비므로 합친다)
+                    memo = getattr(self, "pre_auto_memo", None)
+                    base = dict(memo[1]) if memo and memo[0] == hero else {}
+                    base.update(auto)
+                    raises = _number(pre.get("raises"))
+                    if raises is not None:  # 이번 핸드 프리플랍 레이즈 단계 최댓값 (3벳/4벳 팟 판단용)
+                        base["raises"] = max(int(raises), int(base.get("raises") or 0))
+                    if pre.get("situation") is None and pre.get("why") == "hero made the last raise":
+                        base["hero_last_raise"] = True
+                    self.pre_auto_memo = (hero, base)
         return out
 
+    def preflop_note(self):
+        """플랍 뒤 '프리플랍: 포지션 · 상황' 한 줄 — 이번 핸드 프리플랍에서 읽은 값만 (저장된 선택값은 지난 핸드일 수 있음)."""
+        hero = tuple(c for c in self.view.get("hero", []) if ev.is_card(c))
+        memo = getattr(self, "pre_auto_memo", None)
+        auto = memo[1] if memo and memo[0] == hero else {}
+        pos = (self.table_state or {}).get("hero_pos") or auto.get("hero")
+        if not pos:
+            return None
+        sit = auto.get("situation")
+        text = f"프리플랍: {pos}" + (f" · {dict(pf.SITUATIONS).get(sit, sit)}" if sit else "")
+        if sit and auto.get("villain") and sit in pf.VILLAIN_LABEL:
+            text += f" · {pf.VILLAIN_LABEL[sit]} {auto['villain']}"
+        return text
+
     def opponents(self):
-        return self.auto_values().get("opponents") or self.cfg["opponents"]
+        """에쿼티 계산 상대 수. 직접 고른 값이어도 테이블 상태가 본 '핸드에 남은 상대' 수를 넘지 않게."""
+        n = self.auto_values().get("opponents") or self.cfg["opponents"]
+        cap = self.max_opponents()
+        return max(1, min(int(n), cap)) if cap else n
+
+    def max_opponents(self):
+        """테이블 상태가 믿을 만할 때 핸드에 남은 상대 수 (모르면 None)."""
+        ts = self.table_state
+        if not ts or ts.get("layout_ok") is False or not ts.get("hero_in_hand"):
+            return None
+        k = _number(ts.get("opponents_in_hand"))
+        return max(1, int(k)) if k else None
+
+    def bet_typed(self):
+        """'상대 벳' 입력칸 값을 직접 입력했나 (OCR 이 자동으로 넣은 값이 아님)."""
+        inp = (getattr(self, "inputs", None) or {}).get("bet")
+        v = inp.get() if inp is not None else ""
+        return bool(v) and v != self.ocr_written.get("bet")
 
     # --- 계산 시점 (무거운 계산은 내 차례가 올 때만) ------------------------------------
     def log_once(self, title, ctx=None):
@@ -2550,15 +2629,33 @@ class App:
         opp = [_number(x.get("bet")) or 0.0 for x in seats if x.get("in_hand") and x.get("key") != "hero"]
         if not opp:
             return None
+        mine = App.hero_invested(ts)
+        return round(max(0.0, max(opp) - mine), 2)
+
+    @staticmethod
+    def hero_invested(ts):
+        """이번 스트리트에 내가 이미 낸 칩 (BB): 내 자리 바닥 벳, 없으면 프리플랍 상태의 hero_bet, 그것도 없으면 0."""
+        seats = ts.get("seats") or []
         hero = next((x for x in seats if x.get("key") == "hero"), None)
         mine = _number(hero.get("bet")) if hero else None
         if mine is None:
             mine = _number((ts.get("preflop") or {}).get("hero_bet")) or 0.0
-        return round(max(0.0, max(opp) - mine), 2)
+        return mine
 
     def anticipate_ctx(self, ctx):
-        """추천 ctx 를 '내 차례가 왔을 때' 기준으로: 예상 콜 금액, 내 차례, 체크 가능 = 예상 콜 0."""
-        call = self.estimated_call(self.table_state or {})
+        """추천 ctx 를 '내 차례가 왔을 때' 기준으로: 예상 콜 금액, 내 차례, 체크 가능 = 예상 콜 0.
+        미리 선택 버튼(preaction)이 보이면 그 버튼이 정답: 파란 '콜 3BB' = 콜 3, 초록 '체크' = 체크.
+        (바닥 칩으로 계산한 예상 금액은 내 림프 1BB 를 잘못 읽으면 0 이 되어 '체크' 를 추천했다)"""
+        ts = self.table_state or {}
+        bar, ts_call = ts.get("bar"), _number(ts.get("call"))
+        if ts.get("preaction") and bar == "check":
+            return dict(ctx, call=0.0, to_act=True, can_check=True)
+        if ts.get("preaction") and bar == "call" and ts_call is not None and ts_call > 0:
+            return dict(ctx, call=ts_call, to_act=True, can_check=False)
+        call = self.estimated_call(ts)
+        if ts.get("preaction") and bar == "call" and (call is None or call <= 0):
+            call = None   # 콜 버튼이 보이는데 금액을 못 읽음 → 체크로 보지 않는다
+            return dict(ctx, call=call, to_act=True, can_check=False)
         return dict(ctx, call=call, to_act=True, can_check=None if call is None else call == 0)
 
     def result_stale(self):
@@ -2591,6 +2688,12 @@ class App:
             self.advice, self.advice_status = None, None
             return
         res = self.result
+        if self.view.get("message") and self.fold_view is None:
+            # 카드 인식 대기(내 카드 1장만 보임 등): 계산 중이어도 지난 추천을 남기지 않는다
+            self.advice, self.advice_key, self.advice_cards, self.advice_stale, self.advice_pre = None, None, None, False, False
+            self.advice_why = "message"
+            self.advice_status = self.status_for("message")
+            return
         if self.computing and not (res and res.get("equity") is not None and self.result_state == self.computed_state):
             if self.advice_pre and not self.anticipating():  # 차례가 왔는데 미리 계산과 상황이 다름 → 새 결과 전까지 흐리게
                 self.advice_stale = True
@@ -2729,7 +2832,7 @@ class App:
         """포스트플랍 추천에 넘길 위치·주도권·라인 (advisor 의 hero_ip / aggressor / flop_line, 솔버 조회용 villain_pos 등).
         내 액션도 핸드 추적기에 들어 있다 (좌석 'hero'). 추적을 믿을 수 없으면 프리플랍 마지막 레이저는 테이블 상태 기억(pre_memo)으로,
         그 밖에는 None(모름). 포스트플랍엔 프리플랍 선택값이 의미 없어서 상대 포지션·상황도 여기서 다시 정한다."""
-        out = {"situation": None}
+        out = {"situation": None, "villain_pos": None}   # 프리플랍 선택값(지난 핸드일 수 있음)의 상대 포지션은 쓰지 않음
         ip = hero_ip_from(ts)
         if ip is not None:
             out["hero_ip"] = ip
@@ -2740,8 +2843,13 @@ class App:
         stage = {3: 1, 4: 2, 5: 3}.get(nboard)
         if hist and (hist["street"] != stage or set(hist["hero_cards"]) != set(hero_str)):
             hist = None   # 다른 핸드/스트리트의 요약 (프레임이 아직 따라오지 못함)
+        memo = getattr(self, "pre_auto_memo", None)
+        memo = memo[1] if memo and set(memo[0]) == set(hero_str) else {}
+        if memo.get("raises") is not None:  # 프리플랍 화면에서 본 레이즈 단계 (추적을 못 믿을 때도 3벳/4벳 팟은 안다)
+            out["pre_raises"] = memo["raises"]
         if hist and hist["reliable"]:
             raises = hist["pre_raises"]
+            out["pre_raises"] = max(raises, out.get("pre_raises") or 0)
             if raises >= 2:
                 out["situation"] = "vs3bet"   # 3벳 이상 팟 — 솔버 라이브러리(SRP) 대상 아님
             elif raises == 1:
@@ -2759,6 +2867,8 @@ class App:
                 if line:
                     out["flop_line"] = line
         else:
+            if (out.get("pre_raises") or 0) >= 2:
+                out["situation"] = "vs3bet"   # 3벳 이상 팟 (프리플랍 화면 기억)
             memo = self.pre_memo
             agg = memo["agg"] if stage == 1 and memo and set(memo["hero"]) == set(hero_str) else None
         out["aggressor"] = agg
@@ -2785,12 +2895,27 @@ class App:
         def in_bb(key):  # 추천 모듈은 BB 단위. 입력칸마다 단위(BB/칩)가 달라도 맞게 (amount_bb)
             v = self.amount_bb(key)
             return round(v, 2) if v is not None else None
+        hero_view = [c for c in self.view.get("hero", []) if ev.is_card(c)]
+        if len(res.get("hero") or []) != 2 or [ev.card_str(c) for c in res["hero"]] != hero_view:
+            # 내 카드 2장이 확정돼 지금 화면과 같은 계산일 때만 추천 (한 장만 보이는데 지난 추천이 남아 있었다)
+            self.advice_why = "message"
+            return None
         board = res["board"]
         pot = in_bb("pot")
         call = in_bb("bet")
-        if ts.get("to_act") is not None:  # 테이블 상태의 콜 금액은 이미 BB 단위. 내 차례가 아니면 콜 금액 없음
+        can_check = ts.get("can_check")
+        if ts.get("to_act") is not None:
+            # 콜 금액은 지금 보이는 액션 바에서만 (테이블 상태 값은 이미 BB 단위). 체크 가능 = 콜 0.
+            # 입력칸 값은 직접 입력했을 때만 대신 쓴다 — OCR 이 자동으로 넣은 값은 지난 스트리트/체크 버튼 글자일 수 있다
             ts_call = _number(ts.get("call"))
-            call = ts_call if ts_call is not None else (call if ts.get("to_act") else None)
+            if can_check:
+                call = 0.0
+            elif ts_call is not None:
+                call = ts_call
+            elif not (ts.get("to_act") and self.bet_typed()):
+                call = None
+        if call is not None and call <= 0 and can_check is None:
+            can_check = True
         total = self.ocr_values.get("pot_total") if self.cfg.get("auto_numbers") else None
         pot_total = None
         if total:  # OCR (값, 단위): 'BB' 표기면 그대로, '만' 이면 칩
@@ -2812,7 +2937,7 @@ class App:
             "board": [ev.card_str(c) for c in board],
             "street": STREET_KEYS.get(len(board), "preflop"),
             "players": _number(ts.get("pos_players")) or _number(ts.get("players")) or st["players"],
-            "opponents_in_hand": res["opponents"],
+            "opponents_in_hand": min(res["opponents"], self.max_opponents() or res["opponents"]),
             "hero_pos": ts.get("hero_pos") or st["hero"],
             "situation": st["situation"],
             "villain_pos": st.get("villain") if st["villains"] else None,
@@ -2823,13 +2948,16 @@ class App:
             "pot_total": pot_total,
             "call": call,
             "to_act": ts.get("to_act"),
-            "can_check": ts.get("can_check"),
+            "can_check": can_check,
             "ante": ante if ante else False,
             "equity": res["equity"]["equity"],
             "outs": res.get("outs"),
             "hand_name": res["hand"],
             "facing_allin": facing_allin,
         }
+        if not board and ts.get("seats"):
+            # 프리플랍에 이미 낸 내 칩 (림프 1BB 등): 림프 후 레이즈를 '첫 진입' 으로 보지 않게 (advisor 의 hero_bet)
+            ctx["hero_bet"] = round(self.hero_invested(ts), 2)
         try:  # 토너먼트 ICM 입력 (켜져 있고 참가자 수/지급 인원이 있을 때만). ctx 가 추천 캐시 키라 값이 바뀌면 새로 계산됨
             self.icm_ctx(ctx, ts, len(board))
         except Exception:
@@ -2958,10 +3086,12 @@ class App:
         if lk is not None:
             why = self.lock_signal(lk)
             if why is None:
+                # 일부 자리만 안 보이는 건 칩 더미·이펙트가 가린 것 (리버에 9♦ 위로 벳 칩이 올라가 보드가 턴으로 돌아갔다)
+                # → 잠금 유지. 전부 사라져야(보드 치움) 푼다. 새 핸드는 lock_signal(딜러 이동·핸드 종료·카드 없음)로도 푼다
                 gone = [card_presence(_crop_rect(img, r)) != "face" for r, _ in lk["slots"]]
-                lk["strikes"] = lk["strikes"] + 1 if any(gone) else 0
+                lk["strikes"] = lk["strikes"] + 1 if all(gone) else 0
                 if lk["strikes"] >= LOCK_STRIKES:
-                    why = "cleared" if all(gone) else "fewer"
+                    why = "cleared"
             if why is not None:
                 if why == "cleared" and len(lk["slots"]) >= 3:
                     self.board_resets += 1   # 보드가 비워짐 = 핸드 끝 → 내 카드 잠금도 풂
@@ -3052,6 +3182,8 @@ class App:
             self.memory = {}
             self.computed_state = None
             self.result = self.result_state = None
+            self.generation += 1          # 진행 중인 계산 결과가 돌아와도 화면·추천에 쓰지 않음 (캐시만)
+            self.computing, self.job_key = False, None
             self.schedule_advice()
             return
         if state != self.computed_state:
@@ -3462,9 +3594,9 @@ class App:
                 guide = lambda c: self.sec_outs(c, res["outs"])
             else:
                 guide_text = "아웃츠 — 플랍·턴에 완성할 드로우가 있으면 표시"
-            sit = dict(pf.SITUATIONS).get(st["situation"], "")
-            notes.append(f"프리플랍: {st['hero']} · {sit}" + (f" · {pf.VILLAIN_LABEL[st['situation']]} {st['villain']}"
-                                                        if st["villains"] else ""))
+            note = self.preflop_note()
+            if note:
+                notes.append(note)
         plan.append(("guide", guide, guide_text))
         plan.append(("tabs", self.sec_tabs, None))
         if self.tab != "inputs":

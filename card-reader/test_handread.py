@@ -247,6 +247,28 @@ _r2 = hr.estimate({"V": {"pos": "CO", "preflop": ["open"], "flop": ["bet"]}}, {"
 test("board dict flop 문자열 'As7d2c' 도 플랍으로 반영", _r1["n_actions"] == 1 and _r1["range"] == _r2["range"],
      f"{_r1['street']} {_r1['n_actions']}")
 
+# --- 회귀 2026-10-30: 페어 보드에서 '보드 페어 + 내 원페어' 를 투페어로 봐서 '투페어 91%' 로 좁혀짐 ------------------
+_bp = hr._board_info([ev.parse_card(x) for x in ("Ah", "9d", "4c", "3d", "9h")])
+
+
+def KP(s):
+    return hr._classify(_bp, *sorted((ev.parse_card(s[:2]), ev.parse_card(s[2:])), reverse=True))[:2]
+
+
+test("페어 보드 A9439: A4 = 탑페어(+보드 페어) → 탑페어+", KP("As4s") == (hr.T, 3), KP("As4s"))
+test("페어 보드 A9439: 88 (보드 아래 포켓) → 중간·약한 페어", KP("8s8c") == (hr.M, 4), KP("8s8c"))
+test("페어 보드 A9439: KK (A 아래 포켓) → 중간·약한 페어", KP("KsKc") == (hr.M, 4), KP("KsKc"))
+test("페어 보드 A9439: 43 (보드 페어 99 + 44 가 최선) → 중간·약한 페어", KP("4s3s") == (hr.M, 4), KP("4s3s"))
+_bq = hr._board_info([ev.parse_card(x) for x in ("Ah", "9d", "4c")])
+test("페어 없는 보드 A94: A4 = 진짜 투페어 (그대로)", hr._classify(_bq, ev.parse_card("As"), ev.parse_card("4s"))[:2] == (hr.W, 2))
+test("페어 보드 A9439: 9x = 트립스", KP("9s8c")[1] == 1, KP("9s8c"))
+_sb = one({"pos": "SB", "preflop": ["blind", "call"], "flop": ["check"], "turn": ["check"], "river": ["bet"]},
+          ["Ah", "9d", "4c", "3d", "9h"], players=6, dead=["Kh", "Kc"])
+test("SB 블라인드→콜, 체크·체크·리버 벳 (A9439): 투페어 비중이 압도적이지 않음 (< 50%)",
+     _sb["classes"]["투페어"] < 50, f"{_sb['classes']} 폭 {_sb['width_pct']}%")
+test("SB 블라인드→콜, 체크·체크·리버 벳 (A9439): 범위 폭 5% 이상 (상위 2% 로 좁혀지지 않음)",
+     _sb["width_pct"] >= 5, f"{_sb['width_pct']}%")
+
 # --- 결과 ---------------------------------------------------------------------------------------
 failed = 0
 for ok, name, info in results:

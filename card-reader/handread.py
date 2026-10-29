@@ -274,8 +274,13 @@ def _classify(bi, hi, lo):
     elif cat == 3 and bcat < 3:
         bucket, cls = N, 1
     elif cat == 2 and bcat < 2:
-        if bcat == 1:                      # 보드 페어 + 내 원페어 → 약한 투페어
-            bucket, cls = T, 2
+        if bcat == 1:
+            # 보드 페어 + 내 원페어 = 실제로는 원페어 강도: 내 페어(포켓 페어 또는 보드와 맞춘 카드)로 나눈다.
+            # 예전엔 전부 '투페어'(T 버킷)로 봐서 A9439 보드에서 범위가 '투페어 91%' 로 표시되고, 보드 아래 포켓 페어(88-55)가
+            # 벳 액션에 탑페어처럼 살아남아 범위가 엉뚱하게 좁혀졌다 (2026-10-30 라이브)
+            own = r1 if r1 == r2 else (r1 if r1 in bi.rset else r2)
+            top = own > bi.rmax if r1 == r2 else own == bi.rmax
+            bucket, cls = (T, 3) if top else (M, 4)
         else:
             bucket, cls = W, 2
     if bucket is None:

@@ -121,6 +121,10 @@ MW_BEHIND_CAP = 0.06
 ONEPAIR_STEP_STRONG, ONEPAIR_STEP_WEAK = 0.10, 0.25  # 원페어 다자 벳 취약 할인 (상대 1명 추가당)
 OFFSUIT_ISO_PCT = {0: 10, 1: 8, 2: 6}  # 림퍼 수별 오프수트 레이즈 상한 (상위 %), 3명 이상은 5.5
 PREMIUM_OFFSUIT_PCT = 5.5              # AKo 까지
+# 림프한 뒤 레이즈를 받음 (이미 1BB 를 냄): 차트(첫 진입/상대 오픈)가 아니라 팟 오즈로 판단
+LIMP_RERAISE_PCT = 4.0   # 이 안의 핸드(QQ+, AK)는 다시 레이즈
+LIMP_CALL_PCT = 50.0     # 림프할 만한 핸드 폭 — 팟 오즈가 좋으면 콜
+LIMP_CALL_NEED = 0.25    # 필요 승률이 이 이하(팟이 3:1 이상)면 콜
 VALUE_4BET = {"AA", "KK", "QQ", "JJ", "AKs", "AKo"}  # 콜러가 있어도 4벳하는 밸류 핸드
 RB_PEN_FRAC, RB_DISC_STEP, RB_DISC_CAP = 0.03, 0.01, 0.06   # 레인지 기준 에쿼티의 잔여 할인
 FOLD_HIGH, FOLD_LOW = 60, 30      # 상대 벳 폴드율 (%)
@@ -413,6 +417,8 @@ class _Ctx:
         self.hero_pos = g("hero_pos") or None
         self.situation = g("situation") or None
         self.villain_pos = g("villain_pos") or None
+        hb = _num(g("hero_bet"))   # 프리플랍에 이미 낸 내 칩 (블라인드·림프 포함, BB) — 모르면 None
+        self.hero_in = hb if hb is not None and hb > 0 and n == 0 else None
         self.my_stack = _num(g("my_stack"))
         eff = _num(g("stack_bb"))
         self.eff = eff if eff else self.my_stack
@@ -421,6 +427,12 @@ class _Ctx:
         self.pot = _num(g("pot"))
         self.pot_total = _num(g("pot_total"))
         call = _num(g("call"))
+        self.can_check = g("can_check")
+        if self.can_check is True and call is not None and call > 0:
+            # 체크할 수 있으면 콜할 벳이 없다 — 남은 콜 금액은 지난 스트리트 벳/오인식 (체크 버튼 글자를 '41BB' 로 읽었다)
+            call = 0.0
+        if self.can_check is True and call is None:
+            call = 0.0
         self.call = call if call and call > 0 else 0.0
         self.call_known = call is not None
         mine = self.my_stack or self.eff   # 내 뒷스택 (없으면 유효 스택)
@@ -431,7 +443,6 @@ class _Ctx:
             self.call = mine
             if self.pot_total:
                 self.pot_total = max(self.call, self.pot_total - excess)
-        self.can_check = g("can_check")
         if self.can_check is None and self.call_known:
             self.can_check = self.call == 0
         self.to_act = g("to_act")
@@ -467,7 +478,9 @@ class _Ctx:
         agg = g("aggressor")
         self.aggressor = None if agg is None else bool(agg)
         self.flop_line = g("flop_line") or None
-        self.excess = excess if mine and call and call > mine else 0.0   # 내 스택을 넘는 상대 벳 (돌려받음)
+        pr = _num(g("pre_raises"))
+        self.pre_raises = int(pr) if pr is not None else None
+        self.excess =excess if mine and call and call > mine else 0.0   # 내 스택을 넘는 상대 벳 (돌려받음)
         self.icm = None
         if isinstance(g("tournament"), dict):
             try:  # ICM 은 부가 보정 — 실패하면 칩EV 그대로
@@ -775,6 +788,68 @@ def _pf_ranges(c, sit, pos, villain, players, stack):
 
 
 # --- 진입점 -----------------------------------------------------------------------
+LOW_BOARD_TOP = 7        # '낮은 보드' = 가장 높은 보드 카드가 9 이하 (랭크 번호: 2=0 … 9=7, A=12)
+BIG_POT_RAISES = 2       # 프리플랍 레이즈 단계가 이 이상 = 3벳/4벳 팟
+
+
+def checkable(c):
+    """체크할 수 있나 (체크 버튼이 보임, 또는 콜 금액이 0 으로 알려짐)."""
+    return c.can_check is True or (c.call_known and c.call <= 0)
+
+
+def big_pot(c):
+    """3벳/4벳 팟인가 (프리플랍 레이즈 단계 2 이상)."""
+    return (c.pre_raises or 0) >= BIG_POT_RAISES or c.situation in ("vs3bet", "vs4bet")
+
+
+def low_board(board):
+    """9 이하 카드뿐인 보드, 보드만으로 4플러시/4장 스트레이트가 아님 (오버페어가 보통 벳에 접을 이유가 없는 보드)."""
+    if len(board) < 3 or max(x >> 2 for x in board) > LOW_BOARD_TOP:
+        return False
+    tex = _texture(board)
+    ranks = {x >> 2 for x in board} | ({-1} if any(x >> 2 == 12 for x in board) else set())
+    four_straight = any(sum(1 for r in ranks if lo <= r <= lo + 4) >= 4 for lo in range(-1, 9))
+    return not tex["four_flush"] and not four_straight
+
+
+def bet_fraction(c):
+    """상대 벳 / 벳 전 팟 (모르면 None)."""
+    if not c.call:
+        return 0.0
+    pot = c.total_pot()
+    before = c.pot if c.pot is not None else (max(0.0, pot - c.call) if pot is not None else None)
+    return c.call / before if before else None
+
+
+def overpair_spot(c):
+    """3벳/4벳 팟 · 낮은 보드 · 오버페어 · 헤즈업 · 보통 벳(팟 이하) — 절대 폴드하지 않는 자리."""
+    if not c.hero or len(c.hero) != 2 or c.street not in ("flop", "turn", "river") or c.opp != 1 or not big_pot(c):
+        return False
+    hr = [x >> 2 for x in c.hero]
+    if hr[0] != hr[1] or hr[0] <= max(x >> 2 for x in c.board) or not low_board(c.board):
+        return False
+    frac = bet_fraction(c)
+    return c.call > 0 and (frac is None or frac <= 1.0 + 1e-9)
+
+
+def _invariants(c, r):
+    """어떤 경로(규칙·GTO·ICM)로 나온 추천이든 지켜야 하는 것:
+      1) 체크할 수 있으면 폴드하지 않는다 (공짜로 다음 카드).
+      2) 3벳/4벳 팟 낮은 보드의 오버페어는 헤즈업 보통 벳에 폴드하지 않는다 (상대 범위를 좁게 잘못 읽어도)."""
+    if r.get("action") != FOLD:
+        return r
+    if checkable(c):
+        r.update(action=CHECK, size_bb=None, size_text="", color_key=COLOR[CHECK],
+                 reason="체크 가능 — 폴드하지 않고 체크 (공짜로 다음 카드)",
+                 detail=[f"원래 판단: {r.get('reason')}"] + list(r.get("detail") or [])[:2])
+    elif overpair_spot(c):
+        r.update(action=CALL, size_bb=round(c.call, 1), size_text="", color_key=COLOR[CALL],
+                 reason="3벳/4벳 팟 · 낮은 보드의 오버페어 → 보통 벳에는 폴드하지 않고 콜",
+                 detail=[f"원래 판단: {r.get('reason')}"] + list(r.get("detail") or [])[:2],
+                 confidence=_lower(r.get("confidence") or "medium"))
+    return r
+
+
 def recommend(ctx):
     c = _Ctx(ctx or {})
     if not c.hero or len(c.hero) != 2:
@@ -803,6 +878,7 @@ def recommend(ctx):
             r, gto_mode = _gto_overlay(c, ctx or {}, r)
         except Exception:
             gto_mode = None
+    _invariants(c, r)
     if c.to_act is False and r["action"] != WAIT:
         plan = r["action"] + (f" {r['size_text']}" if r["size_text"] else "")
         r["detail"] = ([f"차례가 오면: {plan} — {r['reason']}"] + r["detail"])[:3]
@@ -1198,12 +1274,53 @@ def _preflop_math(c, hand, strength, name, pos, players, call, eff, pot_total, c
             "need_a": need_a, "margin": (eq - need_a) if allin else (mine - req)}
 
 
+def _posted(c, pos):
+    """프리플랍에 이미 낸 내 칩: 블라인드, 또는 테이블에서 읽은 내 벳(림프 1BB 등) 중 큰 값.
+    예전엔 블라인드만 봐서 림프 뒤 레이즈를 받으면 '첫 진입'·오픈 금액 3BB(실제 4BB)로 잘못 봤다."""
+    blind = {"SB": 0.5, "BB": 1.0}.get(pos, 0.0)
+    return max(blind, c.hero_in or 0.0)
+
+
+def _limped(c, pos):
+    """내가 림프(1BB 콜 / SB 컴플리트)한 뒤 레이즈를 받은 상황인가 (BB 의 1BB 는 블라인드라 아님)."""
+    hin = c.hero_in
+    return (hin is not None and pos != "BB" and abs(hin - 1.0) <= 0.05 and c.call > 0.05
+            and not c.facing_allin)
+
+
+def _limp_raised(c, hand, pos, eff, pot_total, head, conf):
+    """림프 후 레이즈 받음 → 팟 오즈로 콜/폴드, 프리미엄은 다시 레이즈. 차트가 맞지 않는 자리라 None 이면 원래 경로."""
+    call = c.call
+    if eff and call > PRESSURE * eff:
+        return None   # 큰 금액: 원래 압박 규칙
+    pot = pot_total or (c.hero_in + call)
+    need = call / (pot + call)
+    raise_to = call + c.hero_in
+    odds = f"팟 오즈: 콜 {_bb(call)} / 최종 팟 {_bb(pot + call)} = 필요 승률 {_pct(need)} · 이미 {_bb(c.hero_in)} 냄"
+    where = f"{pos} 림프 후 레이즈 {_bb(raise_to)}"
+    if hand in pf.top_pct(LIMP_RERAISE_PCT):
+        size = raise_to * 3 + max(0, c.opp - 1) * raise_to
+        return _raise_or_jam(size, eff, f"{where}: 프리미엄 → 다시 레이즈 (림프-레이즈)",
+                             [head, f"레이즈 {_bb(raise_to)} × 3" + (f" + 상대 {c.opp - 1}명" if c.opp > 1 else "")],
+                             conf, _commit_frac(eff))
+    if need <= LIMP_CALL_NEED + 1e-9 and hand in pf.top_pct(LIMP_CALL_PCT):
+        return _out(CALL, call, None, f"{where}: 팟 오즈 충분 → 콜", [head, odds], conf)
+    if c.rb and c.equity is not None:
+        R = _realization(hand, pf.DATA["G"].index(hand) + 1, pos, False)
+        mine = c.equity * R
+        line = f"보정 에쿼티 {_pct(mine)} (에쿼티 {_pct(c.equity)} × 실현 {R:.2f}) vs 필요 {_pct(need)}"
+        if mine >= need:
+            return _out(CALL, call, None, f"{where}: 에쿼티 ≥ 필요 승률 → 콜", [head, odds, line], _lower(conf))
+        return _out(FOLD, reason=f"{where}: 에쿼티 < 필요 승률 → 폴드", detail=[head, odds, line], confidence=_lower(conf))
+    return _out(FOLD, reason=f"{where}: 팟 오즈 부족 → 폴드", detail=[head, odds], confidence=_lower(conf))
+
+
 def _preflop_core(c, state):
     hand = pf.hand_code(c.hero)
     strength = pf.DATA["G"].index(hand) + 1
     players = _resolve_players(c) if c.hero_pos else None
     pos = c.hero_pos if players else None
-    posted = {"SB": 0.5, "BB": 1.0}.get(pos, 0.0)
+    posted = _posted(c, pos)
     call, eff = c.call, c.eff
     dead = 1.5 + c.ante_total
     pot_total = c.total_pot()
@@ -1241,6 +1358,11 @@ def _preflop_core(c, state):
         return _out(CHECK, reason="BB 체크 옵션 — 공짜로 플랍 보기",
                     detail=[head, f"림퍼 {limpers}명: 오프수트는 상위 {_offsuit_pct(limpers):g}% 만 레이즈" if limpers
                             else "상위 10% 핸드만 레이즈"], confidence=conf)
+
+    if pos is not None and _limped(c, pos):
+        r = _limp_raised(c, hand, pos, eff, pot_total, head, "medium" if conf == "high" else conf)
+        if r is not None:
+            return r
 
     if pos is None or pos not in pf.valid_heroes(sit, players):
         return _preflop_generic(c, hand, strength, unopened, head)
@@ -2086,7 +2208,7 @@ def _preflop_plan(c, r):
     if eff is not None and eff <= PUSHFOLD_BB:
         return []
     hand = pf.hand_code(c.hero)
-    posted = {"SB": 0.5, "BB": 1.0}.get(pos, 0.0)
+    posted = _posted(c, pos)
     unopened = c.call + posted <= 1.0 + 1e-6
     sit = c.situation if c.situation in DEEP_SITUATIONS else ("open" if unopened else "vsopen")
     if sit == "open" and not unopened and c.call + posted >= 2.0:

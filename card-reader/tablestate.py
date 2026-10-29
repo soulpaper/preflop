@@ -46,7 +46,9 @@ DISC_SIZE = (0.06, 0.13)  # 딜러/블라인드 원판 지름 (pw), 실측 0.088
 BUTTON_STD = 12         # 버튼 영역 밝기 표준편차가 이보다 크면 버튼 있음 (실측 있음 ≥24, 없음 ≤5)
 LAMP_STEP = 9           # 예약 버튼 램프 칸: 버튼 바탕과의 밝기 차 (실측 꺼짐 13, 켜짐 180)
 SAME_BET = 0.05         # 이 차이 안의 벳은 같은 금액
-AVATAR_STD = 40         # 아바타 가운데 원 밝기 표준편차가 이보다 크면 사람 있음 (실측 사람 ≥48, 빈 자리 ≤30)
+MID_BLUE = 0.15         # 가운데 버튼이 '콜' (파란 바탕 비율, 실측 ≥0.33)
+MID_TEAL = 0.08         # 가운데 버튼이 '체크' (청록 바탕 비율, 실측 ≥0.16, 다른 화면 0.00)
+AVATAR_STD = 40        # 아바타 가운데 원 밝기 표준편차가 이보다 크면 사람 있음 (실측 사람 ≥48, 빈 자리 ≤30)
 LEFT_SLOTS = {"BL", "L", "UL", "TL"}  # 테이블 왼쪽 좌석: 카드 아이콘이 아바타 오른쪽, 말풍선은 왼쪽
 
 # 카드 뒷면 아이콘 (그레이 36x30, pw=228 화면에서 잘라 냄)
@@ -356,13 +358,9 @@ class TableReader:
                 crops["stack:" + s["key"]] = self._crop_for_ocr(img, box)
 
         # 5. 액션 바
-        buttons = {}
-        for name in ("fold", "call", "raise"):
-            r = bar.get(name)
-            buttons[name] = r is not None and _inside(r, img.shape) and self._button(gray, r)
-        lamp = any(buttons[n] and self._lamp(gray, bar[n]) for n in ("fold", "call"))
+        bar_st = self._bar_pixels(gray, hsv, bar, img.shape)
         amount_box = None
-        if buttons["call"]:
+        if bar_st["kind"] == "call":  # 금액은 파란 '콜' 버튼에서만 읽는다 (초록 '체크' 버튼 글자를 '41' 로 읽었음)
             x, y, w, h = bar["call"]
             amount_box = _text_box(img, (int(x + 0.12 * w), int(y + 0.05 * h), int(0.76 * w), int(0.45 * h)), pw,
                                    min_w=0.04, min_glyphs=3)
@@ -378,9 +376,12 @@ class TableReader:
             s["stack"] = to_bb(v) if v is not None else None
             s["allin"] = bool(s["in_hand"] and s["stack"] == 0.0)
 
-        to_act = buttons["fold"] and buttons["call"] and not lamp
-        call = to_bb(values.get("call")) if amount_box is not None else None
-        can_check = bool(to_act and amount_box is None)  # 가운데 버튼에 금액이 없음 = '체크' (샘플 없음, 추정)
+        to_act, preaction, kind = bar_st["to_act"], bar_st["preaction"], bar_st["kind"]
+        if kind == "check" and (to_act or preaction):
+            call, can_check = 0.0, True   # 초록 '체크' 버튼 = 앞에 벳 없음 (콜할 금액 0)
+        else:
+            call = to_bb(values.get("call")) if amount_box is not None else None
+            can_check = False
 
         # 6. 포지션
         order = [s for s in seats]  # 시계 방향 (내 왼쪽부터, 나는 마지막)
@@ -424,10 +425,11 @@ class TableReader:
                        "in_hand": s["in_hand"], "folded": s["folded"], "allin": s["allin"], "bet": s["bet"],
                        "stack": s["stack"], "bubble": s["bubble"]} for s in seats],
             "to_act": bool(to_act),
-            "preaction": bool(lamp and buttons["fold"]),
+            "preaction": bool(preaction),
+            "bar": kind if (to_act or preaction) else None,   # 'call' / 'check' / None (액션 바 없음)
             "call": call,
             "can_check": can_check,
-            "can_raise": bool(to_act and buttons["raise"]),
+            "can_raise": bool(to_act and bar_st["raise"]),
             "street": None,
             "facing_allin": False,
             "preflop": None,
@@ -465,6 +467,54 @@ class TableReader:
     def _button(gray, rect):
         win = _crop(gray, rect)
         return win.size > 0 and float(win.std()) > BUTTON_STD
+
+    @staticmethod
+    def _mid_kind(hsv, rect):
+        """가운데 버튼 바탕색 → 'call'(파랑) / 'check'(청록) / None.
+        실측 (livecap 77장): 콜 파랑 0.33~0.34, 체크 청록 0.16~0.26, 공개(쇼다운 카드 보이기) 버튼·나무 바닥 0.00."""
+        x, y, w, h = rect
+        win = _crop(hsv, (x + 0.05 * w, y + 0.1 * h, 0.9 * w, 0.8 * h)).reshape(-1, 3).astype(int)
+        if win.size == 0:
+            return None
+        hh, s, v = win[:, 0], win[:, 1], win[:, 2]
+        blue = float(((hh >= 100) & (hh <= 125) & (s >= 80) & (v >= 50)).mean())
+        teal = float(((hh >= 70) & (hh < 100) & (s >= 60) & (v >= 50)).mean())
+        if blue >= MID_BLUE and blue > teal:
+            return "call"
+        if teal >= MID_TEAL:
+            return "check"
+        return None
+
+    def _bar_pixels(self, gray, hsv, bar, shape):
+        """액션 바 픽셀 판정 → {to_act, preaction, kind, raise}.
+        버튼 칸의 밝기 변화(std)만으로는 나무 바닥 무늬(std 8~10, 창마다 12 넘기도 함)나 쇼다운 '공개' 버튼을
+        내 차례로 잘못 봤다 → 가운데 버튼이 파란 '콜' 또는 청록 '체크' 일 때만 액션 바로 본다."""
+        buttons = {}
+        for name in ("fold", "call", "raise"):
+            r = bar.get(name)
+            buttons[name] = r is not None and _inside(r, shape) and self._button(gray, r)
+        kind = self._mid_kind(hsv, bar["call"]) if buttons["call"] else None
+        if not (buttons["fold"] and kind):
+            return {"to_act": False, "preaction": False, "kind": None, "raise": False}
+        lamp = any(self._lamp(gray, bar[n]) for n in ("fold", "call"))
+        return {"to_act": not lamp, "preaction": lamp, "kind": kind, "raise": bool(buttons["raise"] and not lamp)}
+
+    def read_bar(self, img, bar, pw=228.0, unit="BB"):
+        """액션 바만 읽기 (테스트·디버그용): {to_act, preaction, bar, call, can_check}."""
+        gray, hsv = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        st = self._bar_pixels(gray, hsv, bar, img.shape)
+        out = {"to_act": st["to_act"], "preaction": st["preaction"], "bar": st["kind"], "call": None,
+               "can_check": False, "can_raise": st["raise"]}
+        if st["kind"] == "check":
+            out["call"], out["can_check"] = 0.0, True
+        elif st["kind"] == "call":
+            x, y, w, h = bar["call"]
+            box = _text_box(img, (int(x + 0.12 * w), int(y + 0.05 * h), int(0.76 * w), int(0.45 * h)), pw,
+                            min_w=0.04, min_glyphs=3)
+            if box is not None:
+                v = self._ocr({"call": self._crop_for_ocr(img, box)}, unit).get("call")
+                out["call"] = float(v[0]) if v and v[1] in ("BB", None) else None
+        return out
 
     @staticmethod
     def _lamp(gray, rect):

@@ -572,6 +572,29 @@ def test_tablestate_break_screen():
     assert s["layout_ok"] is False
 
 
+def test_call_amount_reread_is_not_a_new_action():
+    """2026-10-30 라이브 KK 핸드: MP 림프 1BB 를 0.9 로 읽었다가 내 레이즈 뒤 1.0 으로 다시 읽음 → '콜 0.9' + '콜 1.0'
+    두 액션이 되어 라인이 꼬였다. 다시 읽은 금액은 직전 콜을 고친다."""
+    tb = Table(handlog.Tracker("s_wobble"), dealer="seat_BL", hero=("Kh", "Kc"))   # SB=UL BB=TC UTG=UR MP=BR CO=hero
+    tb.step()
+    tb.step(bets={"UTG": 1.0}, bubble={"UTG": "call"})
+    tb.step(bets={"MP": 0.9}, bubble={"MP": "call"})          # OCR: 1BB → 0.9
+    tb.step(bets={"hero": 5.0}, bubble={"hero": "raise"})
+    tb.step(fold=["BTN"], bets={"MP": 1.0})                   # 같은 칩을 이제 1.0 으로 읽음
+    tb.step(bets={"SB": 5.0, "BB": 5.0}, bubble={"SB": "call", "BB": "call"})
+    tb.step(bets={"UTG": 5.0, "MP": 5.0}, bubble={"UTG": "call", "MP": "call"})
+    live = tb.tr.live()
+    assert live["seat_BR"]["preflop"] == ["limp", "call"], live["seat_BR"]
+    tb.step(board=["Ah", "9d", "4c"], collect=True, bubble={})
+    tb.step()
+    rec = finish(tb)
+    mp = [(a["act"], a.get("to"), a.get("raises_before")) for a in rec["actions"]["preflop"] if a["seat"] == "seat_BR"]
+    assert mp == [("call", 1.0, 0), ("call", 5.0, 1)], mp
+    # 진짜 새 콜(림프 1 → 레이즈 5 에 콜)은 그대로 두 액션
+    utg = [a["act"] for a in rec["actions"]["preflop"] if a["seat"] == "seat_UR"]
+    assert utg == ["call", "call"], utg
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

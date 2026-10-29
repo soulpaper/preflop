@@ -165,7 +165,9 @@ def common_checks(ctx, res, tag):
     if len(res["detail"]) > 3 or len(res["plan"]) > 3:
         bad(f"{tag}: detail/plan 3줄 초과", ctx, res)
     call = ctx.get("call") or 0
-    if call == 0 and ctx.get("can_check") is True and res["action"] == advisor.FOLD:
+    # 불변식: 체크할 수 있으면(체크 버튼 / 콜 금액 0) 절대 폴드하지 않는다 — 콜 금액이 엉뚱하게 같이 와도 (체크 버튼 글자 '41BB')
+    free = ctx.get("can_check") is True or (ctx.get("call") is not None and ctx["call"] <= 0)
+    if free and res["action"] == advisor.FOLD:
         bad(f"{tag}: 체크 가능한데 폴드", ctx, res["reason"])
     if call > 0 and ctx.get("can_check") is False and res["action"] == advisor.CHECK:
         bad(f"{tag}: 벳을 마주했는데 체크", ctx, res["reason"])
@@ -203,6 +205,12 @@ def post_checks(ctx, k, res):
             bad("post: 필요/보정 에쿼티 부등호가 숫자와 다름", ctx, d)
         if sign == "<" and res["action"] == advisor.FOLD and "드로우" not in res["reason"] and "이상만" not in res["reason"] and ctx.get("to_act") is not False:
             bad("post: 에쿼티 충분 표기인데 폴드", ctx, res["reason"] + " | " + d)
+    # 불변식: 에쿼티·표기의 상대 수는 핸드에 남은 상대 수를 넘지 않는다
+    n_opp = ctx.get("opponents_in_hand")
+    for d in res["detail"] + [res["reason"]]:
+        for m in re.findall(r"상대 (\d+)명", d):
+            if n_opp and int(m) > n_opp:
+                bad("post: 상대 수 > 핸드에 남은 상대", ctx, d)
     if "에쿼티 ≥ 필요 승률" in res["reason"] and not any(" < 보정" in d for d in res["detail"]):
         bad("post: 이유와 수치 불일치", ctx, res["detail"])
     # plan 의 최대 콜 금액: 그 금액의 벳에 실제로 콜(또는 레이즈/올인) 해야 한다
@@ -218,6 +226,93 @@ def post_checks(ctx, k, res):
         counts["plan 최대 콜 재검증"] += 1
         if r2["action"] == advisor.FOLD:
             bad("post: plan '까지 콜' 금액에 폴드", ctx, f"{line} → {r2['reason']} | {r2['detail']}")
+
+
+# --- 라이브 회귀 불변식 (별도 난수: 기존 케이스 순서를 바꾸지 않는다) -------------------------------------
+LOW_RANKS = "98765432"
+
+
+def free_case(r):
+    """체크 버튼이 보이는데 콜 금액이 엉뚱하게 같이 온 경우 (2026-10-30: '체크' 글자를 '41BB' 로 읽음) — 폴드 금지."""
+    ctx, k = post_case(r)
+    ctx = dict(ctx, can_check=True, call=r.choice([0.0, None, round(r.uniform(0.5, 80), 1), 41.0]),
+               to_act=r.choice([True, False, None]), facing_allin=r.random() < 0.2)
+    if r.random() < 0.3:   # 프리플랍 BB 옵션 쪽도
+        ctx, k = pre_case(r)
+        ctx = dict(ctx, can_check=True, call=r.choice([0.0, None, 41.0]))
+    return ctx, k
+
+
+def overpair_case(r):
+    """3벳/4벳 팟 · 낮은 보드(9 이하, 4플러시/4스트레이트 아님) · 오버페어 · 헤즈업 · 보통 벳(팟 이하)."""
+    while True:
+        nb = r.choice([3, 4, 5])
+        ranks = [r.choice(LOW_RANKS) for _ in range(nb)]
+        suits = [r.choice("shdc") for _ in range(nb)]
+        board = [ev.parse_card(a + b) for a, b in zip(ranks, suits)]
+        if len(set(board)) == nb and advisor.low_board(board):
+            break
+    top = max(x >> 2 for x in board)
+    pr = r.choice([x for x in "TJQKA" if "23456789TJQKA".index(x) > top] + ["9"] * (top < 7))
+    hero = [c for c in (ev.parse_card(pr + s) for s in "shdc") if c not in board]
+    r.shuffle(hero)
+    hero = hero[:2]
+    p0 = round(r.uniform(15, 150), 1)
+    call = round(p0 * r.choice([0.2, 0.33, 0.5, 0.66, 0.75, 1.0]), 1)
+    stack = round(r.uniform(call, 400), 1)
+    ctx = dict(hero=cs(hero), board=cs(board), street={3: "flop", 4: "turn", 5: "river"}[nb], players=r.choice([6, 9, None]),
+               opponents_in_hand=1, hero_pos=r.choice(POSITIONS + [None]), villain_pos=r.choice(POSITIONS + [None]),
+               situation=r.choice(["vs3bet", "vs4bet", None]), pre_raises=r.choice([2, 3, 4]),
+               stack_bb=r.choice([stack, None]), my_stack=r.choice([stack, round(stack * 1.5, 1)]),
+               pot=r.choice([p0, None]), pot_total=round(p0 + call, 1), call=call, to_act=r.choice([True, None]),
+               can_check=False, equity=r.choice([0.0, 0.05, 0.15, r.random()]),
+               equity_basis=r.choice(["range", "random", None]), villain_profile=rand_profile(r),
+               villain_raised=r.random() < 0.3, aggressor=r.choice([True, None, False]),
+               facing_allin=call >= stack and r.random() < 0.5, looseness=r.choice([-1.0, 0.0, 1.0, r.uniform(-1, 1)]))
+    return ctx, dict(hero=hero, board=board)
+
+
+def common_checks_any(ctx, k, res):
+    common_checks(ctx, res, "live")
+
+
+def overpair_checks(ctx, k, res):
+    common_checks(ctx, res, "post")
+    if res["action"] == advisor.FOLD:
+        bad("post: 3벳/4벳 팟 낮은 보드 오버페어가 헤즈업 보통 벳에 폴드", ctx, res["reason"] + " | " + " / ".join(res["detail"]))
+
+
+def limp_raise_case(r):
+    """내가 림프(1BB)한 뒤 레이즈를 받음 (2026-10-30 QJo): 팟 오즈가 좋고 림프할 만한 핸드면 폴드·체크 금지."""
+    deck = list(range(52))
+    r.shuffle(deck)
+    hero = deck[:2]
+    raise_to = r.choice([2.5, 3.0, 4.0, 5.0, 6.0])
+    others = round(r.uniform(1.5, 3 * raise_to + 3), 1)   # 블라인드·다른 림프/콜
+    pot_total = round(1.0 + raise_to + others, 1)
+    stack = round(r.uniform(40, 400), 1)
+    pos = r.choice(["UTG", "MP", "LJ", "HJ", "CO", "BTN", "SB"])
+    ctx = dict(hero=cs(hero), board=[], street="preflop", players=r.choice([6, 9]), opponents_in_hand=r.choice([1, 2, 3, 4]),
+               hero_pos=pos, situation=r.choice(["open", "vsopen", None]), villain_pos=r.choice(POSITIONS + [None]),
+               stack_bb=stack, my_stack=stack, pot=r.choice([pot_total, None]), pot_total=pot_total, call=raise_to - 1.0,
+               hero_bet=1.0, to_act=r.choice([True, False, None]), can_check=r.choice([False, None]),
+               equity=r.choice([None, r.uniform(0.15, 0.6)]), equity_basis=r.choice(["range", None]),
+               looseness=r.choice([-1.0, 0.0, 1.0]))
+    return ctx, dict(hero=hero, board=[])
+
+
+def limp_raise_checks(ctx, k, res):
+    common_checks(ctx, res, "pre")
+    need = ctx["call"] / (ctx["pot_total"] + ctx["call"])
+    if res["action"] == advisor.CHECK:
+        bad("pre: 림프 후 레이즈를 받았는데 체크", ctx, res["reason"])
+    hand = pf.hand_code(k["hero"])
+    if (need <= advisor.LIMP_CALL_NEED and hand in pf.top_pct(advisor.LIMP_CALL_PCT)
+            and ctx["call"] <= advisor.PRESSURE * ctx["stack_bb"] and res["action"] == advisor.FOLD):
+        bad("pre: 림프 후 작은 레이즈 · 팟 오즈 충분 · 림프 범위 핸드인데 폴드", ctx, res["reason"])
+
+
+LR = random.Random(5)
 
 
 # --- 프리플랍 -------------------------------------------------------------------------
@@ -468,6 +563,22 @@ def main():
             counts[kind] += 1
             if res != again:
                 bad(f"{kind}: 비결정적", ctx, "")
+            try:
+                chk(ctx, k, res)
+            except Exception:
+                bad(f"{kind}: 검사 중 예외", ctx, traceback.format_exc(limit=3))
+    LR.seed(a.seed + 13)
+    for i in range(max(300, a.n // 3)):
+        for kind, make, chk in (("live: 체크 가능", free_case, common_checks_any),
+                                ("live: 3벳 팟 오버페어", overpair_case, overpair_checks),
+                                ("live: 림프 후 레이즈", limp_raise_case, limp_raise_checks)):
+            ctx, k = make(LR)
+            try:
+                res = advisor.recommend(ctx)
+            except Exception:
+                bad(f"{kind}: 예외", ctx, traceback.format_exc(limit=3))
+                continue
+            counts[kind] += 1
             try:
                 chk(ctx, k, res)
             except Exception:

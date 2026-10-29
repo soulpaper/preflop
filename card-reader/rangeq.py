@@ -40,6 +40,9 @@ MIN_WIDTH, MAX_WIDTH = 0.6, 100.0
 
 # narrow: 포스트플랍 액션별로 남기는 상위 비율 (현재 핸드 강도 기준)
 NARROW_KEEP = {"bet": 0.60, "raise": 0.35, "allin": 0.25, "call": 0.75}
+# 오픈에 콜(콜드콜) 범위의 최소 폭 (%): GTO 차트의 SB 콜 범위는 3% 남짓(거의 3벳 아니면 폴드)이라 프로필 없는 상대가
+# 림프 팟 아이솔레이션에 블라인드로 콜하면 '상위 3%' 로 시작해 리버엔 '상위 2%' 로 좁혀졌다 (실제 풀은 훨씬 넓게 콜)
+CALL_OPEN_FLOOR = 8.0
 
 
 # --- 콤보 테이블 -------------------------------------------------------------------
@@ -228,8 +231,11 @@ def villain_range(action, pos, players, stack_bb, profile=None, *, opener=None, 
             base = chart[1][1] if chart else pf.top_pct(24) - pf.top_pct(6)
             exclude = chart[0][1] if chart else pf.top_pct(6)
             chart_pct = pf.range_pct(base)
+            floor = max(chart_pct, CALL_OPEN_FLOOR)
             if w and vpip is not None and pfr is not None:
-                target = (1 - w) * chart_pct + w * max(2.0, vpip - pfr)
+                target = (1 - w) * floor + w * max(2.0, vpip - pfr)
+            elif floor > chart_pct + 1e-9:
+                target = floor
     elif act in ("call_3bet", "4bet"):
         chart = None
         o = opener

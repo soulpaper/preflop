@@ -29,6 +29,7 @@ from collections import Counter
 STREETS = ("preflop", "flop", "turn", "river")
 BOARD_STREET = {0: 0, 3: 1, 4: 2, 5: 3}
 EPS = 0.05                 # 같은 금액으로 보는 차이 (BB)
+WOBBLE_BB, WOBBLE_FRAC = 0.15, 0.10   # 직전 콜보다 이만큼(BB 또는 비율) 안에서 늘어난 벳 = 같은 콜을 다시 읽음 (최소 레이즈는 1BB 이상)
 SB_AMOUNT, BB_AMOUNT = 0.5, 1.0
 GAP_FATAL = 8.0            # 핸드 중 프레임 간격이 이보다 길면 놓친 액션이 있을 수 있음 → low
 STALE_HAND = 90.0          # 이만큼 새 프레임이 없으면 진행 중 핸드를 닫음
@@ -464,6 +465,15 @@ class Tracker:
                 if b <= amt + EPS:
                     seat.allin = seat.allin or allin
                     return "post"
+        prev = next((a for a in reversed(h.actions[STREETS[h.street]]) if a["seat"] == k), None)
+        if (b <= h.cur_max + EPS and prev is not None and prev["act"] == "call" and prev.get("to") is not None
+                and prev["to"] < b <= prev["to"] + max(WOBBLE_BB, WOBBLE_FRAC * b)):
+            # 같은 콜 금액을 다시 읽은 것 (OCR 0.9 → 1.0, 35.1 → 38): 새 액션이 아니다. 예전엔 '콜 0.9' 뒤에 레이즈가 나오면
+            # '콜 1.0' 이 레이즈 뒤 두 번째 콜로 기록돼 림프가 '림프→콜' 등 엉뚱한 라인이 됐다 (2026-10-30 라이브 KK 핸드)
+            prev["to"] = round(b, 2)
+            seat.inv = b
+            seat.allin = seat.allin or allin
+            return "call"
         if b > h.cur_max + EPS:
             act = "bet" if h.street > 0 and h.cur_max <= EPS else "raise"
             if bubble == "call":

@@ -64,6 +64,11 @@ test("표본이 많을수록 프로필 쪽으로 더 이동", more < w_open_tigh
 call_base = rq.width_pct(rq.villain_range("call_open", "BTN", 6, 100))
 call_loose = rq.width_pct(rq.villain_range("call_open", "BTN", 6, 100, loose))
 test("루즈 프로필(VPIP 45/PFR 8) → 콜 범위 확대", call_loose > call_base * 2, f"{call_base:.0f}% → {call_loose:.0f}%")
+# 회귀 2026-10-30: 프로필 없는 SB 콜 범위가 GTO 차트(3% 남짓)라 리버에 '상위 2%' 로 좁혀졌다 → 최소 폭
+_sbc = rq.width_pct(rq.villain_range("call_open", "SB", 6, 100))
+test(f"프로필 없는 SB 콜 범위 ≥ 최소 폭 {rq.CALL_OPEN_FLOOR:g}%", _sbc >= rq.CALL_OPEN_FLOOR - 0.5, f"{_sbc:.1f}%")
+test("콜 범위 최소 폭은 3벳 범위(프리미엄)를 넣지 않음",
+     not (set(rq.villain_range("call_open", "SB", 6, 100)) & set(rq.villain_range("3bet", "SB", 6, 100))))
 test("3벳% 프로필 반영 (3bet 12%)",
      rq.width_pct(rq.villain_range("3bet", "BTN", 6, 100, {"threebet": 12, "hands": 500, "reliable": True}))
      > rq.width_pct(TIGHT3) + 3)
