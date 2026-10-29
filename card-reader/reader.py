@@ -998,6 +998,14 @@ def _number(v):
         return None
 
 
+def hero_seat(ts):
+    """테이블 상태에서 내 자리(seats 의 'hero') dict, 없으면 None."""
+    for seat in (ts or {}).get("seats") or []:
+        if isinstance(seat, dict) and seat.get("key") == "hero":
+            return seat
+    return None
+
+
 # --- 토너먼트 ICM ctx (순수 함수) -----------------------------------------------------------------
 def main_villain_key(ts, nboard):
     """주 상대 좌석 키 = 마지막 공격자 / 벳을 건 사람.  프리플랍: 테이블 상태가 찾은 마지막 레이저.
@@ -2347,6 +2355,8 @@ class App:
         self.layout_bad = 0
         key = repr([st.get(k) for k in STATE_KEYS])
         cur = self.table_state
+        if getattr(self, "pending_hero", None) and not st.get("to_act"):  # 내 차례가 끝남 → 실제로 한 선택 기록
+            self.resolve_hero_action(st)
         if cur is not None and bool(st.get("to_act")) != bool(cur.get("to_act")):
             # 액션 바(폴드/콜 버튼)가 나타나거나 사라짐은 강한 신호 → 내 차례 변화는 첫 읽기에서 바로 반영 (2번 읽기 기다리지 않음).
             # 액션 바에서 나오는 값(콜 금액·체크 가능·레이즈 가능·미리 선택)만 같이 바꾸고, 나머지 값(인원·포지션·상황 …)은
@@ -2630,10 +2640,61 @@ class App:
         declog = getattr(self, "declog", None)
         if declog is not None and self.advice and not pre and ctx.get("to_act"):  # 내 차례의 결정 기록 (같은 결정은 한 번만)
             try:
-                declog.record(ctx, self.advice, reads=self.reads_now(), state=self.tracker,
-                              profiles=(self.track or {}).get("profiles"))
+                did = declog.record(ctx, self.advice, reads=self.reads_now(), state=self.tracker,
+                                    profiles=(self.track or {}).get("profiles"))
+                if did and did != getattr(self, "last_decision_id", None):
+                    self.last_decision_id = did
+                    hero = hero_seat(self.table_state)
+                    # 내 차례가 끝날 때 실제로 한 행동을 붙이기 위해 기억 (차례 전 내 벳 포함)
+                    self.pending_hero = {"id": did, "bet0": (hero or {}).get("bet") or 0.0, "tries": 0}
+                    self.save_decision_snap(did)
             except Exception:
                 self.log_once("decisionlog.record")
+
+    def save_decision_snap(self, did):
+        """결정 순간의 화면 (게임 창 + 이 창)을 hands/snaps/날짜/<결정 id>.jpg 로 저장 (복기용)."""
+        rect = self.cfg.get("table")
+        if not rect:
+            return
+        try:
+            r = self.root
+            game = grab(self.sct, rect)
+            mine = grab(self.sct, (r.winfo_rootx(), r.winfo_rooty(), r.winfo_width(), r.winfo_height()))
+            hh = max(game.shape[0], mine.shape[0])
+            pad = lambda im: cv2.copyMakeBorder(im, 0, hh - im.shape[0], 0, 0, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+            both = cv2.resize(np.hstack([pad(game), pad(mine)]), None, fx=0.6, fy=0.6, interpolation=cv2.INTER_AREA)
+            folder = BASE / "hands" / "snaps" / time.strftime("%Y-%m-%d")
+            folder.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(folder / f"{did}.jpg"), both, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        except Exception:
+            self.log_once("decision_snap")
+
+    def resolve_hero_action(self, st):
+        """내 차례가 끝난 뒤 상태에서 내가 실제로 한 행동을 찾아 결정 기록에 붙임 (말풍선 > 카드 덮음 > 벳 변화)."""
+        p = getattr(self, "pending_hero", None)
+        declog = getattr(self, "declog", None)
+        if not p or declog is None or not isinstance(st, dict):
+            return
+        hero = hero_seat(st) or {}
+        bet = hero.get("bet") or 0.0
+        bubble = hero.get("bubble")
+        action = size = None
+        if st.get("hero_folded") or hero.get("folded") or bubble == "fold":
+            action = "fold"
+        elif bubble in ("call", "raise", "allin", "check", "bet"):
+            action, size = bubble, (bet if bubble != "check" else None)
+        elif hero.get("allin"):
+            action, size = "allin", bet
+        elif bet > p["bet0"] + 1e-6:
+            action, size = "bet/raise/call", bet
+        p["tries"] += 1
+        if action is None and p["tries"] < 3:  # 말풍선이 늦게 뜨는 경우: 몇 번 더 본다
+            return
+        try:
+            declog.hero_action(p["id"], action or "check?", size)
+        except Exception:
+            self.log_once("decisionlog.hero_action")
+        self.pending_hero = None
 
     def wait_text(self):
         return "클릭해서 분석 —" if self.click_mode() else "추천 대기: 내 차례가 되면 계산합니다 —"
