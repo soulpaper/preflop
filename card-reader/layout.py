@@ -367,6 +367,150 @@ def read_blinds(img, lines):
     return out
 
 
+# --- 토너먼트 머리글 (왼쪽 위 '총 상금 6억 3325만' / '내 순위 6/32') ------------------------------------
+TOURNEY_ZONE = (0.30, 0.30)         # 머리글이 있는 구역: 글자 왼쪽 < 0.30 W, 아래 < 0.30 H
+RANK_RE = re.compile(r"(?<!\d)(\d{1,4})[/|\\](\d{1,5})(?!\d)")
+PRIZE_UNITS = {"억": 10 ** 8, "만": 10 ** 4}
+TOURNEY_ROW = 2.0                   # 상금 줄 → 순위 줄 간격 (글자 높이 배수)
+TOURNEY_PRIZE_X = 4.1               # 라벨 오른쪽 끝 → 상금 글자 시작 (글자 높이 배수, 라벨을 못 찾았을 때 추정용)
+TOURNEY_RANK_X = 6.1                # 라벨 오른쪽 끝 → 순위 숫자 시작 (트로피 아이콘이 그 사이)
+
+
+def parse_rank(texts):
+    """OCR 문자열들 → (내 순위, 남은 인원) 또는 None.  'a/b' 를 느슨하게 (슬래시가 | 로, 공백 포함) 읽고
+    1 <= a <= b 인 것만 인정, 가장 많이 나온 값 (최소 2표, 읽은 문자열이 하나뿐이면 1표)."""
+    from collections import Counter
+    votes = Counter()
+    for t in texts:
+        m = RANK_RE.search(t.replace(" ", "").replace(",", ""))
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if 1 <= a <= b and b >= 2:
+                votes[(a, b)] += 1
+    if not votes:
+        return None
+    best, n = votes.most_common(1)[0]
+    return best if n >= min(2, len(texts)) else None
+
+
+def parse_prize(texts):
+    """OCR 문자열들 → (총 상금 칩, 티켓 여부) 또는 None.  '6억 3325만' = 633250000, '250만', '5억 티켓 X 5' (티켓 = 상금이 금액이 아님).
+    가장 많이 나온 값 (최소 2표, 읽은 문자열이 하나뿐이면 1표)."""
+    from collections import Counter
+    votes, ticket = Counter(), 0
+    for t in texts:
+        s = t.replace(" ", "").replace(",", "")
+        value = None
+        m = re.search(r"(\d+)억(?:(\d{1,4})만?)?", s)
+        if m:
+            value = int(m.group(1)) * PRIZE_UNITS["억"] + int(m.group(2) or 0) * PRIZE_UNITS["만"]
+        else:
+            m = re.search(r"(\d+)만(\d{1,4})?", s)
+            if m:
+                value = int(m.group(1)) * PRIZE_UNITS["만"] + int(m.group(2) or 0)
+            else:
+                m = re.fullmatch(r"\D*(\d{4,})\D*", s)
+                if m:
+                    value = int(m.group(1))
+        if value:
+            votes[value] += 1
+            if re.search(r"티켓|켓|X\d", s):
+                ticket += 1
+    if not votes:
+        return None
+    best, n = votes.most_common(1)[0]
+    if n < min(2, len(texts)):
+        return None
+    return best, ticket * 2 >= sum(votes.values())
+
+
+def tourney_crop(img, rect):
+    """영역 사방 JITTER_MARGIN px 크게 (ocr.read_jittered 입력). 화면 가장자리면 잘린 대로."""
+    m = ocr.JITTER_MARGIN
+    x, y, w, h = rect
+    return _crop(img, (x - m, y - m, w + 2 * m, h + 2 * m))
+
+
+def read_jittered_warm(crops):
+    """ocr.read_jittered 와 같은 흔들어 읽기 (같은 JITTER 잘림) 인데 따뜻한 색 글자를 지우지 않음.
+    머리글의 내 순위 숫자는 주황, 총 상금은 금색 — 숫자용 전처리(레일 선 제거)가 이 글자를 지워 버린다."""
+    m = ocr.JITTER_MARGIN
+    sub = {}
+    for key, img in crops.items():
+        h, w = img.shape[:2]
+        for i, (left, top, right, bottom) in enumerate(ocr.JITTER):
+            part = img[m - top:h - m + bottom, m - left:w - m + right]
+            if part.size:
+                sub[(key, i)] = part
+    texts = ocr.read_texts(sub, suppress_warm=False)
+    return {key: sum((texts.get((key, i), []) for i in range(len(ocr.JITTER))), []) for key in crops}
+
+
+def read_tourney(crops):
+    """{'prize': 이미지, 'rank': 이미지} (tourney_crop) → {'prize': (칩, 티켓) 또는 None, 'rank': (순위, 남은 인원) 또는 None}.
+    흔들어 읽기 (ocr.read_jittered 와 같은 방식) 다수결."""
+    texts = read_jittered_warm({k: v for k, v in crops.items() if v is not None and v.size})
+    return {"prize": parse_prize(texts["prize"]) if "prize" in texts else None,
+            "rank": parse_rank(texts["rank"]) if "rank" in texts else None}
+
+
+def find_tourney(img, lines):
+    """왼쪽 위 토너먼트 머리글을 찾아 {'tourney_prize': 영역, 'tourney_rank': 영역, 'tourney': {...읽은 값...}}.
+    없으면(현금 테이블) {}.  '순위' 라벨/ 'a/b' 모양 줄로 위치를 잡고, 영역 글자를 실제로 읽어 'a/b' 가 읽힐 때만 인정."""
+    H, W = img.shape[:2]
+    zone = [g for g in lines if g["box"][0] < TOURNEY_ZONE[0] * W and g["box"][3] < TOURNEY_ZONE[1] * H]
+    label = {"rank": None, "prize": None}
+    rank_line = None
+    for g in zone:
+        if label["rank"] is None and any("순위" in t for t in g["texts"]):
+            label["rank"] = g
+        if label["prize"] is None and any("상금" in t for t in g["texts"]):
+            label["prize"] = g
+    cand = [g for g in zone if sum(1 for t in g["texts"] if RANK_RE.search(t.replace(" ", ""))) >= 1]
+    if label["rank"] is not None:  # 라벨과 같은 줄, 오른쪽
+        ly = _center(label["rank"]["box"])[1]
+        cand = [g for g in cand if abs(_center(g["box"])[1] - ly) < 0.8 * (label["rank"]["box"][3] - label["rank"]["box"][1])
+                and g["box"][0] > label["rank"]["box"][2]]
+    if cand:
+        rank_line = max(cand, key=lambda g: (sum(1 for t in g["texts"] if RANK_RE.search(t.replace(" ", ""))), -g["box"][1]))
+    if rank_line is None and label["rank"] is None:
+        return {}
+
+    # 글자 높이 / 줄 위치
+    if rank_line is not None:
+        rx0, ry0, rx1, ry1 = rank_line["box"]
+    else:
+        lx0, ly0, lx1, ly1 = label["rank"]["box"]
+        th0 = ly1 - ly0
+        rx0, ry0, rx1, ry1 = lx1 + TOURNEY_RANK_X * th0, ly0, lx1 + (TOURNEY_RANK_X + 4.5) * th0, ly1
+    th = ry1 - ry0
+    rank_rect = _clip((rx0 - 0.25 * th, ry0 - 0.25 * th, (rx1 - rx0) + 1.5 * th, 1.5 * th), img.shape)
+
+    # 상금: 순위 줄 바로 위 (라벨이 있으면 그 줄, 아니면 순위 줄 - 2.0 줄)
+    pl = label["prize"]
+    py0 = pl["box"][1] if pl is not None and abs(pl["box"][1] - (ry0 - TOURNEY_ROW * th)) < 0.9 * th else ry0 - TOURNEY_ROW * th
+    base_x = pl["box"][2] if pl is not None else (label["rank"]["box"][2] if label["rank"] is not None else rx0 - TOURNEY_RANK_X * th)
+    px0 = base_x + (TOURNEY_PRIZE_X - 0.7) * th  # 라벨 오른쪽 끝에서 시작 (라벨 글자에 안 닿게)
+    # 상금 값 줄의 글자(있으면): 라벨 오른쪽 같은 줄
+    vline = next((g for g in zone if g is not pl and g is not label["rank"] and g is not rank_line
+                  and abs(_center(g["box"])[1] - (py0 + th / 2)) < 0.6 * th and g["box"][0] > base_x
+                  and not RANK_RE.search(" ".join(g["texts"]).replace(" ", ""))), None)
+    if vline is not None:
+        px0 = min(px0 + 0.7 * th, vline["box"][0] - 0.25 * th)
+        pw_ = max(vline["box"][2] - px0 + 2.5 * th, 6.0 * th)
+    else:
+        pw_ = 8.5 * th
+    prize_rect = _clip((px0, py0 - 0.25 * th, pw_, 1.5 * th), img.shape)
+
+    read = read_tourney({"prize": tourney_crop(img, prize_rect), "rank": tourney_crop(img, rank_rect)})
+    if read["rank"] is None:
+        return {}
+    return {"tourney_prize": [int(v) for v in prize_rect], "tourney_rank": [int(v) for v in rank_rect],
+            "tourney": {"rank": list(read["rank"]),
+                        "prize": read["prize"][0] if read["prize"] else None,
+                        "ticket": bool(read["prize"] and read["prize"][1])}}
+
+
 # --- 전체 --------------------------------------------------------------------------------
 def calibrate(img):
     """게임 창 이미지(BGR) → 찾은 영역들 (이미지 좌표 [x, y, w, h]).
@@ -548,6 +692,7 @@ def calibrate(img):
         put("board", _clip(board, img.shape), found=bool(rects))
 
     result["blinds"] = read_blinds(img, lines)
+    result.update(find_tourney(img, lines))  # 토너먼트 머리글 (있을 때만): tourney_prize / tourney_rank / tourney
     result["geom"] = {"pill_center": [round(float(pcx), 1), round(float(pcy), 1)], "pw": round(float(pw), 2),
                       "ring": [round(float(v), 1) for v in (rcx, rcy, ra, rb)], "size": [W, H]}
     result.update(anchors(result))

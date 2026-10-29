@@ -98,23 +98,48 @@ def hand_name(score):
     return f"{name} ({RANKS[score[1]]} 하이)"
 
 
+_RANKSET_MEMO = {}
+
+
+def evaluate_fast(cards):
+    """evaluate() 와 같은 결과, 훨씬 빠름. 플러시가 없으면 점수가 랭크 구성(정렬된 랭크 튜플)에만 달려 있으므로
+    그 튜플로 메모이즈한다 (7장 기준 5만여 가지). 플러시 가능성이 있을 때만 원래 evaluate 를 부른다."""
+    s0 = s1 = s2 = s3 = 0
+    for c in cards:
+        t = c & 3
+        if t == 0:
+            s0 += 1
+        elif t == 1:
+            s1 += 1
+        elif t == 2:
+            s2 += 1
+        else:
+            s3 += 1
+    if s0 >= 5 or s1 >= 5 or s2 >= 5 or s3 >= 5:
+        return evaluate(cards)
+    key = tuple(sorted([c >> 2 for c in cards]))
+    v = _RANKSET_MEMO.get(key)
+    if v is None:
+        # 무늬는 i % 4 로 돌려 붙인다 (같은 랭크는 서로 다른 무늬, 7장 이하에서 5장 같은 무늬 불가)
+        v = evaluate([r * 4 + (i & 3) for i, r in enumerate(key)])
+        _RANKSET_MEMO[key] = v
+    return v
+
+
 def _showdown(hero, opps, board):
     """hero 기준 획득 지분 (승=1, k명 무승부=1/k, 패=0)과 결과 종류."""
-    h = evaluate(hero + board)
-    best_opp = max(evaluate(o + board) for o in opps)
+    h = evaluate_fast(hero + board)
+    scores = [evaluate_fast(o + board) for o in opps]
+    best_opp = max(scores)
     if h > best_opp:
         return 1.0, "win"
     if h < best_opp:
         return 0.0, "lose"
-    tied = 1 + sum(1 for o in opps if evaluate(o + board) == h)
-    return 1.0 / tied, "tie"
+    return 1.0 / (1 + scores.count(h)), "tie"
 
 
-def equity(hero, board, opponents=1, iterations=10000, exact_limit=50000, rng=random):
-    """랜덤 핸드를 가진 상대 opponents명 대비 에쿼티.
-
-    1:1 이고 경우의 수가 exact_limit 이하면 전수 계산, 아니면 몬테카를로.
-    """
+def _simulate(hero, board, opponents, iterations, exact_limit, rng):
+    """원래 evaluator.equity 본체: 전수(1:1 이고 경우의 수 <= exact_limit) 또는 몬테카를로."""
     dead = set(hero) | set(board)
     deck = [c for c in range(52) if c not in dead]
     need = 5 - len(board)
@@ -153,6 +178,35 @@ def equity(hero, board, opponents=1, iterations=10000, exact_limit=50000, rng=ra
         "samples": total,
         "exact": exact,
     }
+
+
+def equity(hero, board, opponents=1, iterations=10000, exact_limit=50000, rng=random,
+           use_table=None, use_cache=None):
+    """랜덤 핸드를 가진 상대 opponents명 대비 에쿼티.
+
+    1:1 이고 경우의 수가 exact_limit 이하면 전수 계산, 아니면 몬테카를로.
+
+    미리 계산해 둔 값을 재사용한다 (eqtable.py):
+      보드 0장  → 169핸드 x 1~9명 프리플랍 표 (표본 수십만, 즉시)
+      보드 3~5장 → 디스크 캐시 (무늬 정규화 키; 표본이 충분히 쌓인 항목만 즉시 반환, 아니면 새로 계산해 캐시에 합침)
+    use_table / use_cache: None(기본) = rng 가 기본(전역 random)일 때만 사용 — 고정 시드(rng=Random(..))로
+    재현 가능한 시뮬레이션을 요구하면 예전과 똑같이 직접 계산한다. True/False 로 강제할 수 있다.
+    표/캐시에서 온 결과는 "source" 키("table"/"cache")가 추가로 붙는다.
+    """
+    auto = rng is random
+    if use_table is None:
+        use_table = auto
+    if use_cache is None:
+        use_cache = auto
+    if use_table or use_cache:
+        import eqtable
+        if use_table and not board:
+            r = eqtable.preflop(hero, opponents)
+            if r is not None:
+                return r
+        if use_cache and 3 <= len(board) <= 5:
+            return eqtable.cached_equity(hero, board, opponents, iterations, exact_limit, rng, _simulate)
+    return _simulate(hero, board, opponents, iterations, exact_limit, rng)
 
 
 def _has_flush(cards):

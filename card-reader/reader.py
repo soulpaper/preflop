@@ -13,6 +13,7 @@ import json
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -117,6 +118,18 @@ SIG_TOL = (6.0, 48, 0.006)  # (stable.py가 없을 때) (평균 차이, 픽셀 �
 SETTLE_MAX = 3         # 계속 움직이는 영역도 이 주기마다 한 번은 다시 읽음
 STATE_INTERVAL = 1.0   # 테이블 상태 읽기 주기 (초)
 STATE_REFRESH = 5.0    # 화면이 그대로여도 이 시간마다 다시 읽음
+TOURNEY_INTERVAL = 5.0  # 토너먼트 머리글(총 상금 / 내 순위) 읽기 주기 (초): 순위는 천천히 바뀜
+TOURNEY_REFRESH = 60.0  # 머리글 화면이 그대로여도 이 시간마다 다시 읽음
+TOURNEY_JUMP = 1.5      # 총 상금이 이 배수 이상 바뀌면 다른 토너먼트 (자동 참가자 수 추정을 새로 시작)
+TOURNEY_STRUCTURES = (("standard", "표준"), ("flat", "평평"), ("top_heavy", "상위 집중"))
+TURN_KEYS = ("to_act", "preaction", "call", "can_check", "can_raise")  # 액션 바에서 나오는 값 (내 차례 신호와 함께 바로 반영)
+# 카드 잠금: 확정된 내 카드/보드 카드는 핸드가 끝날 때까지 다시 매칭하지 않는다 (반짝임·말풍선·글로우와 무관)
+LOCK_STRIKES = 2       # 잠금을 푸는 화면 신호(뒷면 / 카드 사라짐)가 이만큼 연속 프레임이어야 풂
+PRESENT_MIN_FACE = 0.15  # 잠근 자리에 카드 면(밝은 저채도)이 이 비율 미만이고 뒷면도 아니면 '카드 없음' (실측 앞면 0.57+, 뒷면 0.32+)
+# 계산: 빠른 1차 → 정밀 (한 번에 작업 하나, 오래된 작업은 조각 사이에서 버림)
+QUICK_ITERS = 1500     # 1차(빠른) 시뮬레이션 횟수 (~50~110ms)
+CHUNK_ITERS = 2500     # 정밀 계산을 이만큼씩 나눠 돌림 (새 작업이 오면 다음 조각 전에 멈춤)
+ANTICIPATE_MS = 300    # 미리 계산: 테이블 상태 변화가 이만큼 멈춘 뒤 시작 (연속 변화는 한 번으로)
 
 # --- 테마 -------------------------------------------------------------------
 BG = "#0f1215"
@@ -412,8 +425,8 @@ def looks_like_card(crop):
     return "big" in parts and "corner_suit" in parts
 
 
-def detect_cards(img):
-    """영역 이미지에서 카드들을 찾아 왼쪽→오른쪽 순서의 crop 리스트로 반환.
+def detect_rects(img):
+    """영역 이미지에서 카드 자리 (x, y, w, h) 들을 왼쪽→오른쪽 순서로.
 
     보통 밝기 기준과 어두운 카드 기준으로 각각 찾아 더 많이 찾은 쪽을 쓴다
     (같으면 보통 기준 — 낮은 기준에서는 인접 카드가 붙어 잡히기 쉬움).
@@ -423,7 +436,46 @@ def detect_cards(img):
         rects = _card_rects(img, min_value)
         if len(rects) > len(best):
             best = rects
-    return [img[y:y + h, x:x + w] for x, y, w, h in best]
+    return best
+
+
+def detect_cards(img):
+    """영역 이미지에서 카드들을 찾아 왼쪽→오른쪽 순서의 crop 리스트로 반환."""
+    return [img[y:y + h, x:x + w] for x, y, w, h in detect_rects(img)]
+
+
+def card_presence(crop):
+    """잠근 카드 자리의 값싼 확인 (매칭 없음): 'back'(뒷면) / 'face'(카드 면이 있음) / 'none'(펠트 = 카드 없음).
+    말풍선·반짝임·글로우가 덮어도 밝은 면이 남으므로 'face' — 잠금은 핸드 단위 신호로만 풀린다."""
+    if crop.size == 0 or min(crop.shape[:2]) < 8:
+        return "none"
+    if is_card_back(crop):
+        return BACK
+    hsv = cv2.cvtColor(cv2.resize(crop, (26, 36), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2HSV)
+    face = ((hsv[:, :, 1] < CARD_MAX_SAT) & (hsv[:, :, 2] > CARD_MIN_VALUE[1])).mean()
+    return "face" if face >= PRESENT_MIN_FACE else "none"
+
+
+def _overlaps(a, b):
+    """두 자리 (x, y, w, h) 의 가로 겹침이 좁은 쪽 폭의 절반 이상인가 (같은 카드 자리)."""
+    ov = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+    return ov >= 0.5 * min(a[2], b[2])
+
+
+def _crop_rect(img, r):
+    x, y, w, h = r
+    return img[max(0, y):y + h, max(0, x):x + w]
+
+
+def merge_equity(a, b):
+    """같은 조건의 몬테카를로 결과 두 개를 표본 수로 가중 합침 (정밀 계산을 조각으로 나눠 돌릴 때)."""
+    na, nb = a["samples"], b["samples"]
+    out = dict(a)
+    for k in ("equity", "win", "tie", "lose"):
+        out[k] = (a[k] * na + b[k] * nb) / (na + nb)
+    out["samples"] = na + nb
+    out["exact"] = False
+    return out
 
 
 class Matcher:
@@ -829,9 +881,10 @@ class LearnDialog:
 
 
 # --- 자동 지정 확인 -----------------------------------------------------------
-AUTO_COLORS = {"board": "#38bdf8", "hero": "#f472b6", "pot_total": WARN, "my_stack": WIN_C, "call": "#fb923c"}
+AUTO_COLORS = {"board": "#38bdf8", "hero": "#f472b6", "pot_total": WARN, "my_stack": WIN_C, "call": "#fb923c",
+               "tourney_prize": "#a78bfa", "tourney_rank": "#a78bfa"}
 AUTO_NAMES = {"board": "보드", "hero": "내 카드", "pot_total": "POT", "my_stack": "내 스택", "call": "콜 금액",
-              "pill": "가운데 팟"}
+              "pill": "가운데 팟", "tourney_prize": "총 상금", "tourney_rank": "내 순위"}
 
 
 class AutoSetupDialog:
@@ -855,6 +908,11 @@ class AutoSetupDialog:
                 if values.get(k)]
         if nums:
             lines.append("  ·  ".join(nums))
+        tn = res.get("tourney")
+        if tn:
+            lines.append(f"토너먼트: 내 순위 {tn['rank'][0]}/{tn['rank'][1]}"
+                         + (f" · 총 상금 {format_prize(tn['prize'])}" if tn.get("prize") and not tn.get("ticket") else "")
+                         + " (5초마다 읽어 ICM에 씁니다)")
         if not res.get("found", {}).get("board", True):
             lines.append("보드 카드가 안 보여서 보드 자리는 테이블 위치로 추정했습니다 (점선).")
         if "call" in res and not res["found"].get("call"):
@@ -919,6 +977,13 @@ def _optional(name):
         return None
 
 
+def format_prize(v):
+    """칩 → '6억 3325만' (게임 표기)."""
+    eok, rest = divmod(int(v), 10 ** 8)
+    man = rest // 10 ** 4
+    return " ".join(p for p in (f"{eok}억" if eok else "", f"{man}만" if man else "") if p) or f"{int(v)}"
+
+
 def _number(v):
     """숫자 / (값, 단위) / 문자열 → float 또는 None."""
     if isinstance(v, bool) or v is None:
@@ -931,6 +996,56 @@ def _number(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+# --- 토너먼트 ICM ctx (순수 함수) -----------------------------------------------------------------
+def main_villain_key(ts, nboard):
+    """주 상대 좌석 키 = 마지막 공격자 / 벳을 건 사람.  프리플랍: 테이블 상태가 찾은 마지막 레이저.
+    플랍 이후: 바닥 벳이 가장 큰 남은 상대 (같으면 올인한 쪽). 벳이 없으면 남은 상대가 한 명일 때만 그 사람, 아니면 None."""
+    seats = ts.get("seats") or []
+    opps = [s for s in seats if s.get("in_hand") and s.get("key") != "hero"]
+    if not opps:
+        return None
+    vk = (ts.get("preflop") or {}).get("villain_key")
+    if not nboard and vk and any(o.get("key") == vk for o in opps):
+        return vk
+    if nboard:
+        bets = [(_number(o.get("bet")) or 0.0, o) for o in opps]
+        top = max(b for b, _ in bets)
+        if top > 0:
+            tied = [o for b, o in bets if b >= top - 0.01]
+            return next((o for o in tied if o.get("allin")), tied[0]).get("key")
+    return opps[0].get("key") if len(opps) == 1 else None
+
+
+def table_stacks_from(ts, ocr_bb, hero_bb):
+    """내 테이블 스택 {좌석 키: 남은 스택 BB, 'hero': 내 스택}.  좌석 상태의 스택(BB)을 먼저, 없으면 화면 숫자 읽기(ocr_bb: {키: BB})."""
+    out = {}
+    for s in ts.get("seats") or []:
+        key = s.get("key")
+        if key == "hero" or not s.get("occupied"):
+            continue
+        v = _number(s.get("stack"))
+        if v is None:
+            v = ocr_bb.get(key)
+        if v is not None and v >= 0:
+            out[key] = round(float(v), 2)
+    if hero_bb:
+        out["hero"] = round(float(hero_bb), 2)
+    return out
+
+
+def villain_stack_from(ts, key, ocr_bb):
+    """주 상대의 남은 스택 (벳 뒤, 올인이면 0). 모르면 None."""
+    seat = next((s for s in ts.get("seats") or [] if key and s.get("key") == key), None)
+    if seat is None:
+        return None
+    if seat.get("allin"):
+        return 0.0
+    v = _number(seat.get("stack"))
+    if v is None:
+        v = ocr_bb.get(key)
+    return round(float(v), 2) if v is not None and v >= 0 else None
 
 
 # --- 포스트플랍 추천 ctx: 위치(IP) · 주도권 · 플랍 라인 (순수 함수; 상태 스레드/Tk 스레드 어디서든) ----------
@@ -1088,12 +1203,28 @@ class App:
         self.sct = MSS()
         self.tablestate = _optional("tablestate")
         self.advisor = _optional("advisor")
+        self.icm = _optional("icm")
         self.detected = {}
         self.memory = {}         # 핸드 동안 읽은 카드 (가려져도 유지)
         self.card_cache = {}     # 자리별 (축소 이미지, 라벨): 카드 그림이 그대로면 다시 매칭하지 않음
+        self.detected_rects = {}  # 영역별 self.detected 카드들의 자리 (x, y, w, h)
+        # 카드 잠금 (핸드 동안 확정된 카드는 다시 매칭하지 않음). 잠금은 핸드 단위 신호로만 풀린다
+        self.hero_lock = None    # {labels, rects, strikes, dealer, hands, boards}
+        self.board_lock = None   # {slots: [(rect, label)], strikes, dealer, hands}
+        self.hands_done = 0      # 핸드 추적기가 끝낸 핸드 수 (상태 스레드가 올림) — 새 핸드 신호
+        self.board_resets = 0    # 잠근 보드가 비워진 횟수 — 새 핸드 신호
         self.view = {}
         self.result = None
         self.computing = False
+        # 무거운 계산 작업자 (한 번에 하나): 빠른 1차 → 정밀. 미리 계산(내 차례 전)도 같은 작업자를 쓴다
+        self.job_cv = threading.Condition()
+        self.job_next = None     # 대기 중인 작업 (새 작업이 오면 덮어씀)
+        self.job_thread = None
+        self.job_key = None      # 지금 계산 중인 (상태, 상대 리딩 sig)
+        self.ant_after = None    # 미리 계산 지연 타이머
+        self.ant_want = None
+        self.advice_pre = False  # 지금 추천이 '미리 계산 (내 차례 전)' 인가 (예상 콜 금액 기준)
+        self.turn_flag = False   # 방금 내 차례가 됨 → 이번 주기에 바로 추천 갱신
         self.analysis_cache = {}  # 같은 카드 상태로 돌아오면 다시 계산하지 않음 (숫자 깜빡임 방지)
         self.analysis_starts = 0
         self.toast = None
@@ -1106,6 +1237,13 @@ class App:
         self.ocr_pending = None
         self.ocr_values = {}
         self.ocr_written = {}    # 입력칸별로 OCR이 마지막에 쓴 글자 (같은 값으로 수동 입력을 덮지 않음)
+        self.tourney_queue = queue.Queue()   # ocr_worker → Tk: 토너먼트 머리글 읽기 {'rank': (순위, 남은 인원), 'prize': (칩, 티켓)} / {'clear': True}
+        self.tourney = None      # 지금 화면의 토너먼트 값 {my_rank, players_left, prize, ticket}. 현금 테이블이면 None
+        tc = self.cfg.get("tourney") if isinstance(self.cfg.get("tourney"), dict) else {}
+        self.t_max_left = int(_number(tc.get("max_left")) or 0)   # 이번 토너먼트에서 본 가장 큰 '남은 인원' (참가자 수 추정)
+        self.t_prize_ref = _number(tc.get("prize_ref"))             # 마지막으로 읽은 총 상금 (크게 바뀌면 다른 토너먼트)
+        self._t_setting = False  # 참가자 수 칸을 프로그램이 채우는 중 (사용자 입력과 구별)
+        self.inputs_t = None     # 입력 탭이 토너먼트 칸을 넣어 만들어졌는가
         self.state_queue = queue.Queue()
         self.state_pending = self.state_key = None
         self.state_errors = 0
@@ -1128,6 +1266,7 @@ class App:
         self.track = {}             # 상태 스레드가 채우는 최신 값 {names, profiles, live, reads, t, hist}
         self.pre_memo = None        # {hero, agg}: 이번 핸드 프리플랍 마지막 레이저가 나인지 (테이블 상태에서)
         self.store = self.name_reader = self.tracker = self.recorder = None
+        self.declog = None  # 내 차례 결정 기록 (decisionlog.DecisionLog)
         self.popup = None          # 게임 '유저 정보' 팝업 읽기 (userinfo.PopupWatcher)
         self.pending_toast = None  # 상태 스레드 → Tk 스레드 알림
         self.handread = self.rangeq = None
@@ -1208,6 +1347,7 @@ class App:
         self.scale = round(min(SCALE_MAX, max(FIT_MIN, scale)), 3)
         self.k = self.scale * self.dpi
         self._fonts = {}
+        self._widths = {}  # (글꼴, 글자) → 폭: 그릴 때마다 같은 글자를 Tk 에 다시 재지 않음
         self._tag = 0
 
     def s(self, x):
@@ -1223,10 +1363,17 @@ class App:
 
     def measure(self, text, pt, weight="normal", family=F_UI):
         key = (family, self.fs(pt), weight)
+        wkey = (key, text)
+        w = self._widths.get(wkey)
+        if w is not None:
+            return w
         f = self._fonts.get(key)
         if f is None:
             f = self._fonts[key] = tkfont.Font(family=family, size=key[1], weight=weight)
-        return f.measure(text)
+        if len(self._widths) > 4000:
+            self._widths.clear()
+        w = self._widths[wkey] = f.measure(text)
+        return w
 
     def reset_lock(self):
         """배율·열·섹션 배치·자리 높이 고정을 풀어 다음 그리기에서 한 번 새로 정하게 함."""
@@ -1433,6 +1580,11 @@ class App:
                 self.cfg["villain_seat"] = "max"
         self.cfg["table"] = [int(v) for v in rect]
         self.cfg["layout"] = to_json(res)
+        if "tourney_prize" in res and "tourney_rank" in res:  # 토너먼트 머리글 (총 상금 / 내 순위) — 몇 초마다 읽음
+            self.cfg["tourney_regions"] = {"prize": screen(res["tourney_prize"]), "rank": screen(res["tourney_rank"])}
+        else:
+            self.cfg.pop("tourney_regions", None)
+        self.reset_tourney()  # 새로 보정함: 자동 추정한 참가자 수는 버림
         self.fill_blinds(res)
         save_config(self.cfg)
         self.reset_ocr()
@@ -1463,9 +1615,15 @@ class App:
         영역이 '의미 있게' 바뀌고 움직임이 멈췄을 때만 다시 OCR (반짝임·글로우·칩 애니메이션은 무시)."""
         cache, last_unit, last_regions = {}, None, None
         steady = Steady(settle=True)
+        tstate = {}
         with MSS() as sct:
             while not self.closed:
                 time.sleep(OCR_INTERVAL)
+                try:  # 토너먼트 머리글 (총 상금 / 내 순위): 몇 초에 한 번, 숫자 읽기와 별개
+                    self.tourney_tick(sct, tstate)
+                except Exception:
+                    tstate.clear()
+                    self.log_once("tourney_tick")
                 regions = self.cfg.get("number_regions")
                 if not regions or not self.cfg.get("auto_numbers"):
                     continue
@@ -1488,6 +1646,275 @@ class App:
                     self.ocr_queue.put(values)
                 except Exception as exc:  # 화면 밖 영역 등 — 다음 주기에 재시도
                     self.ocr_queue.put({"error": str(exc)})
+
+    # --- 토너먼트 (머리글 읽기 · ICM 설정) ------------------------------------------------
+    def tourney_tick(self, sct, st):
+        """(OCR 스레드) 토너먼트 머리글 '총 상금 / 내 순위'를 TOURNEY_INTERVAL 마다 읽는다 (ocr 흔들어 읽기 다수결).
+        화면이 그대로면 건너뛰고 (TOURNEY_REFRESH 마다는 다시), 값이 바뀌면 한 번 더 읽어 같을 때만 반영 (오인식이 참가자 수
+        추정을 망치지 않게). 연속 2번 못 읽으면 지움 (현금 테이블로 옮김)."""
+        regions = self.cfg.get("tourney_regions")
+        if not regions or not self.cfg.get("layout") or "prize" not in regions or "rank" not in regions:
+            st.clear()
+            return
+        if st.get("regions") != regions:  # 영역을 새로 지정함
+            st.clear()
+            st["regions"] = {k: list(v) for k, v in regions.items()}
+        now = time.time()
+        if now < st.get("next", 0.0):
+            return
+        st["next"] = now + TOURNEY_INTERVAL * (3 if st.get("miss", 0) >= 3 else 1)
+        m = ocr.JITTER_MARGIN
+
+        def shoot():
+            out = {}
+            for k in ("prize", "rank"):
+                x, y, w, h = regions[k]
+                out[k] = grab(sct, (x - m, y - m, w + 2 * m, h + 2 * m))
+            return out
+        crops = shoot()
+        sigs = {k: signature(v[m:-m, m:-m]) for k, v in crops.items()}
+        old = st.get("sigs")
+        if st.get("ok") and old and now - st.get("t", 0.0) < TOURNEY_REFRESH \
+                and not any(sig_changed(old[k], sigs[k]) for k in sigs):
+            return
+        read = layout.read_tourney(crops)
+        if read["rank"] is None:
+            st["ok"], st["miss"], st["sigs"] = False, st.get("miss", 0) + 1, None
+            if st["miss"] == 2:
+                self.tourney_queue.put({"clear": True})
+            return
+        if read["rank"] != st.get("rank"):  # 바뀐 값: 한 번 더 읽어 같을 때만
+            again = layout.read_tourney(shoot())
+            if again["rank"] != read["rank"]:
+                st["ok"], st["sigs"] = False, None
+                return
+            read["prize"] = read["prize"] or again["prize"]
+        st.update(ok=True, miss=0, sigs=sigs, t=now, rank=read["rank"])
+        self.tourney_queue.put({"rank": read["rank"], "prize": read["prize"]})
+
+    def tcfg(self):
+        """cfg['tourney']: {icm, structure, entrants, entrants_auto, paid, max_left, prize_ref} (저장됨)."""
+        t = self.cfg.get("tourney")
+        if not isinstance(t, dict):
+            t = self.cfg["tourney"] = {}
+        return t
+
+    @staticmethod
+    def digits(text):
+        d = re.sub(r"\D", "", text or "")
+        return int(d) if d else None
+
+    def icm_on(self):
+        return bool(self.tcfg().get("icm", True))
+
+    def tourney_entrants(self):
+        v = getattr(self, "t_vars", None)
+        return self.digits(v["entrants"].get()) if v else None
+
+    def tourney_paid(self):
+        v = getattr(self, "t_vars", None)
+        return self.digits(v["paid"].get()) if v else None
+
+    def tourney_ui(self):
+        """입력 탭에 토너먼트 칸을 넣는가: 머리글을 읽었거나 영역이 지정돼 있거나 값이 이미 있을 때만 (현금 게임은 그대로)."""
+        t = self.tcfg()
+        return bool(self.tourney or self.cfg.get("tourney_regions") or t.get("entrants") or t.get("paid"))
+
+    def t_set(self, key, text):
+        """참가자 수 / 지급 인원 칸을 프로그램이 채움 (사용자가 직접 고친 것으로 치지 않음)."""
+        v = getattr(self, "t_vars", None)
+        if v and v[key].get() != text:
+            self._t_setting = True
+            try:
+                v[key].set(text)
+            finally:
+                self._t_setting = False
+
+    def on_t_input(self, key):
+        if self._t_setting:
+            return
+        t = self.tcfg()
+        t[key] = self.t_vars[key].get()
+        if key == "entrants":
+            t["entrants_auto"] = False  # 직접 고침 (비우면 다시 자동 추정)
+        self.save_later()
+        if hasattr(self, "canvas"):
+            self.refresh_tourney_widgets()
+            self.schedule_advice()
+            self.render()
+
+    def set_icm(self, on):
+        self.tcfg()["icm"] = bool(on)
+        self.save_later()
+        self.refresh_tourney_widgets()
+        self.schedule_advice()
+        self.render(force=True)
+
+    def set_structure(self, name):
+        self.tcfg()["structure"] = name
+        self.save_later()
+        self.refresh_tourney_widgets()
+        self.schedule_advice()
+        self.render(force=True)
+
+    def fill_auto_entrants(self):
+        """참가자 수가 비어 있거나 자동 추정값이면 → 이번 토너먼트에서 본 가장 큰 '남은 인원' (추정)."""
+        t = self.tcfg()
+        cur = self.tourney_entrants()
+        if (t.get("entrants_auto") or not cur) and self.t_max_left >= 2:
+            if cur != self.t_max_left:
+                self.t_set("entrants", str(self.t_max_left))
+                t["entrants"] = str(self.t_max_left)
+            t["entrants_auto"] = True
+
+    def reset_tourney_estimate(self):
+        """다른 토너먼트 (총 상금이 크게 바뀜 / 새로 자동 지정): 추정한 참가자 수를 버림. 직접 넣은 값은 그대로."""
+        t = self.tcfg()
+        self.t_max_left = 0
+        t["max_left"] = 0
+        if t.get("entrants_auto"):
+            self.t_set("entrants", "")
+            t["entrants"], t["entrants_auto"] = "", False
+
+    def reset_tourney(self):
+        self.tourney = None
+        self.t_prize_ref = None
+        self.tcfg().pop("prize_ref", None)
+        self.reset_tourney_estimate()
+        try:
+            while True:
+                self.tourney_queue.get_nowait()
+        except queue.Empty:
+            pass
+
+    def apply_tourney(self):
+        msg = None
+        while not self.tourney_queue.empty():
+            msg = self.tourney_queue.get_nowait()
+        if msg is None:
+            return
+        if msg.get("clear"):
+            if self.tourney is not None:
+                self.tourney = None
+                self.schedule_advice()
+            return
+        a, b = msg["rank"]
+        old = self.tourney or {}
+        prize, ticket = msg["prize"] if msg.get("prize") else (old.get("prize"), old.get("ticket", False))
+        ref = self.t_prize_ref
+        if prize and ref and not (1 / TOURNEY_JUMP <= prize / ref <= TOURNEY_JUMP):
+            self.reset_tourney_estimate()  # 총 상금이 크게 바뀜 = 다른 토너먼트
+        if prize:
+            self.t_prize_ref = prize
+        self.t_max_left = max(self.t_max_left, b)
+        new = {"my_rank": a, "players_left": b, "prize": prize, "ticket": bool(ticket)}
+        changed = new != self.tourney
+        self.tourney = new
+        t = self.tcfg()
+        t["max_left"], t["prize_ref"] = self.t_max_left, self.t_prize_ref
+        self.fill_auto_entrants()
+        if changed:
+            self.save_later()
+            self.schedule_advice()
+
+    def ocr_opp_bb(self):
+        """화면 숫자 읽기의 상대 스택 {키: BB} (단위 안전: BB 표기는 그대로, 칩 표기는 블라인드로 나눔)."""
+        out = {}
+        if self.cfg.get("auto_numbers"):
+            for k, v in self.ocr_values.items():
+                if k.startswith("opp") and v:
+                    x = self.bb_value(_number(v), {"BB": "BB", "만": "chips"}.get(v[1]))
+                    if x is not None:
+                        out[k] = x
+        return out
+
+    def tournament_ctx(self):
+        """advisor ctx['tournament']: 머리글을 읽었고 ICM 이 켜져 있고 참가자 수/지급 인원 중 하나가 있을 때만 (없으면 ICM 꺼짐)."""
+        t = self.tourney
+        if not t or not self.icm_on():
+            return None
+        ent, paid = self.tourney_entrants(), self.tourney_paid()
+        if not ent and not paid:
+            return None
+        d = {"players_left": t["players_left"], "my_rank": t["my_rank"],
+             "payouts": self.tcfg().get("structure", "standard")}
+        if ent:
+            d["entrants"] = ent
+        if paid:
+            d["paid"] = paid
+        if t.get("prize") and not t.get("ticket"):
+            d["prize_pool"] = t["prize"]
+        return d
+
+    def icm_ctx(self, ctx, ts, nboard):
+        """ctx 에 토너먼트 ICM 입력을 채움: tournament, table_stacks_bb, villain_stack_bb (내 차례 전 예상 ctx 도 같은 값)."""
+        tctx = self.tournament_ctx()
+        if not tctx:
+            return
+        ctx["tournament"] = tctx
+        ocr_bb = self.ocr_opp_bb()
+        stacks = table_stacks_from(ts, ocr_bb, ctx.get("my_stack"))
+        if stacks:
+            ctx["table_stacks_bb"] = stacks
+        vs = villain_stack_from(ts, main_villain_key(ts, nboard), ocr_bb)
+        if vs is not None:
+            ctx["villain_stack_bb"] = vs
+
+    def icm_line(self):
+        """분석 화면의 ICM 한 줄 (문구, 색). ICM 끔 / 현금 테이블이면 None.
+        예: 'ICM: 버블 근처 · 남은 32/지급 27 · 버블 팩터 1.6'"""
+        t = self.tourney
+        if not t or not self.icm_on() or self.icm is None:
+            return None
+        left, ent, paid = t["players_left"], self.tourney_entrants(), self.tourney_paid()
+        if not ent and not paid:
+            return (f"ICM: 참가자 수를 입력하면 켜집니다 · 남은 {left}", MUTED)
+        my = self.amount_bb("my_stack") if self.inputs["my_stack"].get().strip() else None
+        stacks = table_stacks_from(self.table_state or {}, self.ocr_opp_bb(), my)
+        structure = self.tcfg().get("structure", "standard")
+        key = (left, t["my_rank"], ent, paid, structure, round(my or 0, 1), repr(sorted(stacks.items())))
+        memo = getattr(self, "_icm_line_memo", None)
+        if memo and memo[0] == key:
+            return memo[1]
+        try:
+            st = self.icm.tournament_state(left, ent, t["my_rank"], stacks, payouts=structure, paid=paid,
+                                           hero_stack=my)
+        except Exception:
+            self.log_once("icm_line")
+            return None
+        stage, label = st["stage"], st["label"]
+        tail = " · 추정" if ent and self.tcfg().get("entrants_auto") else ""
+        if stage == "unknown":
+            out = (f"ICM: {label} · 남은 {left}", MUTED)
+        else:
+            base = f"ICM: {label} · 남은 {left}/지급 {st['paid']}"
+            if stage == "early":
+                out = (f"{base} · 칩EV 그대로{tail}", MUTED)
+            else:
+                bf = st["bubble_factor"]
+                out = (f"{base} · 버블 팩터 {'∞' if bf == float('inf') else format(bf, '.1f')}{tail}",
+                       WARN if stage in ("bubble", "near_bubble") else ACCENT)
+        self._icm_line_memo = (key, out)
+        return out
+
+    def refresh_tourney_widgets(self):
+        """입력 탭 토너먼트 칸의 표시 (추정 표시, 구조/ICM 버튼 색, 자동 지급 인원)."""
+        w = getattr(self, "t_widgets", None)
+        if not w:
+            return
+        try:
+            t = self.tcfg()
+            ent = self.tourney_entrants()
+            w["est"].config(text="추정" if t.get("entrants_auto") and ent else "")
+            paid_auto = self.icm.paid_places(ent) if self.icm is not None and ent and not self.tourney_paid() else None
+            w["paid_hint"].config(text=f"자동 {paid_auto}" if paid_auto else "")
+            on = self.icm_on()
+            w["icm"].config(text="● ICM 켬" if on else "○ ICM 끔", bg="#123b37" if on else CHIP, fg=ACCENT if on else MUTED)
+            cur = t.get("structure", "standard")
+            for name, b in w["struct"].items():
+                b.config(bg=ACCENT if name == cur else CHIP, fg=BG if name == cur else TEXT)
+        except tk.TclError:  # 입력 탭을 다시 만드는 중
+            pass
 
     def reset_ocr(self):
         """화면 자동 입력 상태 초기화. 팟·콜 금액 칸에 이미 들어 있는 값(지난 실행에서 저장된 값 등)도 자동 값으로 본다 →
@@ -1655,6 +2082,7 @@ class App:
         self.memory = {}
         self.card_cache = {}
         self.analysis_cache = {}
+        self.hero_lock = self.board_lock = None
 
     def hold(self, key, labels):
         """같은 핸드 동안 이미 읽은 카드는 말풍선·이펙트에 가려 ?가 돼도 유지.
@@ -1714,7 +2142,14 @@ class App:
                 self.store = profiles_m.Store(BASE / "profiles.db")
                 self.name_reader = names_m.NameReader(resolver=self.store.resolve_name,
                                                       on_confirm=self.store.learn_fingerprint)
-                self.tracker = handlog_m.Tracker(on_hand=self.store.observe)
+                dl_m = _optional("decisionlog")
+                self.declog = dl_m.DecisionLog(BASE, on_error=lambda *a: self.log_once("decisionlog")) if dl_m else None
+
+                def on_hand(rec, store=self.store):
+                    store.observe(rec)
+                    if self.declog is not None:  # 내 결정 기록에 실제 행동·결과를 이어 붙임
+                        self.declog.link_hand(rec)
+                self.tracker = handlog_m.Tracker(on_hand=on_hand)
                 self.store.new_session(self.tracker.session)
             rec_m = _optional("recorder")
             self.recorder = rec_m.Recorder(BASE / "recordings") if rec_m else None
@@ -1740,12 +2175,15 @@ class App:
         return self.cfg.get("analysis_mode") == "click"
 
     def heavy_allowed_for(self, st):
-        """상태 스레드용: 내 차례/차례 직전(preaction)/[지금 계산] 이면 무거운 계산 허용 (클릭 분석은 [지금 계산]만)."""
+        """상태 스레드용: 내 차례/차례 직전(preaction)/[지금 계산] 이면 무거운 계산 허용 (클릭 분석은 [지금 계산]만).
+        자동 분석에서는 내 카드가 잠겨 있고 핸드에 남아 있으면 내 차례 전에도 상대 예상을 갱신 (미리 계산용)."""
         if self.force_calc:
             return True
-        if self.click_mode():
+        if self.click_mode() or not isinstance(st, dict):
             return False
-        return bool(isinstance(st, dict) and (st.get("to_act") is True or st.get("preaction") is True))
+        if st.get("to_act") is True or st.get("preaction") is True:
+            return True
+        return bool(st.get("hero_in_hand") and not st.get("hero_folded") and self.hero_lock is not None)
 
     @staticmethod
     def aggression(seat):
@@ -1787,7 +2225,8 @@ class App:
         if self.tracker is None or not isinstance(st, dict) or "seats" not in st:
             return
         names = self.name_reader.read(img, calib, st) if self.name_reader else {}
-        self.tracker.update(st, hero, board, names, now)
+        if self.tracker.update(st, hero, board, names, now):
+            self.hands_done += 1   # 핸드가 끝남 → 카드 잠금을 푸는 새 핸드 신호
         profiles = self.store.get_for_table(names, session=self.tracker.session,
                                             tab=self.cfg.get("game_tab")) if self.store else {}
         live = self.tracker.live()
@@ -1907,12 +2346,28 @@ class App:
             return
         self.layout_bad = 0
         key = repr([st.get(k) for k in STATE_KEYS])
+        cur = self.table_state
+        if cur is not None and bool(st.get("to_act")) != bool(cur.get("to_act")):
+            # 액션 바(폴드/콜 버튼)가 나타나거나 사라짐은 강한 신호 → 내 차례 변화는 첫 읽기에서 바로 반영 (2번 읽기 기다리지 않음).
+            # 액션 바에서 나오는 값(콜 금액·체크 가능·레이즈 가능·미리 선택)만 같이 바꾸고, 나머지 값(인원·포지션·상황 …)은
+            # 지금까지 확정된 값 그대로 두고 원래대로 2번 읽기로 확정한다 → 한 프레임의 헛것이 다른 상태를 뒤집지 못함.
+            merged = dict(cur)
+            merged.update({k: st.get(k) for k in TURN_KEYS})
+            if st.get("to_act") is True:
+                self.turn_flag = True  # 이번 주기 안에 (150ms 기다리지 않고) 추천을 갱신
+            self.state_pending = key  # 다음 읽기도 같으면 나머지 값도 확정
+            self.state_key = repr([merged.get(k) for k in STATE_KEYS])
+            self.table_state = merged
+            self.schedule_advice()
+            return
         if key != self.state_pending:  # 같은 결과가 두 번 연속 나와야 반영
             self.state_pending = key
             return
         if key == self.state_key:
             self.table_state = st  # 좌석 세부값만 갱신
             return
+        if st.get("to_act") is True and (self.table_state or {}).get("to_act") is not True:
+            self.turn_flag = True  # 방금 내 차례: 이번 주기 안에 (150ms 기다리지 않고) 추천을 갱신
         self.state_key = key
         self.table_state = st
         self.schedule_advice()
@@ -2033,16 +2488,68 @@ class App:
         self.schedule_advice()
         self.render(force=True)
 
-    def maybe_run_heavy(self):
-        """허용되는데 에쿼티가 현재 상태 기준이 아니면 (보류돼 있던 계산) 지금 시작."""
-        if self.computing or self.computed_state is None or self.view.get("message"):
-            return
-        if not self.heavy_allowed():
-            return
+    def needs_analysis(self):
+        """에쿼티가 지금 상태(카드·상대 수·상대 리딩) 기준이 아니고, 그 기준으로 계산 중이지도 않은가."""
+        if self.computed_state is None or self.view.get("message"):
+            return False
+        if self.computing:
+            return self.job_key != (self.computed_state, self.reads_sig())
         res = self.result
-        reads_changed = bool(res and res.get("equity") is not None and res.get("rkey") != self.reads_sig())
-        if self.result_state != self.computed_state or reads_changed:
+        if self.result_state != self.computed_state:
+            return True
+        return bool(res and res.get("equity") is not None and res.get("rkey") != self.reads_sig())
+
+    def maybe_run_heavy(self):
+        """허용되는데 에쿼티가 현재 상태 기준이 아니면 (보류돼 있던 계산) 지금 시작. 내 차례 전(자동 분석)이면 미리 계산 예약."""
+        if not self.needs_analysis():
+            return
+        if self.heavy_allowed():
             self.start_analysis(self.computed_state)
+        elif self.anticipating():
+            self.schedule_anticipation()
+
+    # --- 미리 계산 (내 차례 전) -----------------------------------------------------------
+    def anticipating(self):
+        """자동 분석 · 내 카드 잠김 · 핸드에 남아 있음 · 아직 내 차례 아님 → 다음 결정을 미리 계산한다."""
+        if self.click_mode() or self.advisor is None or self.hero_lock is None:
+            return False
+        if self.fold_view is not None or self.view.get("message") or self.computed_state is None:
+            return False
+        ts = self.table_state
+        return bool(ts and ts.get("to_act") is False and ts.get("hero_in_hand") and not ts.get("hero_folded"))
+
+    def schedule_anticipation(self):
+        """결정에 필요한 상태(카드·상대 수·상대 리딩)가 바뀌면 ANTICIPATE_MS 동안 더 바뀌지 않을 때 미리 계산 시작."""
+        want = (self.computed_state, self.reads_sig())
+        if self.ant_after is not None:
+            if want == self.ant_want:
+                return
+            self.root.after_cancel(self.ant_after)
+        self.ant_want = want
+        self.ant_after = self.root.after(ANTICIPATE_MS, self.fire_anticipation)
+
+    def fire_anticipation(self):
+        self.ant_after = None
+        if self.anticipating() and not self.heavy_allowed() and self.needs_analysis():
+            self.start_analysis(self.computed_state, pre=True)
+
+    @staticmethod
+    def estimated_call(ts):
+        """내 차례 전 예상 콜 금액 (BB) = 남은 상대의 바닥 벳 최댓값 − 내 벳 (0 = 체크로 넘어옴). 모르면 None."""
+        seats = ts.get("seats") or []
+        opp = [_number(x.get("bet")) or 0.0 for x in seats if x.get("in_hand") and x.get("key") != "hero"]
+        if not opp:
+            return None
+        hero = next((x for x in seats if x.get("key") == "hero"), None)
+        mine = _number(hero.get("bet")) if hero else None
+        if mine is None:
+            mine = _number((ts.get("preflop") or {}).get("hero_bet")) or 0.0
+        return round(max(0.0, max(opp) - mine), 2)
+
+    def anticipate_ctx(self, ctx):
+        """추천 ctx 를 '내 차례가 왔을 때' 기준으로: 예상 콜 금액, 내 차례, 체크 가능 = 예상 콜 0."""
+        call = self.estimated_call(self.table_state or {})
+        return dict(ctx, call=call, to_act=True, can_check=None if call is None else call == 0)
 
     def result_stale(self):
         """보이는 에쿼티가 최신 카드/상대 수 상태가 아닌 '이전 계산'인가."""
@@ -2056,6 +2563,13 @@ class App:
             return
         self.advice_after = self.root.after(150, self.update_advice)
 
+    def advice_now(self):
+        """지금 바로 추천 갱신 (미뤄 둔 갱신은 취소). 내 차례가 막 왔을 때."""
+        if self.advice_after is not None:
+            self.root.after_cancel(self.advice_after)
+        self.maybe_run_heavy()
+        self.update_advice()
+
     def update_advice(self):
         self.advice_after = None
         self.compute_advice()
@@ -2066,8 +2580,11 @@ class App:
         if self.advisor is None:
             self.advice, self.advice_status = None, None
             return
-        if self.computing:
-            return  # 계산이 끝나면 다시 부름
+        res = self.result
+        if self.computing and not (res and res.get("equity") is not None and self.result_state == self.computed_state):
+            if self.advice_pre and not self.anticipating():  # 차례가 왔는데 미리 계산과 상황이 다름 → 새 결과 전까지 흐리게
+                self.advice_stale = True
+            return  # 계산이 끝나면 다시 부름 (지금 상태의 빠른 1차 결과가 있으면 그걸로 먼저 추천)
         if self.fold_view is not None:  # 폴드 후 복기: 직전 추천을 그대로 (흐리게) 둔다
             self.advice_stale = self.advice is not None
             return
@@ -2080,22 +2597,28 @@ class App:
             self.advice_status = ("추천 오류 — debug.log", "err", ())
             return
         if ctx is None:  # 숨기지 않고 이유를 패널에 보여준다
-            self.advice, self.advice_key, self.advice_stale = None, None, False
+            self.advice, self.advice_key, self.advice_stale, self.advice_pre = None, None, False, False
             self.advice_status = self.status_for(self.advice_why)
             return
+        # 내 차례 전(자동 분석): 예상 콜 금액으로 '차례가 왔을 때'의 추천을 미리 (흐리게). 차례가 와서 ctx 가 같으면 그대로 쓴다
+        pre = self.anticipating() and not self.result_stale()
+        if pre:
+            ctx = self.anticipate_ctx(ctx)
         key = repr(sorted((k, repr(v)) for k, v in ctx.items() if k != "villain_ranges")) + repr(self.result.get("rkey"))
         cards = (tuple(ctx["hero"]), tuple(ctx["board"]))
         if key == self.advice_key and not self.result_stale():
-            self.advice_stale = False
+            self.advice_stale, self.advice_pre = False, pre
             return
-        if not self.heavy_allowed():  # 내 차례가 아님: 같은 카드면 지난 결과를 흐리게 유지, 아니면 비움
+        if not pre and not self.heavy_allowed():  # 내 차례가 아님: 같은 카드면 지난 결과를 흐리게 유지, 아니면 비움
             if self.advice is not None and self.advice_cards == cards:
-                self.advice_stale = True
+                self.advice_stale, self.advice_pre = True, False
             else:
-                self.advice, self.advice_cards, self.advice_stale = None, None, False
+                self.advice, self.advice_cards, self.advice_stale, self.advice_pre = None, None, False, False
                 self.advice_status = (self.wait_text(), "info", ("calc",))
             return
-        self.advice_key, self.advice_cards, self.advice_stale, self.force_calc = key, cards, False, False
+        self.advice_key, self.advice_cards, self.advice_stale, self.advice_pre = key, cards, False, pre
+        if not self.computing:  # [지금 계산]: 정밀 계산이 끝날 때까지 유지 (빠른 1차 뒤에 끄면 정밀 결과가 '이전 계산'이 됨)
+            self.force_calc = False
         try:
             adv = self.advisor.recommend(ctx)
             self.advice = adv if isinstance(adv, dict) and adv.get("action") else None
@@ -2104,6 +2627,13 @@ class App:
             self.log_once("advisor.recommend", ctx)
             self.advice = None
             self.advice_status = ("추천 오류 — debug.log", "err", ())
+        declog = getattr(self, "declog", None)
+        if declog is not None and self.advice and not pre and ctx.get("to_act"):  # 내 차례의 결정 기록 (같은 결정은 한 번만)
+            try:
+                declog.record(ctx, self.advice, reads=self.reads_now(), state=self.tracker,
+                              profiles=(self.track or {}).get("profiles"))
+            except Exception:
+                self.log_once("decisionlog.record")
 
     def wait_text(self):
         return "클릭해서 분석 —" if self.click_mode() else "추천 대기: 내 차례가 되면 계산합니다 —"
@@ -2125,6 +2655,8 @@ class App:
         if title == "핸드 대기 중":  # 카드가 안 돌았음 (핸드 사이·휴식 타이머)
             return ("핸드 대기 / 휴식 중 — 내 카드 2장이 보이면 시작", "info", ())
         if why == "noequity":
+            if self.anticipating():
+                return ("추천 대기: 미리 계산 중 (내 차례 전)…", "info", ())
             if not self.heavy_allowed():
                 return (self.wait_text(), "info", ("calc",))
             return ("추천 대기: 계산 중…", "info", ())
@@ -2237,6 +2769,10 @@ class App:
             "hand_name": res["hand"],
             "facing_allin": facing_allin,
         }
+        try:  # 토너먼트 ICM 입력 (켜져 있고 참가자 수/지급 인원이 있을 때만). ctx 가 추천 캐시 키라 값이 바뀌면 새로 계산됨
+            self.icm_ctx(ctx, ts, len(board))
+        except Exception:
+            self.log_once("icm_ctx")
         if board:  # 포스트플랍: 위치·주도권·라인 (프리플랍 선택값 대신 이번 핸드에서 읽은 값으로 덮어쓴다)
             try:
                 turn_pot = pot
@@ -2266,22 +2802,29 @@ class App:
                 self.pending_toast = None
                 save_config(self.cfg)
             self.guard("apply_ocr", self.apply_ocr)
+            self.guard("apply_tourney", self.apply_tourney)
             self.guard("apply_table_state", self.apply_table_state)
-            self.guard("maybe_run_heavy", self.maybe_run_heavy)
             self.guard("capture", self.capture)
+            self.guard("maybe_run_heavy", self.maybe_run_heavy)  # 카드·상대 수가 반영된 뒤 (지난 상태로 헛계산하지 않게)
+            if self.turn_flag:
+                self.turn_flag = False
+                self.guard("turn_advice", self.advice_now)
             self.guard("render", self.render)
         finally:
             if not self.closed:
                 self.root.after(self.cfg["interval_ms"], self.tick)
 
-    def read_cards(self, key, img):
-        """영역 이미지 → [(crop, 라벨)]. 자리별로 카드 그림이 그대로면(반짝임·노이즈 무시) 지난 라벨을 재사용.
-        템플릿과 안 맞고 카드 모양도 아닌 덩어리는 버린다 (캐시에는 라벨 None 으로 기억)."""
-        crops = detect_cards(img)
+    def read_cards(self, key, img, rects=None):
+        """영역 이미지 → [(crop, 라벨)] (자리는 self.detected_rects[key]). 자리별로 카드 그림이 그대로면(반짝임·노이즈 무시)
+        지난 라벨을 재사용. 템플릿과 안 맞고 카드 모양도 아닌 덩어리는 버린다 (캐시에는 라벨 None 으로 기억).
+        rects: 이미 찾은 자리만 읽을 때 (잠근 보드의 빈 자리)."""
+        if rects is None:
+            rects = detect_rects(img)
+        crops = [_crop_rect(img, r) for r in rects]
         cache = self.card_cache.get(key)
         if cache is None or len(cache) != len(crops):
             cache = [None] * len(crops)
-        out = []
+        out, kept = [], []
         for i, crop in enumerate(crops):
             sig = signature(cv2.resize(crop, NORM_SIZE, interpolation=cv2.INTER_AREA))
             hit = cache[i]
@@ -2296,8 +2839,106 @@ class App:
                 cache[i] = (sig, label)
             if label is not None:
                 out.append((crop, label))
+                kept.append(rects[i])
         self.card_cache[key] = cache
+        self.detected_rects[key] = kept
         return out
+
+    # --- 카드 잠금 ----------------------------------------------------------------
+    # 한 번 확정된 카드는 같은 핸드 동안 바뀌지 않는다 → 잠근 동안은 매칭하지 않고, 값싼 확인(뒷면/카드 없음)과
+    # 핸드 단위 신호(폴드, 새 핸드: 딜러 이동 · 추적기의 핸드 종료 · 카드 받은 사람 없음 · 보드가 비워짐)로만 푼다.
+    # 말풍선·반짝임·글로우는 카드 면을 다 가리지 못하므로 잠금에 영향이 없다. 화면 신호는 2프레임 연속이어야 푼다.
+    def lock_signal(self, lk):
+        """잠근 뒤 새 핸드가 시작됐다는 신호 (테이블 상태 값들은 이미 2프레임 확정) → 이유, 없으면 None."""
+        ts = self.table_state
+        if ts:
+            if ts.get("no_hand"):
+                return "no_hand"
+            d = ts.get("dealer")
+            if d:
+                if lk.get("dealer") is None:
+                    lk["dealer"] = d
+                elif d != lk["dealer"]:
+                    return "dealer"
+        if self.hands_done != lk["hands"]:
+            return "tracker"
+        return None
+
+    def hero_unlock_reason(self, lk, img):
+        why = self.lock_signal(lk)
+        if why:
+            return why
+        ts = self.table_state
+        if ts and ts.get("hero_folded"):
+            return "hero_folded"
+        if self.board_resets != lk["boards"]:
+            return "board_cleared"
+        kinds = [card_presence(_crop_rect(img, r)) for r in lk["rects"]]
+        bad = BACK in kinds or all(k == "none" for k in kinds)
+        lk["strikes"] = lk["strikes"] + 1 if bad else 0
+        if lk["strikes"] >= LOCK_STRIKES:
+            return "back" if BACK in kinds else "gone"
+        return None
+
+    def read_hero(self, img):
+        """내 카드 → ([(자리, 라벨)], 잠금으로 읽었나). 잠근 동안은 매칭 없이 잠근 라벨."""
+        lk = self.hero_lock
+        if lk is not None:
+            if self.hero_unlock_reason(lk, img) is None:
+                return list(zip(lk["rects"], lk["labels"])), True
+            self.hero_lock = None
+        items = self.read_cards("hero", img)
+        self.detected["hero"] = items
+        return list(zip(self.detected_rects["hero"], (label for _, label in items)))[:2], False
+
+    def read_board(self, img):
+        """보드 → [(자리, 라벨)] (왼쪽부터, 뒷면 제외, 최대 5장). 잠근 자리는 매칭 없이 그대로, 빈 자리만 읽는다."""
+        lk = self.board_lock
+        if lk is not None:
+            why = self.lock_signal(lk)
+            if why is None:
+                gone = [card_presence(_crop_rect(img, r)) != "face" for r, _ in lk["slots"]]
+                lk["strikes"] = lk["strikes"] + 1 if any(gone) else 0
+                if lk["strikes"] >= LOCK_STRIKES:
+                    why = "cleared" if all(gone) else "fewer"
+            if why is not None:
+                if why == "cleared" and len(lk["slots"]) >= 3:
+                    self.board_resets += 1   # 보드가 비워짐 = 핸드 끝 → 내 카드 잠금도 풂
+                self.board_lock = lk = None
+        if lk is None:
+            items = self.read_cards("board", img)
+            self.detected["board"] = items
+            return [(r, label) for r, (_, label) in zip(self.detected_rects["board"], items) if label != BACK][:5]
+        slots = list(lk["slots"])
+        if len(slots) < 5:  # 새 카드는 잠근 자리 밖에서만 찾는다
+            new = [r for r in detect_rects(img) if not any(_overlaps(r, sr) for sr, _ in slots)]
+            if new:
+                items = self.read_cards("board_new", img, new)
+                slots += [(r, label) for r, (_, label) in zip(self.detected_rects["board_new"], items) if label != BACK]
+            slots.sort(key=lambda p: p[0][0])
+        self.detected["board"] = [(_crop_rect(img, r), label) for r, label in slots]
+        return slots[:5]
+
+    def lock_cards(self, hero_pairs, hero, board_pairs, board, state):
+        """확정된 정상 상태(메시지 아님)에서, 이번 프레임에 직접 읽은 라벨(기억으로 채운 것 아님)이 확정 값과 같으면 잠금."""
+        if isinstance(state[0], str):
+            return
+        ts = self.table_state
+        if ts and ts.get("no_hand"):
+            return
+        meta = {"strikes": 0, "dealer": (ts or {}).get("dealer"), "hands": self.hands_done}
+        raw = [label for _, label in hero_pairs]
+        if self.hero_lock is None and not (ts and ts.get("hero_folded")) and len(raw) == 2 and raw == list(hero) \
+                and all(ev.is_card(c) for c in raw):
+            self.hero_lock = dict(meta, labels=tuple(raw), rects=[r for r, _ in hero_pairs], boards=self.board_resets)
+        lk = self.board_lock
+        slots = list(lk["slots"]) if lk else []
+        add = [(r, label) for (r, label), b in zip(board_pairs, board)
+               if ev.is_card(label) and label == b and not any(_overlaps(r, sr) for sr, _ in slots)]
+        if add:
+            if lk is None:
+                self.board_lock = lk = meta
+            lk["slots"] = sorted(slots + add, key=lambda p: p[0][0])
 
     def capture(self):
         regions = self.cfg["regions"]
@@ -2305,18 +2946,29 @@ class App:
             self.view = {"message": ("영역을 지정하세요", "[자동 지정]을 누르고 게임 창을 드래그하면 보드·내 카드·팟·스택 "
                                                        "자리를 찾습니다. 직접 하려면 [카드]로 보드와 내 카드를 드래그합니다.")}
             return
-        self.detected = {key: self.read_cards(key, grab(self.sct, regions[key])) for key, _ in REGIONS}
-        hero = self.hold("hero", [label for _, label in self.detected["hero"]][:2])
-        board = self.hold("board", [label for _, label in self.detected["board"] if label != BACK][:5])
+        imgs = {key: grab(self.sct, regions[key]) for key, _ in REGIONS}
+        board_pairs = self.read_board(imgs["board"])  # 먼저: 보드가 비워짐 → 내 카드 잠금도 풂
+        hero_pairs, hero_locked = self.read_hero(imgs["hero"])
+        if hero_locked:
+            hero = [label for _, label in hero_pairs]
+            self.memory["hero"] = list(hero)
+        else:
+            hero = self.hold("hero", [label for _, label in hero_pairs])
+        board = self.hold("board", [label for _, label in board_pairs])
         self.live_cards = (list(hero), list(board))  # 실제 화면 (폴드 후 복기 화면과 별개, 핸드 기록용)
         state = self.read_state(hero, board)
 
         # 같은 결과가 두 번 연속 나와야 화면에 반영 (딜링/뒤집기 애니메이션 중 깜빡임 방지)
         frame = (tuple(hero), tuple(board), state)
         if frame != self.pending:
+            c = self.confirmed
             self.pending = frame
-            return
+            # 카드는 그대로고 상대 수만 바뀜 (테이블 상태에서 이미 2프레임 확정된 값) → 기다리지 않고 바로 반영
+            if not (c is not None and frame[:2] == c[:2] and not isinstance(state[0], str)
+                    and not isinstance(c[2][0], str)):
+                return
         if frame == self.confirmed:
+            self.lock_cards(hero_pairs, hero, board_pairs, board, state)
             return
         self.confirmed = frame
         # 폴드 후 복기용: 직전 분석·추천·상대 예상을 다음 핸드 카드가 들어올 때까지 그대로 남김
@@ -2344,6 +2996,7 @@ class App:
         if state != self.computed_state:
             self.computed_state = state
             self.start_analysis(state)
+        self.lock_cards(hero_pairs, hero, board_pairs, board, state)
 
     def read_state(self, hero, board):
         if BACK in hero:  # 한 장이라도 뒷면이면 폴드 (덮는 애니메이션 중 포함)
@@ -2359,7 +3012,9 @@ class App:
         return (tuple(ev.parse_card(c) for c in hero), tuple(ev.parse_card(c) for c in board),
                 self.opponents())
 
-    def start_analysis(self, state):
+    def start_analysis(self, state, pre=False):
+        """state 의 에쿼티 계산. pre=True: 미리 계산 (내 차례 전, 자동 분석). 같은 (상태, 상대 리딩)은 캐시.
+        계산은 작업자 스레드 하나가 빠른 1차(QUICK_ITERS) → 정밀(조각 CHUNK_ITERS) 순으로 하고 1차 결과부터 바로 보여준다."""
         self.generation += 1
         gen = self.generation
         hero, board, opponents = state
@@ -2367,57 +3022,128 @@ class App:
         rkey = reads["sig"] if reads else None
         cached = self.analysis_cache.get((state, rkey))
         if cached is not None:  # 같은 상태 → 같은 숫자 (몬테카를로를 다시 돌리면 값이 흔들림)
-            self.result, self.computing, self.result_state = cached, False, state
+            self.result, self.computing, self.result_state, self.job_key = cached, False, state, None
             self.schedule_advice()
             return
-        if not self.heavy_allowed():
+        if not (pre or self.heavy_allowed()):
             # 내 차례가 아님: 시뮬레이션은 미룬다. 같은 카드의 지난 계산이 있으면 그대로(흐리게), 아니면 가벼운 결과만
             prev = self.result
-            self.computing = False
+            self.computing, self.job_key = False, None
             if not (prev and prev.get("equity") is not None and prev["hero"] == list(hero)
                     and prev["board"] == list(board)):
                 self.result, self.result_state = analyze(list(hero), list(board), opponents), None
+            if self.anticipating():
+                self.schedule_anticipation()
             self.schedule_advice()
             return
         self.computing = True
+        self.job_key = (state, rkey)
         self.analysis_starts += 1
+        with self.job_cv:
+            self.job_next = {"gen": gen, "state": state, "reads": reads, "rkey": rkey}
+            self.job_cv.notify()
+        if self.job_thread is None:
+            self.job_thread = threading.Thread(target=self.job_worker, daemon=True)
+            self.job_thread.start()
 
-        def work():
-            res = None
-            if reads and self.rangeq is not None:  # 상대 레인지 기준 에쿼티 (없거나 실패하면 랜덤 핸드 기준)
-                try:
-                    res = self.range_analyze(hero, board, opponents, reads)
-                except Exception:
-                    self.log_once("range_equity", {"hero": list(hero), "board": list(board), "opp": opponents,
-                                                   "order": reads.get("order")})
-            if res is None:
-                res = analyze(list(hero), list(board), opponents, self.cfg["iterations"])
-                res["equity_basis"] = "random"
-            res["opponents"] = opponents
-            res["rkey"] = rkey
-            self.root.after(0, lambda: self.finish_analysis(gen, state, res, rkey))
+    def job_worker(self):
+        """무거운 계산 작업자 (한 번에 작업 하나). 결과는 Tk 스레드로 넘긴다."""
+        while not self.closed:
+            with self.job_cv:
+                while self.job_next is None and not self.closed:
+                    self.job_cv.wait(0.5)
+                job, self.job_next = self.job_next, None
+            if job is None:
+                continue
+            try:
+                self.run_job(job)
+            except Exception:
+                self.log_once("analysis_job", {"hero": list(job["state"][0]), "board": list(job["state"][1])})
+                self.post(lambda g=job["gen"]: self.job_failed(g))
 
-        threading.Thread(target=work, daemon=True).start()
+    def post(self, fn):
+        """작업자 스레드 → Tk 스레드 (창이 닫힌 뒤면 버림)."""
+        if self.closed:
+            return
+        try:
+            self.root.after(0, fn)
+        except (RuntimeError, tk.TclError):
+            pass
 
-    def range_analyze(self, hero, board, opponents, reads):
+    def equity_pass(self, hero, board, opponents, reads, iterations):
+        """에쿼티 한 번: 상대 레인지 기준 (없거나 실패하면 랜덤 핸드 기준)."""
+        if reads and self.rangeq is not None:
+            try:
+                return self.range_analyze(hero, board, opponents, reads, iterations)
+            except Exception:
+                self.log_once("range_equity", {"hero": list(hero), "board": list(board), "opp": opponents,
+                                               "order": reads.get("order")})
+        res = analyze(list(hero), list(board), opponents, iterations)
+        res["equity_basis"] = "random"
+        return res
+
+    def run_job(self, job):
+        gen, state, reads, rkey = job["gen"], job["state"], job["reads"], job["rkey"]
+        hero, board, opponents = state
+        full = int(self.cfg["iterations"])
+        if reads and self.rangeq is not None:
+            full = min(6000, full)
+        quick = max(1, min(QUICK_ITERS, full))
+        res = self.equity_pass(hero, board, opponents, reads, quick)
+        if res["equity_basis"] != "range" and reads:
+            reads, full = None, int(self.cfg["iterations"])  # 1차에서 레인지 계산이 안 됐으면 정밀도 같은 기준(랜덤)으로
+        res["opponents"], res["rkey"] = opponents, rkey
+        done = res["equity"]["samples"]
+        final = bool(res["equity"].get("exact")) or done >= full
+        res["quality"] = "full" if final else "quick"
+        shown = threading.Event()
+        self.post(lambda r=res, f=final: self.finish_analysis(gen, state, r, rkey, f, shown))
+        # 1차 결과를 화면에 그릴 동안은 정밀 계산을 쉬어 GIL 을 다투지 않음 (그리기가 2배 느려짐)
+        shown.wait(0.3)
+        while not final:
+            if self.closed or self.generation != gen or self.job_next is not None:
+                return  # 상태가 바뀜 / 새 작업 → 오래된 정밀 계산은 버림
+            part = self.equity_pass(hero, board, opponents, reads, min(CHUNK_ITERS, full - done))
+            res = dict(res, equity=merge_equity(res["equity"], part["equity"]))
+            done = res["equity"]["samples"]
+            final = done >= full
+        res["quality"] = "full"
+        self.post(lambda r=res: self.finish_analysis(gen, state, r, rkey, True))
+
+    def job_failed(self, gen):
+        if gen == self.generation:
+            self.computing, self.job_key = False, None
+            self.update_advice()
+
+    def range_analyze(self, hero, board, opponents, reads, iterations=None):
         """남은 상대 각자의 추정 범위로 에쿼티 (주 상대 먼저. 범위를 모르는 상대는 랜덤 핸드로 채움)."""
         order = list(reads["order"])[:opponents]
         ranges = [reads["ranges"][k] for k in order if k in reads["ranges"]]
         while len(ranges) < opponents:
             ranges.append(self.rangeq.random_range())
         res = analyze(list(hero), list(board), opponents)
-        res["equity"] = self.rangeq.equity_vs_ranges(list(hero), list(board), ranges,
-                                                     min(6000, int(self.cfg["iterations"])))
+        n = iterations if iterations is not None else min(6000, int(self.cfg["iterations"]))
+        res["equity"] = self.rangeq.equity_vs_ranges(list(hero), list(board), ranges, n)
         res["equity_basis"], res["villain_ranges"], res["villain_keys"] = "range", ranges, order
         return res
 
-    def finish_analysis(self, gen, state, res, rkey=None):
-        self.analysis_cache[(state, rkey)] = res
-        while len(self.analysis_cache) > 32:
-            self.analysis_cache.pop(next(iter(self.analysis_cache)))
-        if gen == self.generation:
-            self.result, self.computing, self.result_state = res, False, state
-            self.update_advice()
+    def finish_analysis(self, gen, state, res, rkey=None, final=True, shown=None):
+        """작업 결과 (빠른 1차 / 정밀). 정밀만 캐시. 지금 작업의 결과면 화면에 반영하고 추천 갱신."""
+        try:
+            if final:
+                self.analysis_cache[(state, rkey)] = res
+                while len(self.analysis_cache) > 32:
+                    self.analysis_cache.pop(next(iter(self.analysis_cache)))
+            if gen == self.generation:
+                self.result, self.result_state = res, state
+                self.computing = not final
+                if final:
+                    self.job_key = None
+                self.update_advice()
+                self.guard("render", self.render)  # 다음 주기(interval_ms)를 기다리지 않고 바로 (같은 화면이면 건너뜀)
+        finally:
+            if shown is not None:
+                shown.set()
 
     # --- 그리기 -------------------------------------------------------------
     def render(self, force=False):
@@ -2431,9 +3157,11 @@ class App:
         key = (repr(self.view), id(self.result), self.computing, self.toast, self.opponents(),
                len(self.matcher.labels), repr(st), repr(self.cfg.get("inputs")), w, h, self.tab,
                self.cfg.get("explain", True), repr(self.advice), repr(self.advice_status), self.advice_stale,
+               self.advice_pre, (self.result or {}).get("quality"),
                self.result_stale(), self.heavy_allowed(), self.err_note, self.state_key, tuple(sorted(self.manual)),
                bool(self.cfg.get("auto_numbers")), repr(self.ocr_values), self.rec_on, self.rec_elapsed(),
-               self.reads_sig(), repr((self.track or {}).get("names")), repr(self.cfg.get("section_layout")))
+               self.reads_sig(), repr((self.track or {}).get("names")), repr(self.cfg.get("section_layout")),
+               repr(self.tourney), repr(self.cfg.get("tourney")))
         if key == self.last_render and not force:
             return
         self.last_render = key
@@ -3140,6 +3868,11 @@ class App:
         t = self.text(c, x, y + pad, "  ·  ".join(parts) if parts else "입력값 없음 — 눌러서 입력", FS_BODY + 1,
                       "bold", TEXT if parts else MUTED, width=W - P - pad - x, tags=tag)
         bottom = c.bbox(t)[3] + pad
+        icm_line = self.icm_line()
+        if icm_line:  # 토너먼트 ICM 한 줄 (큰 글씨, 같은 상자 안)
+            t2 = self.text(c, P + pad, bottom - pad + s(5), icm_line[0], FS_BODY + 1, "bold", icm_line[1],
+                           width=W - 2 * (P + pad), tags=tag)
+            bottom = c.bbox(t2)[3] + pad
         bg = round_rect(c, P, top, W - P, bottom, s(10), fill=PANEL, outline="", tags=tag)
         c.tag_lower(bg)
         c.tag_bind(tag, "<Button-1>", lambda e: self.set_tab("inputs"))
@@ -3214,6 +3947,11 @@ class App:
         bw_ = h
         need_core = self.measure("플레이", FS_SMALL) + s(6) + bw_ + vw + bw_
         ends = self.measure("타이트", FS_NOTE) + self.measure("루즈", FS_NOTE) + s(12)
+        extra = 0
+        if x3 + need_core > W - P:  # 자리가 모자라면 빼지 말고 다음 줄로 (항상 보이게)
+            extra = h + s(6)
+            row3 += extra
+            x3 = P
         if x3 + need_core <= W - P:
             show_ends = x3 + need_core + ends <= W - P
             t = self.text(c, x3, row3 + h / 2, "플레이", FS_SMALL, "bold", MUTED, anchor="w")
@@ -3235,7 +3973,7 @@ class App:
                     "플레이 성향: ◀ 타이트(좁게) · ▶ 루즈(넓게, 공격적) · 0.0 = 솔버 근사 표준 · 0.1 단위. "
                     "추천과 프리플랍 가이드 격자에 바로 반영됩니다", e.x_root, e.y_root), add="+")
                 c.tag_bind(f"btn_{bk}", "<Leave>", lambda e: self.tip.hide(), add="+")
-        rows = h + s(6)
+        rows = h + s(6) + extra
         # 상태 점 + 학습된 카드 수 (버튼 줄 오른쪽, 자리가 있을 때만)
         msg = self.view.get("message")
         dot = MUTED if not self.cfg["regions"] else (WARN if msg and msg[0] not in ("핸드 대기 중", "폴드") else WIN_C)
@@ -3273,6 +4011,7 @@ class App:
         if adv:
             waiting = (ts.get("to_act") is False if ts else False) and not click  # 내 차례 아님 → 계획만, 흐리게
             stale = self.advice_stale
+            pre = self.advice_pre and waiting and self.fold_view is None  # 예상 콜 금액으로 미리 계산한 추천
             color = ADVICE_COLORS.get(adv.get("color_key"), ACCENT)
             if waiting or stale:
                 color = blend(color, PANEL, 0.45)
@@ -3280,11 +4019,12 @@ class App:
                 outline = color
             tag = self.new_tag("tip")
             cap = self.text(c, tx, iy, "추천" + ("  ·  폴드 전 마지막 분석 (복기용)" if self.fold_view is not None else
+                                                "  ·  미리 계산 (내 차례 전)" if pre and not stale else
                                                 ("  ·  차례가 오면" if waiting else "") + ("  ·  이전 계산" if stale else "")),
                             FS_NOTE, "bold", WARN if stale else MUTED, tags=tag)
             self.bind_tip(c, tag, f"{EXPLAIN['advice'][0]}: {EXPLAIN['advice'][2]}")
             rx, cap_bottom = x1 - pad, c.bbox(cap)[3]
-            if gate_closed:  # 내 차례가 아니라 계산을 미뤘다 → 직접 계산 버튼
+            if gate_closed and not pre:  # 내 차례가 아니라 계산을 미뤘다 → 직접 계산 버튼
                 fresh = click and not stale  # 클릭 분석: 최신 결과면 '다시 계산', 아니면 눈에 띄게 '지금 계산'
                 bw, bh = pill("calc", "다시 계산" if fresh else "지금 계산", rx, iy - s(2), right_align=True,
                               primary=click and not fresh)
@@ -3520,7 +4260,9 @@ class App:
         self.badge(c, mx - s(10), cy - (self.measure("가", FS_SMALL) + s(8)) / 2, "opponents", align="right")
         method = "정확 계산" if eq["exact"] else f"시뮬레이션 {eq['samples']:,}회"
         n = res["opponents"]
-        head = self.text(c, P, nb[3] + s(2), f"상대 {n}명 기준 승률" + ("  (다시 계산 중…)" if self.computing else "  (이전 계산)" if stale else ""),
+        busy = ("  (빠른 계산 · 정밀 계산 중…)" if res.get("quality") == "quick" and self.result_state == self.computed_state
+                else "  (다시 계산 중…)")
+        head = self.text(c, P, nb[3] + s(2), f"상대 {n}명 기준 승률" + (busy if self.computing else "  (이전 계산)" if stale else ""),
                          FS_BODY, "bold", MUTED if stale else TEXT, width=mx - P - s(12))
         basis = ("범위 기준 (상대 예상 레인지)" if res.get("equity_basis") == "range" else "랜덤 기준 (랜덤 핸드 가정)")
         t = self.text(c, P, c.bbox(head)[3] + s(2), f"{basis} · {method}", FS_NOTE,
@@ -3751,11 +4493,19 @@ class App:
                 self.inputs[key] = var
         # 상대 벳을 바꾸면 팟(= 화면 POT - 벳)도 다시 계산
         self.inputs["bet"].trace_add("write", lambda *_: self.fill_pot())
+        tc = self.tcfg()
+        self.t_vars = {}
+        for key in ("entrants", "paid"):
+            var = tk.StringVar(value=str(tc.get(key) or ""))
+            var.trace_add("write", lambda *_, k=key: self.on_t_input(k))
+            self.t_vars[key] = var
         self.build_inputs_frame()
 
     def build_inputs_frame(self):
-        if self.inputs_frame is not None and self.inputs_k == self.k:
+        tui = self.tourney_ui()
+        if self.inputs_frame is not None and self.inputs_k == self.k and self.inputs_t == tui:
             return self.inputs_frame
+        self.inputs_t = tui
         if self.inputs_frame is not None:
             self.inputs_frame.destroy()
         s = self.s
@@ -3794,6 +4544,9 @@ class App:
                         b.bind("<Button-1>", lambda e, k=key, fr=frac: self.apply_preset(k, fr))
                         b.bind("<Enter>", lambda e, w=b: w.config(bg=CHIP_HOVER))
                         b.bind("<Leave>", lambda e, w=b: w.config(bg=CHIP))
+        self.t_widgets = None
+        if tui:  # 토너먼트 (ICM): 머리글을 읽었거나 영역이 지정된 토너먼트 테이블에서만
+            self.build_tourney_inputs(box)
         self.villain_box = tk.Frame(box, bg=BG)
         self.villain_box.grid(row=95, column=0, columnspan=3, sticky="we", pady=(s(10), 0))
         if self.inputs_item is not None:
@@ -3801,6 +4554,42 @@ class App:
         self.inputs_item = self.canvas.create_window(0, 0, window=box, anchor="nw", state="hidden")
         self.refresh_auto_toggle()
         return box
+
+    def build_tourney_inputs(self, box):
+        """[입력] 탭의 토너먼트 칸: 참가자 수 · 지급 인원 · 상금 구조 · ICM 켜기/끄기."""
+        s = self.s
+        tb = tk.Frame(box, bg=BG)
+        tb.grid(row=91, column=0, columnspan=3, sticky="we", pady=(s(6), 0))
+        w = {"struct": {}}
+        head = tk.Frame(tb, bg=BG)
+        head.pack(fill="x")
+        tk.Label(head, text="토너먼트 (ICM)", bg=BG, fg=TEXT, font=self.font(FS_BODY, "bold")).pack(side="left")
+        w["icm"] = tk.Label(head, font=self.font(FS_SMALL, "bold"), padx=s(8), pady=s(2), cursor="hand2")
+        w["icm"].pack(side="right")
+        w["icm"].bind("<Button-1>", lambda e: self.set_icm(not self.icm_on()))
+        row = tk.Frame(tb, bg=BG)
+        row.pack(fill="x", pady=(s(4), 0))
+        for key, label, hint in (("entrants", "참가자 수", "est"), ("paid", "지급 인원", "paid_hint")):
+            f = tk.Frame(row, bg=BG)
+            f.pack(side="left", padx=(0, s(12)))
+            tk.Label(f, text=label, bg=BG, fg=MUTED, font=self.font(FS_NOTE)).pack(anchor="w")
+            line = tk.Frame(f, bg=BG)
+            line.pack(anchor="w")
+            tk.Entry(line, textvariable=self.t_vars[key], width=7, font=self.font(FS_BODY, "normal", F_NUM), bg=PANEL,
+                     fg=TEXT, insertbackground=TEXT, relief="flat", highlightthickness=1, highlightbackground=LINE,
+                     highlightcolor=ACCENT).pack(side="left", ipady=s(3), pady=(s(2), 0))
+            w[hint] = tk.Label(line, text="", bg=BG, fg=WARN, font=self.font(FS_SMALL, "bold"))
+            w[hint].pack(side="left", padx=(s(5), 0))
+        sr = tk.Frame(tb, bg=BG)
+        sr.pack(fill="x", pady=(s(5), 0))
+        tk.Label(sr, text="상금 구조", bg=BG, fg=MUTED, font=self.font(FS_NOTE)).pack(side="left", padx=(0, s(6)))
+        for name, label in TOURNEY_STRUCTURES:
+            b = tk.Label(sr, text=label, font=self.font(FS_SMALL), padx=s(7), pady=0, cursor="hand2")
+            b.pack(side="left", padx=(0, s(3)))
+            b.bind("<Button-1>", lambda e, n=name: self.set_structure(n))
+            w["struct"][name] = b
+        self.t_widgets = w
+        self.refresh_tourney_widgets()
 
     def amount(self, key):
         return odds.parse_amount(self.inputs[key].get())

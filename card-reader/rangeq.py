@@ -2,7 +2,7 @@
 
 공개 API
   villain_range(action, pos, players, stack_bb, profile=None, *, opener=None) -> {핸드코드: 가중치(0~1)}
-  equity_vs_ranges(hero, board, ranges, iterations=6000, rng=None) -> {equity, win, tie, lose, samples, exact}
+  equity_vs_ranges(hero, board, ranges, iterations=6000, rng=None, cache=None) -> {equity, win, tie, lose, samples, exact}
   narrow(range, board, action='bet', keep=None, dead=()) -> {콤보('AhKd'): 가중치}   포스트플랍 좁히기
   width_pct(range) -> 레인지 폭 (%, 콤보 기준)      random_range() -> 169핸드 균등
   profile_reliable(profile) -> bool                 profile_weight(profile) -> hands/(hands+50)
@@ -366,14 +366,17 @@ def _compile(rng, dead_mask, deck_cards):
     return [p[:3] for p in pop], cw
 
 
-def equity_vs_ranges(hero, board, ranges, iterations=6000, rng=None):
+def equity_vs_ranges(hero, board, ranges, iterations=6000, rng=None, cache=None):
     """hero(2장)의 에쿼티: 상대 각자가 자기 레인지에서 가중 샘플링한 두 장을 들고 있다고 가정.
 
     ranges: 상대별 레인지 리스트 (상대 수 = len(ranges)). 죽은 카드(내 패/보드)는 제외하고,
     상대끼리 카드가 겹치면 그 표본을 버리고 다시 뽑는다(거절 샘플링). 남은 보드는 균등 랜덤.
     표본이 하나도 안 나오는 불가능한 조합이면 ValueError.
+
+    cache: 디스크 캐시(eqtable.py; 무늬 정규화 + 레인지 가중치 해시 키, 표본을 합쳐 쌓음). None(기본) = rng 를 안 줬을 때만 사용
+    (고정 시드로 재현 가능한 계산을 요구하면 예전처럼 직접 계산). True/False 로 강제. 표본이 충분히(>= max(iterations, 6000))
+    쌓인 항목이면 즉시 그 값을, 아니면 새로 iterations 개를 계산해 캐시에 합치고 그 새 결과를 반환한다. 캐시 결과엔 "source": "cache".
     """
-    rng = rng or random
     hero, board = _cards(hero), _cards(board)
     if len(hero) != 2 or len(set(hero + board)) != len(hero) + len(board):
         raise ValueError("잘못된 카드")
@@ -381,15 +384,27 @@ def equity_vs_ranges(hero, board, ranges, iterations=6000, rng=None):
         ranges = [ranges]
     if not ranges:
         raise ValueError("상대 레인지 없음")
-    need = 5 - len(board)
-    if need < 0:
+    if len(board) > 5:
         raise ValueError("보드가 5장 초과")
+    if cache is None:
+        cache = rng is None
+    if cache:
+        import eqtable
+        return eqtable.cached_range_equity(
+            hero, board, ranges, iterations, expand,
+            lambda n: _equity_core(hero, board, ranges, n, rng))
+    return _equity_core(hero, board, ranges, iterations, rng)
+
+
+def _equity_core(hero, board, ranges, iterations, rng):
+    rng = rng or random
+    need = 5 - len(board)
     base_mask = 0
     for c in hero + board:
         base_mask |= BIT[c]
     deck = [c for c in range(52) if not base_mask & BIT[c]]
     comp = [_compile(r, base_mask, deck) for r in ranges]
-    evaluate = ev.evaluate
+    evaluate = ev.evaluate_fast
     sample, choices = rng.sample, rng.choices
     bl = list(board)
     hl = list(hero)

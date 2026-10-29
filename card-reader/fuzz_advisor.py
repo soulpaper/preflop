@@ -14,6 +14,7 @@ from collections import defaultdict
 
 import advisor
 import evaluator as ev
+import icm
 import odds
 import preflop as pf
 import rangeq
@@ -106,7 +107,51 @@ def post_case(r):
         ctx["style"] = r.choice(["tight", "standard", "aggressive", "weird"])
     if ctx["opponents_in_hand"] is None:
         ctx["opponents_in_hand"] = opp
+    add_tournament(r, ctx, stack)
     return ctx, dict(hero=hero, board=board, eq=eq, p0=p0, call=call, stack=stack, opp=opp, rb=rb, exact=exact)
+
+
+# --- 토너먼트 ICM ---------------------------------------------------------------------
+def rand_tournament(r):
+    """무작위 토너먼트 정보 (버블·파이널 쪽에 무게, 깨진 값 포함)."""
+    paid = r.choice([1, 3, 9, 15, 27, 45, 150])
+    left = r.choice([2, 3, 5, 9, paid - 1, paid, paid + 1, paid + 2, paid + 3, int(paid * 1.4) + 1, paid * 2 + 1, paid * 5,
+                     1, 0, None])
+    t = {"players_left": left}
+    k = r.random()
+    if k < 0.5:
+        t["paid"] = paid
+    elif k < 0.7:
+        t["payouts"] = [round(r.uniform(0.5, 30), 2) for _ in range(paid)]
+    elif k < 0.85:
+        t["entrants"] = r.choice([paid * 6, paid * 7, 0, None])
+    if r.random() < 0.4:
+        t["payouts"] = r.choice(["standard", "flat", "top_heavy", "weird", [], [0, -1], [100]])
+    if r.random() < 0.6:
+        t["avg_stack_bb"] = r.choice([r.uniform(5, 80), None, 0, -3])
+    if r.random() < 0.3:
+        t["my_rank"] = r.choice([f"{r.randint(1, 9)}/{left}", "x/y", 3, None])
+    if r.random() < 0.2:
+        t["prize_pool"] = 633250000
+    return t
+
+
+TR = random.Random(1)   # 토너먼트 정보는 별도 난수 — 기존 케이스 순서(main 의 r)를 바꾸지 않는다
+
+
+def add_tournament(_r, ctx, stack):
+    r = TR
+    if r.random() < 0.55:
+        return
+    ctx["tournament"] = rand_tournament(r)
+    if r.random() < 0.8:
+        n = r.randint(0, 9)
+        seats = {i: r.choice([round(r.uniform(0.5, 120), 1), round(r.uniform(5, 40), 1), 0, None, "x"]) for i in range(n)}
+        if r.random() < 0.5 and stack:
+            seats[r.choice(["hero", 99])] = stack
+        ctx["table_stacks_bb"] = seats
+    if r.random() < 0.7:
+        ctx["villain_stack_bb"] = r.choice([0, round(r.uniform(0.5, 150), 1), None, -5])
 
 
 def eff_stack(ctx):
@@ -133,6 +178,9 @@ def common_checks(ctx, res, tag):
         for m in re.findall(r"필요(?: 승률)? (-?\d+)%", d):
             if not 0 <= int(m) < 100:
                 bad(f"{tag}: 필요 승률 범위 밖", ctx, d)
+        for a, b in re.findall(r"필요 승률 (\d+)%→(\d+)%", d):   # ICM: 칩EV → ICM 필요 승률
+            if not (0 <= int(a) < 100 and 0 <= int(b) < 100) or int(b) < int(a):
+                bad(f"{tag}: ICM 필요 승률 범위 밖 / 칩EV 보다 낮음", ctx, d)
 
 
 def post_checks(ctx, k, res):
@@ -219,6 +267,7 @@ def pre_case(r):
     if r.random() < 0.2:
         ctx["equity"] = r.random()
         ctx["equity_basis"] = "range"
+    add_tournament(r, ctx, stack)
     return ctx, dict(hero=hero, kind=kind)
 
 
@@ -353,6 +402,52 @@ def rangeq_checks(r, n):
         counts["rangeq 레인지"] += 1
 
 
+def icm_checks(r, n):
+    """icm 직접: 필요 승률 ∈ [0, 1), 에쿼티 합 = 상금 합, 버블 팩터 >= 1 근처.  + 리버 너트는 ICM 이 극단이어도 올인 콜."""
+    for _ in range(n):
+        m = r.randint(1, 14)
+        st = [r.choice([r.uniform(0.1, 200), r.uniform(0.1, 3), 0.0]) for _ in range(m)]
+        pays = icm.payouts(r.randint(1, 20), structure=r.choice(["standard", "flat", "top_heavy"]))
+        try:
+            eq = icm.icm_equities(st, pays)
+            q = icm.required_equity_icm(r.uniform(0, 100), r.uniform(0, 100), r.uniform(0.01, 100),
+                                        r.choice([0.0, r.uniform(0, 200)]), st, pays)
+            bf = icm.bubble_factor(r.uniform(0.1, 100), r.uniform(0.1, 100), st, pays)
+        except Exception as e:
+            bad("icm: 예외", (st, pays), repr(e))
+            continue
+        counts["icm 직접"] += 1
+        if abs(sum(eq) - sum(pays[:m])) > 1e-6:
+            bad("icm: 에쿼티 합 != 남은 상금 합", (st, pays), sum(eq))
+        if not 0.0 <= q < 1.0:
+            bad("icm: 필요 승률 범위 밖", (st, pays), q)
+        if bf < 0.98:   # 정확한 Harville 은 >= 1 (오목) — 0.1% 스택 버킷 반올림 잡음만 허용
+            bad("icm: 버블 팩터 < 1", (st, pays), bf)
+    # 리버 너트 (정확 에쿼티 98%+) 는 어떤 ICM 상황에서도 올인 콜
+    for _ in range(max(60, n // 5)):
+        while True:
+            deck = list(range(52))
+            r.shuffle(deck)
+            hero, board = deck[:2], deck[2:7]
+            e = nut_equity(hero, board)
+            if e >= 0.98:
+                break
+        stack = round(r.uniform(2, 60), 1)
+        pot = round(r.uniform(1, 40), 1)
+        ctx = dict(hero=cs(hero), board=cs(board), street="river", opponents_in_hand=1, hero_pos=r.choice(["BB", "BTN", None]),
+                   villain_pos=r.choice(["CO", "SB", None]), stack_bb=stack, my_stack=stack, pot=pot,
+                   pot_total=round(pot + stack, 1), call=stack, to_act=True, can_check=False, facing_allin=True, equity=e,
+                   looseness=r.choice([-1.0, 0.0, 1.0]),
+                   tournament={"players_left": r.choice([3, 4, 5, 9, 28, 30]), "paid": 27,
+                               "payouts": r.choice(["standard", "top_heavy", "flat"]), "avg_stack_bb": r.uniform(10, 200)},
+                   table_stacks_bb={i: r.choice([0.5, 1.0, 300.0, r.uniform(1, 200)]) for i in range(r.randint(1, 8))},
+                   villain_stack_bb=r.choice([0, 300, r.uniform(0, 200)]))
+        res = advisor.recommend(ctx)
+        counts["icm 너트 올인 콜"] += 1
+        if res["action"] == advisor.FOLD:
+            bad("icm: 리버 너트 ICM 폴드", ctx, res["detail"])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=3000)
@@ -360,6 +455,7 @@ def main():
     ap.add_argument("-v", action="store_true")
     a = ap.parse_args()
     r = random.Random(a.seed)
+    TR.seed(a.seed + 3)
     for i in range(a.n):
         for kind, make, chk in (("post", post_case, post_checks), ("pre", pre_case, pre_checks)):
             ctx, k = make(r)
@@ -377,6 +473,8 @@ def main():
             except Exception:
                 bad(f"{kind}: 검사 중 예외", ctx, traceback.format_exc(limit=3))
     rangeq_checks(r, max(200, a.n // 5))
+    TR.seed(a.seed + 7)
+    icm_checks(random.Random(a.seed + 11), max(300, a.n // 5))
     range_checks()
     hashseed_check()
     parse_checks()

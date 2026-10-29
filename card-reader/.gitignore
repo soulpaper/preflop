@@ -15,3 +15,6 @@ test_userinfo.py
 gto_lib/
 templates_neg/
 config.json.*
+eqtable/postflop_cache.sqlite*
+eqtable/*.partial.jsonl
+eqtable/build.log

@@ -19,7 +19,7 @@ python reader.py
 ## exe 빌드
 
 ```
-pyinstaller --onefile --windowed --name CardReader --collect-all winrt --hidden-import names --hidden-import handlog --hidden-import profiles --hidden-import handread --hidden-import rangeq --hidden-import recorder --hidden-import userinfo --hidden-import advisor --hidden-import tablestate --hidden-import solverlib reader.py
+pyinstaller --onefile --windowed --name CardReader --collect-all winrt --hidden-import names --hidden-import handlog --hidden-import profiles --hidden-import handread --hidden-import rangeq --hidden-import recorder --hidden-import userinfo --hidden-import advisor --hidden-import tablestate --hidden-import solverlib --hidden-import icm --hidden-import eqtable --hidden-import decisionlog --add-data "eqtable/preflop_random.json;eqtable" reader.py
 ```
 
 exe 옆에 `templates/`, `font_glyphs/`, `gto_lib/` 를 둔다.

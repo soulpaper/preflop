@@ -36,6 +36,19 @@ ctx 키
                          tight 는 앤티 보정 전(예전) 동작에 가깝고, aggressive 는 오픈/방어/3벳이 더 넓고 헤즈업 세미블러프가 많고 얇은 밸류 벳.
   스택 깊이            : stack_bb(유효 스택)에 따라 프리플랍 폭이 연속으로 변한다 (preflop.DEPTH_*).  PUSHFOLD_BB(15BB) 이하 푸시/폴드,
                          15~25BB 는 오픈이 조금 좁고 콜이 줄며(투기 핸드 먼저) 3벳이 곧 잼, 40~100BB+ 는 투기 핸드 콜이 늘어난다.
+  tournament           : (선택) 토너먼트 ICM.  {players_left, entrants, paid, payouts (리스트 또는 'standard'/'flat'/'top_heavy'),
+                         prize_pool, my_rank ('6/32' 문자열도 됨 — 뒤 숫자를 players_left 로), avg_stack_bb}.  지급 인원 = paid / len(payouts)
+                         / entrants 의 ~15% (셋 다 없으면 단계 'unknown' → 보정 없음).  단계가 early(초반)이면 칩EV 그대로 (동작 동일).
+  table_stacks_bb      : (선택) {seat: 스택BB} 내 테이블 (내 자리가 있으면 'hero' 키나 my_stack 과 같은 값 하나를 빼고 쓴다)
+  villain_stack_bb     : (선택) 주 상대의 남은 스택 (벳 뒤, 올인이면 0).  없으면: 올인 상대는 0(+내 스택을 넘는 몫),
+                         그 밖엔 유효 스택 < 내 스택이면 유효 스택, 아니면 테이블 스택 중앙값, 그것도 없으면 평균 스택
+  ICM (tournament 가 있고 단계가 mid 이후): 필드 = 나 + 상대 + 테이블 나머지 + (남은 인원 - 테이블) × 나머지 평균 스택 (icm.py)
+    올인 결정 (잼, 잼 콜, 포스트플랍 올인 콜, 낮은 SPR 커밋, 압박 콜): 칩EV 필요 승률 대신 ICM 필요 승률 (상한 85% — 너트는 안 접음).
+      프리플랍 잼/잼콜 차트 폭은 (칩 필요/ICM 필요)^2 배 (잼은 상대 콜 쪽 ICM 압박만큼 넓힘, 0.4~1.35배).
+      detail 'ICM: 버블 팩터 1.6 → 필요 승률 33%→44% (버블)'.  포스트플랍 표기 '필요 승률 33%+11%(ICM) …'
+    올인 아닌 결정: 위험 프리미엄 rp = BF/(1+BF) - 0.5 (상대 기준) 로 콜 여유 + rp × 0.5 × 스택 관여, 프리플랍 오픈/방어/3벳 폭
+      × (1 - 2rp) (최소 0.55; 덮는 상대에겐 rp 가 커서 더 좁다).  평균 1.3배 이상 + 상대를 덮는 빅스택은 오픈 폭을 (상대 rp - 내 rp) 만큼 넓힌다 (최대 1.2배).
+      위험 프리미엄 3%p 이상이면 콤보 드로우 세미블러프 올인 안 함.
 
 멀티웨이 (opponents_in_hand >= 2) 규칙 요약
   콜 판단: 보정 에쿼티 = 에쿼티 × (벳 크기 보정) × (1 - 상대 수 할인) × (1 - 원페어 취약), 단 이 합산 감소는 상대 2명 14% / 3명+ 18% 를 넘지 않는다 (standard; post_params)
@@ -84,6 +97,7 @@ import time
 from functools import lru_cache
 
 import evaluator as ev
+import icm
 import odds
 import preflop as pf
 import rangeq
@@ -453,6 +467,13 @@ class _Ctx:
         agg = g("aggressor")
         self.aggressor = None if agg is None else bool(agg)
         self.flop_line = g("flop_line") or None
+        self.excess = excess if mine and call and call > mine else 0.0   # 내 스택을 넘는 상대 벳 (돌려받음)
+        self.icm = None
+        if isinstance(g("tournament"), dict):
+            try:  # ICM 은 부가 보정 — 실패하면 칩EV 그대로
+                self.icm = _Icm.build(self, g("tournament"), g("table_stacks_bb"), _num(g("villain_stack_bb")))
+            except Exception:
+                self.icm = None
 
     def _derive_ip(self):
         """포스트플랍에서 내가 상대보다 늦게 행동하는가 (헤즈업 판단용). 포지션을 모르면 None."""
@@ -473,6 +494,284 @@ class _Ctx:
         if self.pot is not None:
             return self.pot + self.call
         return None
+
+
+# --- 토너먼트 ICM -------------------------------------------------------------------
+ICM_ACTIVE = ("mid", "near_bubble", "bubble", "itm", "final")
+ICM_NEED_CAP = 0.85        # ICM 이 올리는 필요 승률 상한 (NUT_K 바닥: 에쿼티 98% 의 보정 에쿼티 >= 90% → 너트는 ICM 때문에 접지 않는다)
+ICM_CALL_MILD = 0.5        # 올인 아닌 콜: 위험 프리미엄 × 0.5 × 스택 관여 (0.4 + 1.2 × 콜/내 스택, 최대 1)
+ICM_WIDTH_K = 2.0          # 프리플랍 오픈/방어/3벳 폭 배수 = 1 - 2 × 위험 프리미엄
+ICM_WIDTH_MIN = 0.55
+ICM_BIG = 1.3              # 평균 스택의 1.3배 이상 + 상대를 덮으면 '압박' — 오픈만 조금 넓게
+ICM_PRESSURE_MAX = 1.2
+ICM_JAM_RANGE = (0.4, 1.35)   # 잼 / 잼콜 차트 폭 배수 범위
+ICM_SEMI_RP = 0.03         # 위험 프리미엄이 이 이상이면 콤보 드로우 세미블러프 올인을 안 한다
+
+
+def _rank_pair(v):
+    """'6/32' → (6, 32), 숫자 → (n, None)."""
+    if isinstance(v, str) and "/" in v:
+        a, b = v.split("/", 1)
+        return _num(a.strip()), _num(b.strip())
+    return _num(v), None
+
+
+def _fmt_bf(bf):
+    if bf == float("inf") or bf >= 10:
+        return "10+"
+    return f"{bf:.2f}".rstrip("0").rstrip(".")
+
+
+class _Icm:
+    """한 번의 recommend 동안 쓰는 ICM 모델 (필드 축소 모델 + 캐시된 icm 계산)."""
+
+    @staticmethod
+    def build(c, t, table, villain):
+        rank, left2 = _rank_pair(t.get("my_rank"))
+        left = _num(t.get("players_left")) or left2
+        entrants = _num(t.get("entrants"))
+        spec = t.get("payouts") or "standard"
+        paid = _num(t.get("paid"))
+        if isinstance(spec, (list, tuple)):
+            spec = [x for x in (_num(v) for v in spec) if x is not None and x > 0]
+            paid = len(spec) if spec else paid
+            spec = spec or "standard"
+        if not paid and entrants:
+            paid = icm.paid_places(entrants)
+        hero = c.my_stack or c.eff
+        if not left or left < 2 or not paid or not hero or hero <= 0:
+            return None
+        stage = icm.stage_of(int(left), int(paid))
+        if stage not in ICM_ACTIVE:
+            return None
+        pays = icm.as_payouts(spec, int(paid))
+        if not pays:
+            return None
+        return _Icm(c, int(left), int(paid), pays, stage, rank, table, villain, _num(t.get("avg_stack_bb")))
+
+    def __init__(self, c, left, paid, pays, stage, rank, table, villain, avg):
+        self.c, self.left, self.paid, self.pays, self.stage, self.rank = c, left, paid, pays, stage, rank
+        self.label = icm.STAGE_LABEL[stage]
+        self.hero = float(c.my_stack or c.eff)
+        hero_key = False
+        if isinstance(table, dict):
+            others = []
+            for k, v in table.items():
+                x = _num(v)
+                if str(k).lower() in ("hero", "me", "mine"):
+                    hero_key = True
+                elif x and x > 0:
+                    others.append(float(x))
+        else:
+            others = [float(_num(v)) for v in (table or []) if _num(v) and _num(v) > 0]
+        if not hero_key and others:   # 내 자리가 섞여 있으면 my_stack 과 같은 값 하나를 뺀다
+            j = min(range(len(others)), key=lambda i: abs(others[i] - self.hero))
+            if abs(others[j] - self.hero) <= max(0.06, 0.005 * self.hero):
+                others.pop(j)
+        self.table = others[: max(0, left - 1)]
+        known = [self.hero] + self.table
+        self.avg = avg if avg and avg > 0 else sum(known) / len(known)
+        self.villain_given = villain if villain is not None and villain >= 0 else None
+        self.notes = []
+        self._memo = {}
+
+    def _rest(self, v, alt=None):
+        """상대를 뺀 나머지 필드: 테이블 (상대 자리 = 남은 스택 alt 또는 전체 스택 v 와 같은 값 하나 제거) + 테이블 밖 평균 스택 그룹."""
+        key = ("rest", icm.bucket(v), None if alt is None else icm.bucket(alt))
+        if key in self._memo:
+            return self._memo[key]
+        tab = list(self.table)
+        removed = False
+        for x in ([alt] if alt else []) + [v]:
+            if tab and x and x > 0:
+                j = min(range(len(tab)), key=lambda i: abs(tab[i] - x))
+                if abs(tab[j] - x) <= max(1.0, 0.05 * x):
+                    tab.pop(j)
+                    removed = True
+                    break
+        if not removed and tab and 2 + len(tab) > self.left:   # 인원이 넘치면 상대가 테이블에 있는 것 — 가장 가까운 값을 뺀다
+            x = alt if alt else v
+            tab.pop(min(range(len(tab)), key=lambda i: abs(tab[i] - x)))
+        while tab and 2 + len(tab) > self.left:
+            tab.pop()
+        pot = self.c.total_pot() or 0.0
+        rest = [(s, 1) for s in tab] + icm.rest_of_field(self.left, [self.hero, max(v, 0.01)] + tab, self.avg, pot)
+        self._memo[key] = rest
+        return rest
+
+    def default_villain(self):
+        c = self.c
+        if self.villain_given is not None and self.villain_given > 0:
+            return self.villain_given
+        if c.eff and c.my_stack and c.eff < c.my_stack - 0.5:
+            return c.eff
+        if self.table:
+            s = sorted(self.table)
+            return s[len(s) // 2]
+        return self.avg
+
+    def allin_villain(self):
+        """올인한 상대의 남은 스택 (벳 뒤): 주어진 값, 없으면 0 + 내 스택을 넘어 돌려받는 몫."""
+        if self.villain_given is not None:
+            return self.villain_given + (self.c.excess or 0.0)
+        return self.c.excess or 0.0
+
+    def bf(self, a=None, b=None):
+        a = self.hero if a is None else a
+        b = self.default_villain() if b is None else b
+        key = ("bf", icm.bucket(a), icm.bucket(b))
+        if key not in self._memo:
+            rest = self._rest(b if a == self.hero else a)
+            self._memo[key] = icm.bubble_factor(a, b, rest, self.pays)
+        return self._memo[key]
+
+    def rp(self, a=None, b=None):
+        return icm.risk_premium(self.bf(a, b))
+
+    def need(self, risk, reward, v_behind, hero=None, v_full=None):
+        """올인 필요 승률 dict(icm, chip, bf, ...).  v_behind: 상대 남은 스택 (벳 뒤), v_full: 상대 전체 스택 (BF·필드 매칭용).
+        hero 를 주면 그 사람(상대) 입장 — 내 스택이 상대 자리 (v_full = 내 스택)."""
+        h = self.hero if hero is None else hero
+        risk = min(risk, h)
+        if risk <= 0 or reward < 0:
+            return None
+        vf = v_full if v_full is not None else v_behind + reward
+        rest = self._rest(vf, alt=v_behind) if hero is None else self._rest(h)
+        d = icm.required_equity_icm(risk, reward, h, v_behind, rest, self.pays, detail=True)
+        # 칩EV 아래로는 내리지 않는다 (Harville 에서 1:1 대결은 오목 — 그 아래는 버킷 반올림 잡음), 위로는 ICM_NEED_CAP 까지
+        d["icm"] = min(max(d["icm"], d["chip"]), max(ICM_NEED_CAP, d["chip"]))
+        d["bf"] = icm.bubble_factor(h, vf, rest, self.pays)
+        return d
+
+    def line(self, d):
+        return f"ICM: 버블 팩터 {_fmt_bf(d['bf'])} → 필요 승률 {_pct(d['chip'])}→{_pct(d['icm'])} ({self.label})"
+
+    def note(self, text):
+        if text and text not in self.notes:
+            self.notes.append(text)
+
+    def call_pad(self, call):
+        """올인 아닌 콜의 위험 프리미엄 (필요 승률 가산)."""
+        if not call or call <= 0:
+            return 0.0
+        inv = min(1.0, 0.4 + 1.2 * call / self.hero)
+        return ICM_CALL_MILD * self.rp() * inv
+
+    def width_mult(self, sit):
+        """프리플랍 차트 폭 배수 (sit 별, 1 = 그대로).  (배수, 설명)"""
+        key = ("w", sit)
+        if key in self._memo:
+            return self._memo[key]
+        c = self.c
+        out = (1.0, None)
+        if sit in ("open", "vsopen", "vs3bet", "vs4bet"):
+            v = self.default_villain()
+            rp_h = self.rp(self.hero, v)
+            m = max(ICM_WIDTH_MIN, 1 - ICM_WIDTH_K * rp_h)
+            why = f"ICM: {self.label} — 레인지 ×{m:.2f} (버블 팩터 {_fmt_bf(self.bf(self.hero, v))})"
+            if sit == "open" and self.hero >= v and self.hero >= ICM_BIG * self.avg:
+                rp_v = self.rp(v, self.hero)
+                m = min(ICM_PRESSURE_MAX, m + max(0.0, rp_v - rp_h))
+                why = f"ICM: {self.label} 빅스택 압박 — 오픈 ×{m:.2f} (상대 버블 팩터 {_fmt_bf(self.bf(v, self.hero))})"
+            out = (m, why)
+        elif sit == "jam":
+            eff = c.eff or self.hero
+            v = self.default_villain()
+            e = min(eff, self.hero, v)
+            dead = c.total_pot() or (1.5 + c.ante_total)
+            dh = self.need(e, e + dead, max(0.0, v - e), v_full=v)
+            dv = self.need(e, e + dead, max(0.0, self.hero - e), hero=v, v_full=self.hero)
+            if dh and dv:
+                mh = (dh["chip"] / dh["icm"]) ** 2 if dh["icm"] > 0 else 1.0
+                mv = (dv["chip"] / dv["icm"]) ** 2 if dv["icm"] > 0 else 1.0
+                m = min(ICM_JAM_RANGE[1], max(ICM_JAM_RANGE[0], mh / math.sqrt(max(mv, 1e-6))))
+                out = (m, f"ICM: 잼 폭 ×{m:.2f} (내 버블 팩터 {_fmt_bf(dh['bf'])} / 상대 콜 {_fmt_bf(dv['bf'])}, {self.label})")
+        elif sit == "jamcall":
+            d = self.facing_allin_need()
+            if d:
+                m = min(1.0, max(ICM_JAM_RANGE[0], (d["chip"] / d["icm"]) ** 2 if d["icm"] > 0 else 1.0))
+                out = (m, self.line(d))
+        self._memo[key] = out
+        return out
+
+    def facing_allin_need(self, call=None, pot=None):
+        c = self.c
+        call = c.call if call is None else call
+        pot = c.total_pot() if pot is None else pot
+        if not call or not pot:
+            return None
+        v = self.allin_villain()
+        return self.need(call, pot, v, v_full=v + pot)
+
+
+def _icm_facing(c, call, pot_with_bet, allin, base_need):
+    """콜의 ICM 가산 (필요 승률). (가산, 표시 줄)  base_need 와 합쳐 ICM_NEED_CAP 을 넘기지 않는다 (원래 더 높으면 그대로)."""
+    I = c.icm
+    if I is None or not call or call <= 0:
+        return 0.0, None
+    line = None
+    if allin:
+        d = I.facing_allin_need(call, pot_with_bet) if pot_with_bet else None
+        if not d:
+            return 0.0, None
+        pad, line = max(0.0, d["icm"] - d["chip"]), I.line(d)
+    else:
+        pad = I.call_pad(call)
+    return min(pad, max(0.0, ICM_NEED_CAP - base_need)), line
+
+
+def _icm_commit_pad(c, call, pot_with_bet, eff):
+    """낮은 SPR 커밋(올인) 의 ICM 가산: 내 남은 스택 전부를 걸고 상대가 나머지를 맞춘다고 본다."""
+    I = c.icm
+    if I is None or not eff or eff <= 0 or not pot_with_bet:
+        return 0.0
+    v = I.default_villain()
+    more = max(0.0, eff - call)
+    d = I.need(eff, pot_with_bet + more, max(0.0, v - more), v_full=v)
+    return max(0.0, d["icm"] - d["chip"]) if d else 0.0
+
+
+def _scale_acts(acts, mult, grow=False):
+    """프리플랍 액션 레인지 폭을 mult 배로: 줄일 때는 핸드 순위(G) 아래부터 빼고, grow 면 위 순위부터 첫 액션에 더한다."""
+    if abs(mult - 1.0) < 0.01 or not acts:
+        return acts
+    union = set().union(*(a[1] for a in acts))
+    if not union:
+        return acts
+    rank = {h: i for i, h in enumerate(pf.DATA["G"])}
+    total = sum(pf.combos(h) for h in union)
+    target = mult * total
+    if mult < 1.0:
+        keep, n = set(), 0
+        for h in sorted(union, key=lambda x: rank.get(x, 999)):
+            if keep and n >= target:
+                break
+            keep.add(h)
+            n += pf.combos(h)
+        return [(name, hands & keep, col) for name, hands, col in acts]
+    if not grow:
+        return acts
+    add, n = set(), total
+    for h in pf.DATA["G"]:
+        if n >= target:
+            break
+        if h not in union:
+            add.add(h)
+            n += pf.combos(h)
+    first = acts[0]
+    return [(first[0], first[1] | add, first[2])] + list(acts[1:])
+
+
+def _pf_ranges(c, sit, pos, villain, players, stack):
+    """pf.ranges + ICM 폭 보정 (토너먼트가 아니거나 초반이면 그대로)."""
+    acts = pf.ranges(sit, pos, villain, players, stack, c.ante, c.loose)
+    if c.icm is None:
+        return acts
+    m, why = c.icm.width_mult(sit)
+    if abs(m - 1.0) < 0.01:
+        return acts
+    c.icm.note(why)
+    return _scale_acts(acts, m, grow=sit in ("open", "jam"))
 
 
 # --- 진입점 -----------------------------------------------------------------------
@@ -515,6 +814,8 @@ def recommend(ctx):
         _tag_detail(r, _prof_note(c, c.prof_why), "핸드)")
     if c.rb and c.street in ("flop", "turn", "river") and gto_mode != "primary" and             not any("상대 범위" in x for x in r["detail"]):
         _tag_detail(r, "상대 범위 기준", "상대 범위")
+    if c.icm is not None and c.icm.notes and c.hero and len(c.hero) == 2 and c.street is not None:
+        _tag_detail(r, c.icm.notes[0], "ICM")
     if abs(c.loose) > 1e-9 and c.hero and len(c.hero) == 2 and c.street is not None:
         name = f"{STYLE_LABEL[c.style]} " if c.style else ""
         tail = " — GTO 기준 유지" if gto_mode == "primary" else ""   # GTO 가 주 추천이면 느슨함은 표기만
@@ -686,6 +987,25 @@ def _commit_range(c, hand, players, villain, call, eff):
     return hand in pf.top_pct(pct), pct
 
 
+def _icm_commit_range(c, hand, ok, pct, call, eff, pot_total, allin_call):
+    """큰 금액 승부 범위(_commit_range)를 ICM 필요 승률로 좁힌다: 폭 × (칩 필요/ICM 필요)^2.  (포함 여부, 범위 %, 표시 줄)"""
+    I = c.icm
+    if I is None or not pot_total or not call:
+        return ok, pct, None
+    if allin_call:
+        d = I.facing_allin_need(min(call, I.hero), pot_total)
+    else:   # 잼: 내 유효 스택 전부, 상대가 나머지를 맞춘다
+        v = I.default_villain()
+        more = max(0.0, eff - call)
+        d = I.need(eff, pot_total + more, max(0.0, v - more), v_full=v)
+    if not d or d["icm"] <= d["chip"] + 1e-9:
+        return ok, pct, (I.line(d) if d else None)
+    m = max(ICM_JAM_RANGE[0], (d["chip"] / d["icm"]) ** 2)
+    pct2 = pct * m
+    I.note(I.line(d))
+    return hand in pf.top_pct(pct2), pct2, I.line(d)
+
+
 def _preflop(c):
     state = {}
     r = _preflop_core(c, state)
@@ -835,10 +1155,18 @@ def _preflop_math(c, hand, strength, name, pos, players, call, eff, pot_total, c
         imp = p * f * mult * min(eff - call, IMPLIED_DEPTH * call) / (pot_total + call)
     mine = eq * R
     req = need + pad - imp
+    icm_line, need_a = None, need   # need_a: 올인 필요 승률 (ICM 이면 ICM 필요 승률)
+    if c.icm is not None:
+        ipad, icm_line = _icm_facing(c, call, pot_total, allin, need if allin else req)
+        if allin:
+            need_a = need + ipad
+        elif ipad > 0:
+            req += ipad
+            icm_line = f"ICM {c.icm.label}: 위험 프리미엄 +{ipad * 100:.0f}%p"
     big = bool(eff) and call > PRESSURE * eff and not allin
     verdict = None
     if allin:
-        verdict = "call" if eq >= need + 0.005 else "fold"   # 올인은 차트가 아니라 수학으로만
+        verdict = "call" if eq >= need_a + 0.005 else "fold"   # 올인은 차트가 아니라 수학으로만
     elif name == "폴드":
         if mine >= req + call_margin + (MATH_BIG_CALL if big else 0.0):
             verdict = "call"
@@ -846,9 +1174,9 @@ def _preflop_math(c, hand, strength, name, pos, players, call, eff, pot_total, c
         if mine < req - MATH_FOLD_MARGIN - c.post["math_margin"]:
             verdict = "fold"
     spr = (eff - call) / (pot_total + call) if eff and eff > call else None
-    cmp_ = "<" if (eq >= need if allin else mine >= req) else ">"
+    cmp_ = "<" if (eq >= need_a if allin else mine >= req) else ">"
     eqtxt = f"범위 대비 승률 {_pct(eq)}" + (f"→실현 {_pct(mine)}" if R < 1 else "")
-    need_txt = f"필요 {_pct(need if allin else req)}"
+    need_txt = f"필요 {_pct(need_a if allin else req)}"
     if verdict == "call":
         head_line = f"차트: {name} → {'올인도 수학으로: ' if allin else ''}팟 오즈로 콜 ({need_txt} {cmp_} {eqtxt})"
     elif verdict == "fold":
@@ -864,8 +1192,10 @@ def _preflop_math(c, hand, strength, name, pos, players, call, eff, pot_total, c
         second = f"팟 오즈 {_pct(need)} (콜 {_bb(call)} / 최종 팟 {_bb(pot_total + call)})"
     if spr is not None and not allin:
         second += f" · 콜 후 SPR {spr:.1f}" + (" → 플랍 커밋 수준" if spr < 3 else "")
+    if icm_line:
+        second = icm_line if allin else f"{second} · {icm_line}"
     return {"verdict": verdict, "lines": [head_line, second], "allin": allin, "mine": mine, "req": req,
-            "margin": (eq - need) if allin else (mine - req)}
+            "need_a": need_a, "margin": (eq - need_a) if allin else (mine - req)}
 
 
 def _preflop_core(c, state):
@@ -923,7 +1253,7 @@ def _preflop_core(c, state):
         else:
             villain = villains[0] if sit == "vs3bet" else villains[len(villains) // 2]
             conf = _lower(conf)
-    acts = pf.ranges(sit, pos, villain, players, eff or 100.0, c.ante, c.loose)
+    acts = _pf_ranges(c, sit, pos, villain, players, eff or 100.0)
     name, _ = pf.decide(hand, acts)
     vs = f" vs {villain}" if villain else ""
     where = f"{players}인 {pos}{vs}"
@@ -963,7 +1293,8 @@ def _preflop_core(c, state):
     if sit in ("vsopen", "vs3bet", "vs4bet") and eff and call > PRESSURE * eff and name != "폴드":
         ok, pct = _commit_range(c, hand, players, villain, call, eff)
         need = call / ((pot_total or call) + call)
-        info = [head, f"콜 {_bb(call)} = 유효 스택의 {_pct(call / eff)}",
+        ok, pct, icm_line = _icm_commit_range(c, hand, ok, pct, call, eff, pot_total, allin_call)
+        info = [head, icm_line or f"콜 {_bb(call)} = 유효 스택의 {_pct(call / eff)}",
                 f"상위 {pct:.0f}% 만 승부 · 필요 승률 {_pct(need)}" + (f" · 상대 {c.opp}명 기준" if c.opp > 1 else "")]
         if not ok:
             return _out(FOLD, reason=f"{where}: 큰 금액 — 승부 범위 밖이라 폴드", detail=info, confidence=conf)
@@ -975,7 +1306,8 @@ def _preflop_core(c, state):
     if name == "폴드":
         if sit == "jamcall" or allin_call:
             need = call / ((pot_total or call) + call) if call else 0
-            detail = [head, f"필요 승률 {_pct(need)}" if call else None]
+            d = c.icm.facing_allin_need(call, pot_total) if c.icm is not None and call and pot_total else None
+            detail = [head, (c.icm.line(d) if d else f"필요 승률 {_pct(need)}") if call else None]
         else:
             detail = [head, mw_note or f"{where} 레인지 밖"]
         why = "다자 팟 — 가치 하락" if mw_note else "레인지 밖"
@@ -1072,7 +1404,9 @@ def _preflop_generic(c, hand, strength, unopened, head):
         return _out(FOLD, reason="첫 진입 · 상위 15% 밖 → 폴드", detail=detail, confidence="low")
     if eff and call > PRESSURE * eff:
         ok, pct = _commit_range(c, hand, c.players or 9, None, call, eff)
-        detail.append(f"상위 {pct:.0f}% 만 승부 · 콜 {_bb(call)}")
+        ok, pct, icm_line = _icm_commit_range(c, hand, ok, pct, call, eff, pot_total,
+                                              bool(c.facing_allin) or call >= 0.95 * eff)
+        detail.append(f"상위 {pct:.0f}% 만 승부 · 콜 {_bb(call)}" + (f" · {icm_line}" if icm_line else ""))
         if not ok:
             return _out(FOLD, reason="큰 금액 — 승부 범위 밖이라 폴드", detail=detail, confidence="low")
         if c.facing_allin or call >= 0.95 * eff:
@@ -1346,10 +1680,15 @@ def _facing_bet(c, cls, made, tp_plus, twopair_plus, tex, eq, eq_src, outs, stro
         hu_pad = 0.0 if allin_call else _hu_margin(T, c.street, bet_frac, False, pot)
     cadj = c.post["call_adj"]
     need_eff = need + pad + ppad + cadj + hu_pad
+    icm_pad, icm_line = _icm_facing(c, call, pot, allin_call, need_eff)   # 토너먼트 ICM (없거나 초반이면 0)
+    need_eff += icm_pad
+    if icm_pad >= 0.005 and not icm_line:
+        c.icm.note(f"ICM: {c.icm.label} 위험 프리미엄 +{icm_pad * 100:.0f}%p (버블 팩터 {_fmt_bf(c.icm.bf())})")
     # 표기에 필요 승률의 모든 가산을 보인다 (스타일 가감이 빠져 '필요 41% > 보정 에쿼티 44%' 처럼 숫자와 부등호가 어긋났다)
     odds_line = f"필요 승률 {_pct(need)}" + (f"+{_pct(pad)}(뒤 레이즈 위험)" if pad else "") +         (f"{'+' if ppad > 0 else '-'}{_pct(abs(ppad))}(상대 성향)" if ppad else "") + \
         (f"{'+' if cadj > 0 else '-'}{_pct(abs(cadj))}(스타일)" if abs(cadj) >= 0.005 else "") + \
         (f"{'+' if hu_pad > 0 else '-'}{_pct(abs(hu_pad))}(실현 보정)" if abs(hu_pad) >= 0.005 else "") + \
+        (f"+{_pct(icm_pad)}(ICM)" if icm_pad >= 0.005 else "") + \
         f" {'<' if adj >= need_eff else '>'} 보정 에쿼티 {_pct(adj)}" + (f"(상대 {c.opp}명 -{_pct(disc)})" if mw else "")
     margin = adj - need_eff
     sure = "high" if abs(margin) >= 0.12 and conf != "low" else conf
@@ -1359,11 +1698,15 @@ def _facing_bet(c, cls, made, tp_plus, twopair_plus, tex, eq, eq_src, outs, stro
         size = min(call, c.my_stack) if c.my_stack else call
         # 헤즈업 올인 최소 에쿼티: 솔버 데이터의 큰 올인 기준이라 팟 대비 작은 올인(좋은 팟 오즈)엔 비례해서만 적용
         floor = T["allin_eq"][c.street] * min(1.0, bet_frac / ALLIN_EQ_FULL_FRAC) if hu else 0.0
+        third = icm_line or head
         if adj >= need_eff and eq >= floor:
             return _out(CALL, size, f"{_bb(size)} (올인 콜)", f"{made}: 에쿼티가 팟 오즈를 넘음 → 올인 콜",
-                        [odds_line, eq_src, head], sure)
-        why = "올인에 에쿼티 부족" if adj < need_eff else f"큰 올인 콜은 에쿼티 {_pct(floor)} 이상만 (현재 {_pct(eq)})"
-        return _out(FOLD, reason=f"{made}: {why} → 폴드", detail=[odds_line, eq_src, head], confidence=sure)
+                        [odds_line, eq_src, third], sure)
+        if adj < need_eff:
+            why = "올인에 에쿼티 부족" + (" (ICM)" if icm_pad and adj >= need_eff - icm_pad else "")
+        else:
+            why = f"큰 올인 콜은 에쿼티 {_pct(floor)} 이상만 (현재 {_pct(eq)})"
+        return _out(FOLD, reason=f"{made}: {why} → 폴드", detail=[odds_line, eq_src, third], confidence=sure)
 
     spr_after = stack_after / (pot + call) if stack_after is not None and pot + call > 0 else None
     spr_line = f"SPR(콜 후) {spr_after:.1f}" if spr_after is not None else None
@@ -1371,14 +1714,16 @@ def _facing_bet(c, cls, made, tp_plus, twopair_plus, tex, eq, eq_src, outs, stro
     if hu:  # 헤즈업: 솔버 표 — 낮은 SPR 커밋 / 에지 기준 밸류 레이즈
         edge = adj - need - ppad - c.post["call_adj"]
         st = c.street
-        if spr_after is not None and spr_after < T["jam_spr"] and edge >= T["jam_edge"][st]:
+        if spr_after is not None and spr_after < T["jam_spr"] and \
+                edge >= T["jam_edge"][st] + _icm_commit_pad(c, call, pot, eff):
             return _out(ALLIN, eff, _bb(eff), f"{made} + 낮은 SPR → 커밋 (올인)", [spr_line, odds_line, eq_src],
                         conf)
         value = cls in T["raise_cls"] and edge >= T["raise_edge"][st]
     else:
         # 낮은 SPR + 탑페어 이상 → 커밋
         commit_ok = tp_plus and (cls == "monster" or (cls == "strong" and (twopair_plus or overpair)))
-        if commit_ok and spr_after is not None and spr_after < 2 and adj >= need_eff:
+        if commit_ok and spr_after is not None and spr_after < 2 and \
+                adj >= need_eff + max(0.0, _icm_commit_pad(c, call, pot, eff) - icm_pad):
             return _out(ALLIN, eff, _bb(eff), f"{made} + 낮은 SPR → 커밋 (올인)", [spr_line, odds_line, eq_src],
                         conf)
         # 밸류 레이즈 (멀티웨이: 원페어 계열은 레이즈 대신 콜, 투페어+ 만 레이즈)
@@ -1393,7 +1738,8 @@ def _facing_bet(c, cls, made, tp_plus, twopair_plus, tex, eq, eq_src, outs, stro
         return _out(RAISE, size, f"{_bb(size)} (벳의 3배)", f"{made}: {strong_txt} → 밸류 레이즈",
                     [odds_line, eq_src, spr_line], conf)
     # 콤보 드로우 + 낮은 SPR → 세미블러프 올인 (상대 2명 이하만)
-    if combo and c.opp <= 2 and spr_after is not None and spr_after < 3:
+    if combo and c.opp <= 2 and spr_after is not None and spr_after < 3 and \
+            (c.icm is None or c.icm.rp() < ICM_SEMI_RP):   # 버블/파이널의 덮인 스택은 세미블러프 올인 자제
         return _out(ALLIN, eff, _bb(eff), "콤보 드로우 + 낮은 SPR → 세미블러프 올인",
                     [f"아웃츠 {outs['count']}장", odds_line, spr_line], "medium" if c.opp == 1 else "low")
     if adj >= need_eff:
@@ -1612,7 +1958,11 @@ def _max_call(c, pl, p0):
         adj, _ = _adj_equity(c, eq, cls, made, tw, f)
         ppad, _ = _prof_facing(c, cls, tw, f)
         hu_pad = _hu_margin(T, c.street, f, False, p0 * (1 + f) if p0 else None)
-        return adj - (f / (1 + 2 * f) + pad + ppad + c.post["call_adj"] + hu_pad)
+        base = f / (1 + 2 * f) + pad + ppad + c.post["call_adj"] + hu_pad
+        if c.icm is not None and p0:   # _facing_bet 과 같은 ICM 가산 (올인 크기면 ICM 올인 필요 승률)
+            allin = bool(pl["eff"]) and f * p0 >= 0.98 * pl["eff"]
+            base += _icm_facing(c, f * p0, p0 * (1 + f), allin, base)[0]
+        return adj - base
     f_pure = _plan_gain(g, PLAN_MAX_F)
     outs, eff = pl["outs"], pl["eff"]
     if not (outs and outs.get("count") and not pl["river"] and p0 and eff):
@@ -1748,7 +2098,7 @@ def _preflop_plan(c, r):
             if act != RAISE or pos not in pf.valid_heroes("vs3bet", players):
                 return []
             vl = pf.valid_villains("vs3bet", pos, players)
-            acts = pf.ranges("vs3bet", pos, vl[0] if vl else None, players, stack, c.ante, c.loose)
+            acts = _pf_ranges(c, "vs3bet", pos, vl[0] if vl else None, players, stack)
             name, _ = pf.decide(hand, acts)
             if name == "4벳":
                 return ["3벳 당하면: 4벳 (또는 상황 보고 콜)"]
@@ -1760,7 +2110,7 @@ def _preflop_plan(c, r):
             return []
         vl = pf.valid_villains("vsopen", pos, players)
         villain = vl[len(vl) // 2] if vl else None
-        acts = pf.ranges("vsopen", pos, villain, players, stack, c.ante, c.loose)
+        acts = _pf_ranges(c, "vsopen", pos, villain, players, stack)
         name, _ = pf.decide(hand, acts)
         if name == "3벳":
             ip = pos not in ("SB", "BB")
@@ -1777,7 +2127,7 @@ def _preflop_plan(c, r):
             return [f"레이즈가 오면: {_bb(_max_call_raise(hand, acts, eff))}까지 콜, 그 이상 폴드"]
         return ["레이즈가 오면: 폴드"]
     if sit in ("vsopen", "vs3bet") and act == RAISE:  # 내가 3벳/4벳 → 다음 레이즈 당하면
-        acts = pf.ranges("vs4bet", pos, None, players, stack, c.ante, c.loose)
+        acts = _pf_ranges(c, "vs4bet", pos, None, players, stack)
         name, _ = pf.decide(hand, acts)
         nxt = "4벳" if sit == "vsopen" else "5벳(올인)"
         if name == "5벳 잼":
