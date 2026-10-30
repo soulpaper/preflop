@@ -2458,7 +2458,7 @@ class App:
                     self.pre_auto_memo = (hero, base)
         return out
 
-    def preflop_note(self):
+    def postflop_pre_note(self):
         """플랍 뒤 '프리플랍: 포지션 · 상황' 한 줄 — 이번 핸드 프리플랍에서 읽은 값만 (저장된 선택값은 지난 핸드일 수 있음)."""
         hero = tuple(c for c in self.view.get("hero", []) if ev.is_card(c))
         memo = getattr(self, "pre_auto_memo", None)
@@ -3594,7 +3594,7 @@ class App:
                 guide = lambda c: self.sec_outs(c, res["outs"])
             else:
                 guide_text = "아웃츠 — 플랍·턴에 완성할 드로우가 있으면 표시"
-            note = self.preflop_note()
+            note = self.postflop_pre_note()
             if note:
                 notes.append(note)
         plan.append(("guide", guide, guide_text))
