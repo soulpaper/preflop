@@ -77,6 +77,9 @@ ctx 키
 
 GTO 라이브러리 (solverlib, 헤즈업 플랍/턴 SRP): 조회가 믿을 만하면 그 액션이 주 추천(규칙 기반 판단은 detail 로), 아니면 규칙 기반 유지 +
   detail 'GTO 참고(비슷한 플랍 K72r): …' 한 줄 + 신뢰도 low.  조건·상수는 GTO_* 와 _gto_primary 참고.  멀티웨이·프리플랍·3벳팟엔 쓰지 않는다.
+  예외 (참고만): 상대 2명 + 유효 스택 <= GTO_REF3_MAX_STACK + 단일 레이즈 팟이면 주 상대(ctx ref3_villain_pos, 선택 ref3_villain_stack·
+  ref3_other_bet) 와의 헤즈업 표를 detail 'GTO 참고(3명 → 1명 근사): vs BTN …' 한 줄로만 보여 준다.  액션·크기·색은 그대로, 신뢰도 low.
+  강한 메이드가 아니면 공격 빈도는 빼고, 표가 공격 쪽이면 줄을 뺀다 (팟 벳 블러프는 50% 폴드가 필요한데 두 명이면 25%).
 
 반환
   action      : 폴드 / 체크 / 콜 / 벳 / 레이즈 / 올인
@@ -909,6 +912,7 @@ def recommend(ctx):
 GTO_ENABLED = True
 GTO_NEAR_DIST = 2.0
 GTO_STACK_TOL = 10.0
+GTO_REF3_MAX_STACK = 60.0   # 3명 팟 참고 줄: 유효 스택 상한 (BB, 라이브러리 최대 스택. 토너먼트 깊이)
 GTO_TTL = 30.0              # 초: 배치가 라이브러리를 갱신하므로 조회 결과 캐시는 이만큼만
 _GTO_CACHE = {}
 _GTO_KEYS = ("hero", "board", "street", "hero_pos", "villain_pos", "players", "opponents_in_hand", "situation",
@@ -989,7 +993,11 @@ def _gto_primary(c, adv, res):
 
 def _gto_overlay(c, ctx, r):
     """(r, 모드).  모드: 'primary' / 'secondary' / None (GTO 조회 없음 → r 그대로).  r 은 직접 고치지 않고 새로 만든다."""
-    if not GTO_ENABLED or c.opp != 1 or not c.opp_known or c.to_act is False or r["action"] == WAIT:
+    if not GTO_ENABLED or not c.opp_known or c.to_act is False or r["action"] == WAIT:
+        return r, None
+    if c.opp == 2:
+        return _gto_ref3(c, ctx, r)
+    if c.opp != 1:
         return r, None
     adv = _gto_lookup(ctx)
     if not adv or adv["action"] not in COLOR:
@@ -1014,6 +1022,37 @@ def _gto_overlay(c, ctx, r):
         where += ", 턴"
     _tag_detail(r, f"GTO 참고({where}): {freq}", "GTO 참고")
     return r, "secondary"
+
+
+def _gto_ref3(c, ctx, r):
+    """상대 2명: 주 상대와의 헤즈업 표를 참고 줄 하나로 (r, 'ref3') / 조건이 안 되면 (r, None).  action·size·color 는 절대 안 바꾼다."""
+    vp = ctx.get("ref3_villain_pos")
+    if not vp or c.pre_raises != 1 or c.situation in ("vs3bet", "vs4bet", "jam", "jamcall") or c.facing_allin:
+        return r, None     # 단일 레이즈 팟임을 아는 경우만 (라이브러리는 SRP: 림프 팟·3벳 팟·모르는 팟은 안 씀)
+    vs = _num(ctx.get("ref3_villain_stack"))
+    eff = min(c.eff, vs) if c.eff and vs else c.eff
+    if not eff or eff > GTO_REF3_MAX_STACK:
+        return r, None
+    q = dict(ctx, opponents_in_hand=1, villain_pos=vp, stack_bb=eff)
+    other = _num(ctx.get("ref3_other_bet")) or 0.0
+    total = _num(ctx.get("pot_total"))
+    if other > 0 and total and total > other:   # 먼저 콜한 다른 상대의 칩은 빼고 벳 크기를 잰다
+        q["pot_total"] = round(total - other, 2)
+    adv = _gto_lookup(q)
+    acts = ((adv or {}).get("gto") or {}).get("actions")
+    if not isinstance(acts, dict) or not acts:
+        return r, None
+    calm = {a: f for a, f in acts.items() if a in ("check", "call", "fold")}
+    strong = _classify(c.hero, c.board)[0] in ("monster", "strong")
+    if not strong and sum(acts.values()) - sum(calm.values()) >= sum(calm.values()):
+        return r, None     # 표가 공격 쪽인데 약한 패: 블러프 조언 금지
+    import solverlib
+    freq = solverlib._freq_text(acts if strong else calm)
+    if not freq:
+        return r, None
+    r = dict(r, detail=list(r["detail"]), confidence="low")
+    _tag_detail(r, f"GTO 참고(3명 → 1명 근사): vs {vp} {freq}", "GTO 참고")
+    return r, "ref3"
 
 
 def _cap_medium(conf):

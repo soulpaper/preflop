@@ -1103,6 +1103,79 @@ def hero_ip_from(ts):
         return None
 
 
+def seat_position(seat, hist):
+    """좌석의 포지션: 이번 프레임 테이블 상태, 없으면 이번 핸드 추적기 (hist: 같은 핸드임을 확인한 요약). 둘이 다르면 None (믿을 수 없음)."""
+    a = seat.get("pos")
+    b = ((hist or {}).get("pos") or {}).get(seat.get("key"))
+    if a and b and a != b:
+        return None
+    return a or b or None
+
+
+def headsup_villain_pos(ts, hist, opponents, hero_pos):
+    """상대가 정확히 한 명 남았을 때 그 포지션 (이번 핸드 정보만), 모르면 None.
+    남은 사람은 두 번 읽어 확정한 테이블 상태를 믿는다: 추적기의 폴드는 한 프레임 판정이라 틀릴 때가 있어 (10-30 기록: 벳한 좌석을
+    폴드로 기록) 추적기로 상대 수를 줄이지 않는다. 믿을 만한 추적기가 다른 상대가 살아 있다고 하면 다자 팟일 수 있으니 모른다고 한다.
+    테이블 상태가 아무도 못 찾았을 때만 추적기의 남은 한 명을 쓴다."""
+    if opponents != 1:
+        return None
+    opps = [s for s in ts.get("seats") or [] if s.get("in_hand") and s.get("key") != "hero"]
+    live = [k for k in (hist or {}).get("live") or () if k != "hero"] if (hist or {}).get("reliable") else []
+    if len(opps) == 1:
+        if any(k != opps[0].get("key") for k in live):
+            return None
+        pos = seat_position(opps[0], hist)
+    elif not opps and len(live) == 1:
+        pos = hist["pos"].get(live[0])
+    else:
+        return None
+    return pos if pos and pos != hero_pos else None
+
+
+def three_way_ref(ts, hist, memo, nboard, opponents, hero_pos, ocr_bb=None):
+    """상대 2명 (플랍/턴) 일 때 참고 줄용 주 상대 {ref3_villain_pos, ref3_villain_stack, ref3_other_bet}. 못 정하면 {}.
+    주 상대 = 지금 벳한 사람 → 이번 핸드 마지막 공격자 → 프리플랍 레이저 → (내가 레이저면) 표에 있는 블라인드.
+    memo: 같은 핸드임을 확인한 프리플랍 기억 (pre_auto_memo). 추적기가 3명 이상 살아 있다고 하면 쓰지 않는다."""
+    if nboard not in (3, 4) or opponents != 2:
+        return {}
+    opps = [s for s in ts.get("seats") or [] if s.get("in_hand") and s.get("key") != "hero"]
+    if len(opps) != 2:
+        return {}
+    rel = hist if (hist or {}).get("reliable") else None
+    if rel and sum(1 for k in rel.get("live") or () if k != "hero") > 2:
+        return {}
+    keys = {o.get("key"): o for o in opps}
+    stage = {3: 1, 4: 2}[nboard]
+    last = (rel or {}).get("last_aggr") or {}
+    main = None
+    top = max(_number(o.get("bet")) or 0.0 for o in opps)
+    if top > 0:   # 같은 금액이면 콜한 사람이 아니라 벳한 사람
+        tied = [o for o in opps if (_number(o.get("bet")) or 0.0) >= top - 0.01]
+        main = (next((o for o in tied if o.get("key") == last.get(HAND_STREETS[stage])), None)
+                or next((o for o in tied if o.get("bubble") in ("bet", "raise", "allin")), None)
+                or next((o for o in tied if o.get("bubble") != "call"), None) or tied[0])
+    if main is None:
+        for street in reversed(HAND_STREETS[:stage + 1]):
+            if last.get(street) in keys:
+                main = keys[last[street]]
+                break
+    if main is None and (memo or {}).get("villain"):
+        main = next((o for o in opps if seat_position(o, hist) == memo["villain"]), None)
+    if main is None and ((rel or {}).get("opener") == "hero" or (memo or {}).get("hero_last_raise")):
+        for blind in ("BB", "SB"):
+            main = main or next((o for o in opps if seat_position(o, hist) == blind), None)
+    pos = seat_position(main, hist) if main else None
+    if not pos or pos == hero_pos:
+        return {}
+    out = {"ref3_villain_pos": pos}
+    other = next(o for o in opps if o is not main)
+    out["ref3_other_bet"] = round(_number(other.get("bet")) or 0.0, 2)
+    vs = villain_stack_from(ts, main.get("key"), ocr_bb or {})
+    if vs is not None:   # 벳 포함 (이번 스트리트 시작 기준 뒷스택)
+        out["ref3_villain_stack"] = round(vs + (_number(main.get("bet")) or 0.0), 2)
+    return out
+
+
 def flop_line_from(acts, turn_pot):
     """플랍 액션 [{act, to}] + 턴 시작 팟(BB) → solverlib 라인 'x_x' / 'x_bet33_c' / 'x_bet75_c' / 'bet33_c' / 'bet75_c'.
     레이즈·폴드가 섞였거나 크기를 못 잡으면 None.  벳 크기 = 벳 / (플랍 시작 팟 = 턴 시작 팟 - 2 × 벳), 0.5 아래면 33 아니면 75."""
@@ -1128,20 +1201,26 @@ def flop_line_from(acts, turn_pot):
 def summarize_hand(h, fatal=TRACK_FATAL):
     """handlog.Tracker.hand (진행 중 핸드; 내 좌석 'hero' 의 액션도 들어 있다) → 주도권·라인 요약 (상태 스레드에서만 호출).
     {hero_cards, street(0~3), reliable, last_aggr: {스트리트: 마지막 벳/레이즈한 좌석 or None}, pre_raises, pre_seen,
-     opener, flop(액션 목록), opp_raise(이번 스트리트에 상대 레이즈)}"""
+     opener, flop(액션 목록), opp_raise(이번 스트리트에 상대 레이즈), pos: {좌석: 이번 핸드에서 가장 많이 본 포지션},
+     live: 폴드 안 한 좌석}.  같은 좌석이 연달아 올린 것은 한 단계 (칩 글자를 3.9 → 4 로 고쳐 읽은 것을 3벳으로 세지 않게)"""
     acts = {s: [dict(a) for a in h.actions.get(s, [])] for s in HAND_STREETS}
     last = {}
     for s in HAND_STREETS:
         agg = [a for a in acts[s] if a["act"] in ("bet", "raise")]
         last[s] = agg[-1]["seat"] if agg else None
     pre = [a for a in acts["preflop"] if a["act"] != "post"]
-    raises = [a for a in pre if a["act"] == "raise"]
+    raises = []
+    for a in pre:
+        if a["act"] == "raise" and not (raises and raises[-1]["seat"] == a["seat"]):
+            raises.append(a)
     cur = acts[HAND_STREETS[min(max(h.street, 0), 3)]]
     return {"hero_cards": tuple(h.hero_cards or ()), "street": h.street,
             "reliable": not ({i["code"] for i in h.issues} & set(fatal)),
             "last_aggr": last, "pre_raises": len(raises), "pre_seen": bool(pre),
             "opener": raises[0]["seat"] if raises else None, "flop": acts["flop"],
-            "opp_raise": any(a["act"] == "raise" and a["seat"] != "hero" for a in cur)}
+            "opp_raise": any(a["act"] == "raise" and a["seat"] != "hero" for a in cur),
+            "pos": {k: s.pos.most_common(1)[0][0] for k, s in h.seats.items() if s.pos},
+            "live": [k for k, s in h.seats.items() if not s.folded]}
 
 
 def pre_aggressor_memo(pre, hero):
@@ -1859,6 +1938,10 @@ class App:
                     x = self.bb_value(_number(v), {"BB": "BB", "만": "chips"}.get(v[1]))
                     if x is not None:
                         out[k] = x
+            # 숫자 영역 키는 'opp1'.., 테이블 상태 좌석 키는 'seat_<자리>' — 둘 다 찾을 수 있게 (안 그러면 ICM 이 상대 스택을 못 찾음)
+            for seat in (self.cfg.get("layout") or {}).get("seats") or []:
+                if seat.get("key") in out and seat.get("slot"):
+                    out[layout.slot_key(seat["slot"])] = out[seat["key"]]
         return out
 
     def tournament_ctx(self):
@@ -2831,20 +2914,22 @@ class App:
     def postflop_ctx(self, ts, hero_str, nboard, opponents, turn_pot):
         """포스트플랍 추천에 넘길 위치·주도권·라인 (advisor 의 hero_ip / aggressor / flop_line, 솔버 조회용 villain_pos 등).
         내 액션도 핸드 추적기에 들어 있다 (좌석 'hero'). 추적을 믿을 수 없으면 프리플랍 마지막 레이저는 테이블 상태 기억(pre_memo)으로,
-        그 밖에는 None(모름). 포스트플랍엔 프리플랍 선택값이 의미 없어서 상대 포지션·상황도 여기서 다시 정한다."""
+        그 밖에는 None(모름). 포스트플랍엔 프리플랍 선택값이 의미 없어서 상대 포지션·상황도 여기서 다시 정한다.
+        opponents: 지금 핸드에 남은 상대 수 (ctx 의 opponents_in_hand. 에쿼티 결과의 상대 수는 지난 계산일 수 있음)."""
         out = {"situation": None, "villain_pos": None}   # 프리플랍 선택값(지난 핸드일 수 있음)의 상대 포지션은 쓰지 않음
         ip = hero_ip_from(ts)
         if ip is not None:
             out["hero_ip"] = ip
-        opps = [s for s in ts.get("seats") or [] if s.get("in_hand") and s.get("key") != "hero"]
-        if len(opps) == 1 and opponents == 1 and opps[0].get("pos"):
-            out["villain_pos"] = opps[0]["pos"]
         hist = (self.track or {}).get("hist")
         stage = {3: 1, 4: 2, 5: 3}.get(nboard)
         if hist and (hist["street"] != stage or set(hist["hero_cards"]) != set(hero_str)):
             hist = None   # 다른 핸드/스트리트의 요약 (프레임이 아직 따라오지 못함)
         memo = getattr(self, "pre_auto_memo", None)
         memo = memo[1] if memo and set(memo[0]) == set(hero_str) else {}
+        hero_pos = ts.get("hero_pos") or ((hist or {}).get("pos") or {}).get("hero") or memo.get("hero") or None
+        out["hero_pos"] = hero_pos
+        out["villain_pos"] = headsup_villain_pos(ts, hist, opponents, hero_pos)
+        out.update(three_way_ref(ts, hist, memo, nboard, opponents, hero_pos, self.ocr_opp_bb()))
         if memo.get("raises") is not None:  # 프리플랍 화면에서 본 레이즈 단계 (추적을 못 믿을 때도 3벳/4벳 팟은 안다)
             out["pre_raises"] = memo["raises"]
         if hist and hist["reliable"]:
@@ -2938,9 +3023,10 @@ class App:
             "street": STREET_KEYS.get(len(board), "preflop"),
             "players": _number(ts.get("pos_players")) or _number(ts.get("players")) or st["players"],
             "opponents_in_hand": min(res["opponents"], self.max_opponents() or res["opponents"]),
-            "hero_pos": ts.get("hero_pos") or st["hero"],
-            "situation": st["situation"],
-            "villain_pos": st.get("villain") if st["villains"] else None,
+            # 플랍 이후엔 프리플랍 선택값(지난 핸드일 수 있음)을 쓰지 않는다: postflop_ctx 가 이번 핸드 값으로 채우고, 실패해도 비어 있다
+            "hero_pos": ts.get("hero_pos") or (None if board else st["hero"]),
+            "situation": None if board else st["situation"],
+            "villain_pos": st.get("villain") if st["villains"] and not board else None,
             "stack_bb": st["stack_bb"],   # 프리플랍 가이드 격자와 같은 유효 스택
             "looseness": self.looseness(),
             "my_stack": in_bb("my_stack"),
@@ -2967,7 +3053,7 @@ class App:
                 turn_pot = pot
                 if turn_pot is None and pot_total and call is not None:
                     turn_pot = pot_total - call
-                ctx.update(self.postflop_ctx(ts, hero_str, len(board), res["opponents"], turn_pot))
+                ctx.update(self.postflop_ctx(ts, hero_str, len(board), ctx["opponents_in_hand"], turn_pot))
             except Exception:
                 self.log_once("postflop_ctx")
         return ctx

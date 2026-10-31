@@ -1242,7 +1242,7 @@ def gto_advice(ctx):
     raised = bool(g("villain_raised"))
     if not facing:
         base = "oop_first" if role == "oop" else "ip_vs_check"
-        start = pot if pot is not None else pot_total
+        start = pot_total if pot_total else pot   # 앞에 벳이 없으니 화면 POT 가 곧 시작 팟 (입력칸 pot 은 지난 스트리트 값일 때가 있음)
         cr = None
     else:
         if raised:

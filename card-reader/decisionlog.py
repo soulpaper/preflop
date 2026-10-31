@@ -15,14 +15,14 @@ load() 는 둘을 합쳐 결정 dict 에 'resolution' 키로 붙여 준다 (같�
 
 DECISION_FIELDS
   id, v, t, day, hand_id, street, turn, rev, hero_acts_before, state_street
-  hero[2], board[], tex{...board_texture}, hero_pos, villain_pos, situation, hero_ip, aggressor, flop_line, villain_raised
+  hero[2], board[], tex{...board_texture}, hero_pos, villain_pos, situation, hero_ip, aggressor, flop_line, villain_raised, ref3_villain_pos, pre_raises
   players, opponents, stack_bb, my_stack, pot, pot_total, call, call_pct_pot, spr, can_check, facing_allin, ante
   bettor{seat,pos,street,act,to,pct} (이번 스트리트 마지막 상대 벳/레이즈), n_aggr (이번 스트리트 벳/레이즈 수)
   seats{키: {pos, name|None, placeholder, hero, folded(street), acts{street:[{act,to,pct,allin}]}, profile{...}}}
       pct = 그 액션으로 낸 칩 / 액션 직전 팟 (BB 단위 팟을 액션 기록에서 다시 계산한 값; 앤티·OCR 팟과 다를 수 있음)
   equity, equity_basis, outs, hand_name, reads{키: {width, summary, classes, line}}
   advice{action(영문 fold/check/call/bet/raise/allin/wait), action_ko, size_bb, size_text, confidence, reason,
-         detail[], plan[], color_key, gto_mode(primary/secondary/None), gto_line}
+         detail[], plan[], color_key, gto_mode(primary/secondary/ref3/None), gto_line}
   looseness, tourney{players_left, my_rank, stage, bubble_factor ...}
 
 resolution 필드: src(tracker/manual), hero_actual{action,to,added,pct,allin,size_bb}, followed(True/False/None),
@@ -50,6 +50,7 @@ MEM_HANDS = 64
 MEM_KEYS = 512
 PROFILE_KEYS = ("vpip", "pfr", "af", "fold_to_bet", "threebet", "wtsd", "hands", "source")
 CTX_DIRECT = ("players", "hero_pos", "villain_pos", "situation", "hero_ip", "aggressor", "flop_line", "villain_raised",
+              "ref3_villain_pos", "pre_raises",
               "stack_bb", "my_stack", "pot", "pot_total", "call", "can_check", "facing_allin", "ante", "outs",
               "hand_name", "looseness", "equity_basis")
 TOURNEY_KEYS = ("players_left", "my_rank", "stage", "bubble_factor", "bubble", "m_ratio", "payouts_left", "icm")
@@ -270,7 +271,9 @@ def _advice_summary(advice):
     detail = [str(d)[:200] for d in (advice.get("detail") or []) if d][:3]
     plan = _prim(advice.get("plan") or [])
     gto_line = next((d for d in detail if "GTO" in d), None)
-    if any("GTO 참고" in d for d in detail):
+    if any("3명 → 1명 근사" in d for d in detail):
+        gto_mode = "ref3"       # 3명 팟 참고 줄 (헤즈업 GTO 조회와 구별)
+    elif any("GTO 참고" in d for d in detail):
         gto_mode = "secondary"
     elif str(advice.get("reason") or "").startswith("GTO") or any("규칙 기반 판단" in d for d in detail):
         gto_mode = "primary"
