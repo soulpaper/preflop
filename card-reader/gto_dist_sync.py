@@ -131,30 +131,18 @@ def save_cache(path, cache):
         pass
 
 
-def run(cfg, stats=None):
-    stats = stats if stats is not None else {}
-    stats.update(put=0, scanned=0)
-    api = Api(cfg["url"], cfg["token"])
-    lib_dir = cfg["lib_dir"]
+def get_manifest(api):
     st, data = api.req("GET", C.PATH_MANIFEST)
     if st == 404:
-        base, cur = 0, {}
-    elif st == 200:
-        m = json.loads(data)
-        base, cur = m["version"], m["files"]
-    else:
+        return 0, {}
+    if st != 200:
         raise Fail("manifest_get_%d" % st)
-    cache_path = cfg.get("cache")
-    cache = load_cache(cache_path) if cache_path else {}
-    files, cache = scan(lib_dir, cache)
-    stats["scanned"] = len(files)
-    if cache_path:
-        save_cache(cache_path, cache)
-    if not files:
-        raise Fail("scan_empty")
-    if files == cur:
-        log("변경 없음 (버전 %d, 파일 %d)" % (base, len(files)))
-        return 0
+    m = json.loads(data)
+    return m["version"], m["files"]
+
+
+def put_files(api, lib_dir, files, stats):
+    """서버에 없는 객체만 올린다. 그사이 러너가 파일을 교체하면 files 를 새 해시로 갱신한다."""
     shas = sorted({e["sha256"] for e in files.values()})
     st, data = api.json("POST", C.PATH_MISSING, {"sha256": shas})
     if st != 200:
@@ -183,7 +171,39 @@ def run(cfg, stats=None):
             raise Fail("put_%d %s %s" % (st, rel, data[:80].decode("utf-8", "replace")))
         stats["put"] += 1
         missing.discard(sha)
-    st, data = api.json("POST", C.PATH_MANIFEST, {"base_version": base, "files": files, "allow_shrink": False})
+
+
+def run(cfg, stats=None):
+    stats = stats if stats is not None else {}
+    stats.update(put=0, scanned=0)
+    api = Api(cfg["url"], cfg["token"])
+    lib_dir = cfg["lib_dir"]
+    base, cur = get_manifest(api)
+    cache_path = cfg.get("cache")
+    cache = load_cache(cache_path) if cache_path else {}
+    files, cache = scan(lib_dir, cache)
+    stats["scanned"] = len(files)
+    if cache_path:
+        save_cache(cache_path, cache)
+    if not files:
+        raise Fail("scan_empty")
+    if files == cur:
+        # 게시할 것은 없지만 서버에 객체가 모두 있는지는 확인한다(요청 1회). 사라진 객체가 있으면 다시 올린다.
+        put_files(api, lib_dir, files, stats)
+        if files != cur:
+            raise Fail("changed_during_sync")      # 그사이 러너가 교체함: 다음 타이머가 게시
+        log("변경 없음 (버전 %d, 파일 %d, 재업로드 %d)" % (base, len(files), stats["put"]))
+        return 0
+    for attempt in (0, 1):
+        put_files(api, lib_dir, files, stats)
+        st, data = api.json("POST", C.PATH_MANIFEST, {"base_version": base, "files": files, "allow_shrink": False})
+        # 48시간 넘은 미참조 객체는 missing 조회 뒤 서버 정리와 겹치면 사라질 수 있다.
+        # 이 경우 한 번만 missing 부터 다시 한다(그래도 실패하면 exit 1, 다음 타이머가 복구).
+        if st == 422 and b"missing_object" in data and attempt == 0:
+            log("게시 중 객체가 정리됨(missing_object): 다시 올림")
+            base, _ = get_manifest(api)
+            continue
+        break
     if st != 200:
         raise Fail("publish_%d %s" % (st, data[:80].decode("utf-8", "replace")))
     out = json.loads(data)

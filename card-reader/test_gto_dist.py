@@ -95,6 +95,38 @@ def write_lib(d, v=0, names=None):
             f.write(make_obj("turn" if rel.startswith("turn/") else "lib", i, v))
 
 
+def deep_json_obj(depth):
+    inner = "1"
+    return gzip.compress(('{"board":"x","lines":' + "[" * depth + inner + "]" * depth + ',"rh":1,"th":1}').encode(), mtime=0)
+
+
+def bigint_obj(n=4400):
+    return gzip.compress(('{"board":"x","lines":[1' + "0" * n + '],"rh":1,"th":1}').encode(), mtime=0)
+
+
+def py_verdict_variants():
+    """Go 와 판정이 다를 수 있는 변종. (이름, 바이트, Go 기대 통과 여부)."""
+    base = json.dumps({"board": "x", "lines": [1], "rh": 1, "th": 1})
+    return [
+        ("UTF-8 BOM", gzip.compress(b"\xef\xbb\xbf" + base.encode(), mtime=0), False),
+        ("UTF-16 JSON", gzip.compress(base.encode("utf-16"), mtime=0), False),
+        ("UTF-32 JSON", gzip.compress(base.encode("utf-32"), mtime=0), False),
+        ("gzip 뒤 0바이트 패딩", gzip.compress(base.encode(), mtime=0) + b"\0" * 8, False),
+        ("깊이 1100 중첩", deep_json_obj(1100), True),
+        ("깊이 9990 중첩", deep_json_obj(9990), True),
+        ("깊이 10001 중첩", deep_json_obj(10001), False),
+        ("4400자리 정수(stack 외)", bigint_obj(), True),
+    ]
+
+
+def _py_rejects(data):
+    try:
+        C.validate_object(data)
+        return False
+    except C.ValidationError:
+        return True
+
+
 def snap(d):
     """{rel: (sha, mtime_ns)} — .update-tmp 와 숨김 폴더 제외."""
     out = {}
@@ -396,6 +428,14 @@ def common_rules():
     except C.ValidationError as e:
         ok = e.code == "bad_gzip"
     test("validate_object: 압축 폭탄 거부(해제 상한)", ok, "압축 %dKB" % (len(bomb) // 1024))
+    # Go 서버 판정과의 차이(회귀): Go 가 거부하는 것을 Python 이 통과시키면 게시가 막히므로 업로더에서 먼저 차단한다
+    jb = json.dumps({"board": "x", "lines": [1], "rh": 1, "th": 1})
+    for name, data, go_ok in py_verdict_variants():
+        got = not _py_rejects(data)
+        # 안전 조건: Go 가 거부하는 파일을 업로더가 통과시키면 안 된다(게시가 422 로 막힘). 반대(더 엄격)는 허용.
+        test("판정 차이: %s — Go %s, 업로더 %s (Python 단독 통과 없음)" % (name, "통과" if go_ok else "거부", "통과" if got else "거부"),
+             go_ok or not got)
+    test("판정: 다중 멤버 gzip 은 Go 와 같이 통과", _py_rejects(gzip.compress(jb[:20].encode()) + gzip.compress(jb[20:].encode())) is False)
     ent = {"sha256": "a" * 64, "size": 1}
     for name, files in {"..": {"../x": ent}, "hands/": {"hands/a.json.gz": ent}, "절대": {"/x/BTN_BB_20bb.json.gz": ent},
                         "C:": {"C:\\x": ent}, ".tmp": {"BTN_BB_20bb.json.gz.tmp": ent},
@@ -497,7 +537,7 @@ def upload_flow():
         rc, st = e.upload()
         test("재동기화(동일 내용): 버전 불변, PUT 0회, POST missing 0회",
              rc == 0 and e.share.manifest["version"] == 1 and e.share.count("PUT", C.PATH_OBJECTS) == n_put
-             and e.share.count("POST", C.PATH_MISSING) == 1)       # 첫 업로드에서 1회뿐
+             and e.share.count("POST", C.PATH_MISSING) == 2 and st["put"] == 0)   # 존재 확인 1회만 추가
         # 파일 1개 변경
         write_lib(e.src, v=1, names=[NAMES[5]])
         rc, st = e.upload()
@@ -1192,75 +1232,432 @@ def free_port():
     return closed_port()
 
 
-def real_shareboxd_tests(binary):
-    """임시 SHAREBOX_DATA/HOME/포트에서만 실행한다. 실제 서비스(1213, 8737)와 홈 데이터는 쓰지 않는다."""
-    data = os.path.join(TMP, "sharebox-data")
-    os.makedirs(data)
-    env = {**os.environ, "SHAREBOX_DATA": data, "HOME": os.path.join(TMP, "home")}
-    hp, tp = free_port(), free_port()
-    assert hp not in (8737, 1213) and tp not in (8737, 1213)
+class Real:
+    """임시 데이터 폴더의 실제 shareboxd. 토큰은 변수에만 둔다(로그/파일/출력 금지)."""
 
-    def sb(*a):
-        r = subprocess.run([binary, *a], env=env, capture_output=True, text=True, timeout=60)
-        assert r.returncode == 0, r.stderr[-200:]
+    def __init__(self, binary):
+        self.binary = binary
+        self.data = os.path.join(TMP, "sharebox-data")
+        os.makedirs(self.data)
+        self.env = {**os.environ, "SHAREBOX_DATA": self.data, "HOME": os.path.join(TMP, "home")}
+        self.hp, self.tp = free_port(), free_port()
+        assert self.hp not in (8737, 1213) and self.tp not in (8737, 1213) and self.hp != self.tp
+        self.proc = None
+        self.up = self.sb("token", "add", "t-up", "space:gto:write")
+        self.rd = self.sb("token", "add", "t-rd", "space:gto:read")
+        self.us = self.sb("token", "add", "t-user", "user")
+        self.pin = self.sb("cert-pin")
+        self.start()
+
+    def sb(self, *a):
+        r = subprocess.run([self.binary, *a], env=self.env, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, "shareboxd %s 실패" % a[0]
         return r.stdout.strip()
 
-    up, rd = sb("token", "add", "gto-test-up", "space:gto:write"), sb("token", "add", "gto-test-rd", "space:gto:read")
-    pin = sb("cert-pin")
-    proc = subprocess.Popen([binary, "serve", "-listen", "127.0.0.1:%d" % hp, "-tls-listen", "127.0.0.1:%d" % tp,
-                             "-data", data], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
+    def start(self):
+        self.proc = subprocess.Popen([self.binary, "serve", "-listen", "127.0.0.1:%d" % self.hp, "-tls-listen",
+                                      "127.0.0.1:%d" % self.tp, "-data", self.data], env=self.env,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(100):
             try:
-                socket.create_connection(("127.0.0.1", hp), 0.2).close()
-                break
+                socket.create_connection(("127.0.0.1", self.hp), 0.2).close()
+                socket.create_connection(("127.0.0.1", self.tp), 0.2).close()
+                return
             except OSError:
                 time.sleep(0.1)
-        src, dst, base = (os.path.join(TMP, "real-" + x) for x in ("src", "dst", "base"))
-        for d in (src, dst, base):
-            os.makedirs(d)
-        write_lib(src)
-        before = tree_state(src)
-        stats = {}
-        rc = S.run({"url": "http://127.0.0.1:%d" % hp, "token": up, "lib_dir": src}, stats)
-        test("[실서버] 업로드 후 게시: 버전 1, 원본 불변", rc == 0 and stats["version"] == 1 and tree_state(src) == before)
-        rc = S.run({"url": "http://127.0.0.1:%d" % hp, "token": up, "lib_dir": src}, stats)
-        test("[실서버] 동일 내용 재동기화: 버전 불변, PUT 0회", stats["version"] == 1 and stats["put"] == 0)
-        u = G.Updater(base, {"urls": ["https://127.0.0.1:%d" % tp], "token": rd, "cert_sha256": pin, "lib_dir": dst},
-                      first_delay=0)
-        test("[실서버] 지문 일치 TLS 1.3 수신, 첫 갱신 전체 설치", u.cycle() == "updated"
-             and {k: v[0] for k, v in snap(dst).items()} == {k: v[0] for k, v in snap(src).items()})
-        test("[실서버] 304: 변경 없음", u.cycle() == "unchanged")
-        bad = G.Updater(base, {"urls": ["https://127.0.0.1:%d" % tp], "token": rd, "cert_sha256": "0" * 64,
-                               "lib_dir": dst}, first_delay=0)
-        test("[실서버] 지문 불일치: pin_failed", bad.cycle() == "pin_failed")
+        raise RuntimeError("shareboxd 시작 실패")
 
-        def http_status(port, method, path, token, tls=False, body=None):
-            if tls:
-                c = C.PinnedConnection("127.0.0.1", port, pin)
-            else:
-                c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
-            c.request(method, path, body=body, headers={"Authorization": "Bearer " + token,
-                                                        "Content-Type": "application/json"})
-            st = c.getresponse().status
-            c.close()
-            return st
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(10)
+            except Exception:
+                self.proc.kill()
 
-        probes = [("GET", "/api/items", None), ("GET", "/api/items/1/content", None), ("DELETE", "/api/items/1", None),
-                  ("POST", "/api/files", b"x"), ("POST", "/api/texts", b'{"text":"x"}')]
-        for who, tok in (("읽기", rd), ("쓰기", up)):
-            test("[실서버] %s 토큰으로 기존 API 5종 → 전부 403" % who,
-                 all(http_status(hp, m, p, tok, body=b) == 403 for m, p, b in probes))
-        sha = next(iter(snapshot_shas(src)))
-        test("[실서버] 쓰기 토큰으로 객체 GET → 403", http_status(hp, "GET", C.PATH_OBJECTS + sha, up) == 403)
-        sb("token", "revoke", "gto-test-rd")
-        test("[실서버] 토큰 폐기 후 다음 요청 401", http_status(hp, "GET", C.PATH_MANIFEST, rd) == 401)
-    finally:
-        proc.terminate()
+    def http(self, method, path, token=None, body=None, tls=False, headers=None):
+        c = C.PinnedConnection("127.0.0.1", self.tp, self.pin) if tls else \
+            http.client.HTTPConnection("127.0.0.1", self.hp, timeout=30)
+        h = dict(headers or {})
+        if token:
+            h["Authorization"] = "Bearer " + token
         try:
-            proc.wait(10)
-        except Exception:
-            proc.kill()
+            c.request(method, path, body=body, headers=h)
+        except (BrokenPipeError, ConnectionResetError):      # 서버가 본문을 다 받기 전에 거부하고 끊은 경우
+            pass
+        r = c.getresponse()
+        data = r.read()
+        out = (r.status, data, {k.title(): v for k, v in r.getheaders()})
+        c.close()
+        return out
+
+    def obj_path(self, sha):
+        return os.path.join(self.data, "spaces", "gto", "objects", sha[:2], sha)
+
+    def up_cfg(self, src, **kw):
+        c = {"url": "http://127.0.0.1:%d" % self.hp, "token": self.up, "lib_dir": src}
+        c.update(kw)
+        return c
+
+    def updater(self, base, dst, **kw):
+        cfg = {"urls": ["https://127.0.0.1:%d" % self.tp], "token": self.rd, "cert_sha256": self.pin, "lib_dir": dst,
+               "max_bytes_per_sec": 0}
+        cfg.update(kw)
+        errs = []
+        u = G.Updater(base, cfg, on_error=lambda *a: errs.append(a), first_delay=0)
+        u.errs = errs
+        u.seen = []
+        orig = u._request
+
+        def spy(path, headers=None):
+            r = orig(path, headers)
+            u.seen.append((path, r.status))
+            return r
+
+        u._request = spy
+        return u
+
+    def cli(self, cfg, tag):
+        p = os.path.join(TMP, "cli-%s.json" % tag)
+        with open(p, "w") as f:
+            json.dump(cfg, f)
+        os.chmod(p, 0o600)
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        r = subprocess.run([sys.executable, "-I", os.path.join(HERE, "gto_dist_sync.py"), "--config", p],
+                           capture_output=True, text=True, env=env, timeout=300)
+        os.unlink(p)
+        return r
+
+
+def real_shareboxd_tests(binary):
+    """임시 SHAREBOX_DATA/HOME/포트에서만 실행. 실제 서비스(1213, 8737)와 홈 데이터는 쓰지 않는다."""
+    R = Real(binary)
+    try:
+        real_flow(R)
+        real_permissions(R)
+        real_paths_and_validation(R)
+        real_gc_race(R)
+        real_idle_and_stop(R)
+    finally:
+        R.stop()
+
+
+def real_flow(R):
+    src, dst, base = (os.path.join(TMP, "real-" + x) for x in ("src", "dst", "base"))
+    for d in (src, dst, base):
+        os.makedirs(d)
+    write_lib(src)
+    before = tree_state(src)
+    stats = {}
+    rc = S.run(R.up_cfg(src), stats)
+    test("[실서버] 업로드 후 게시: 버전 1, 63개 PUT, 원본 폴더 불변", rc == 0 and stats["version"] == 1 and stats["put"] == 63
+         and tree_state(src) == before)
+    stats = {}
+    rc = S.run(R.up_cfg(src), stats)
+    test("[실서버] 동일 내용 재동기화: exit 0, 게시 호출 없음(버전 1 유지), PUT 0회",
+         rc == 0 and "version" not in stats and stats["put"] == 0
+         and json.loads(R.http("GET", C.PATH_MANIFEST, R.rd, tls=True)[1])["version"] == 1)
+    st, data, hd = R.http("GET", C.PATH_MANIFEST, R.rd, tls=True)
+    test("[실서버] 매니페스트 GET: Content-Length와 ETag \"v1\", 304", st == 200 and hd.get("Content-Length") == str(len(data))
+         and hd.get("Etag") == '"v1"' and R.http("GET", C.PATH_MANIFEST, R.rd, tls=True,
+                                                 headers={"If-None-Match": '"v1"'})[0] == 304)
+    pc = C.PinnedConnection("127.0.0.1", R.tp, R.pin)
+    pc.connect()
+    ver = pc.sock.version()
+    pc.close()
+    test("[실서버] 지문 일치: TLS 1.3 연결", ver == "TLSv1.3", ver)
+    bad = R.updater(base, dst, cert_sha256="0" * 64)
+    test("[실서버] 지문 불일치: pin_failed, 대상 폴더에 데이터 없음", bad.cycle() == "pin_failed" and bad.seen == []
+         and not [n for n in os.listdir(dst) if n != G.TMP_NAME])
+    u = R.updater(base, dst)
+    s1 = u.cycle()
+    test("[실서버] 빈 대상 첫 갱신: 63개 전부 설치, 내용 동일", s1 == "updated" and
+         {k: v[0] for k, v in snap(dst).items()} == {k: v[0] for k, v in snap(src).items()}, s1)
+    n_obj = sum(1 for p, c in u.seen if p.startswith(C.PATH_OBJECTS) and c == 200)
+    u.seen.clear()
+    s2 = u.cycle()
+    test("[실서버] 매니페스트 불변: 304, 객체 GET 0회", s2 == "unchanged" and u.seen == [(C.PATH_MANIFEST, 304)], str(u.seen))
+    write_lib(src, v=1, names=[NAMES[9]])
+    S.run(R.up_cfg(src), stats)
+    before_dst = snap(dst)
+    u.seen.clear()
+    s3 = u.cycle()
+    gets = [p for p, c in u.seen if p.startswith(C.PATH_OBJECTS) and c == 200]
+    after_dst = snap(dst)
+    test("[실서버] 1개 변경 갱신: 객체 GET 정확히 1회(첫 설치는 %d회), PUT 1회" % n_obj,
+         s3 == "updated" and len(gets) == 1 and stats["put"] == 1 and stats["version"] == 2)
+    test("[실서버] 1개 변경 갱신: 나머지 62개 mtime 불변",
+         [k for k in after_dst if after_dst[k] != before_dst[k]] == [os.path.normpath(NAMES[9])])
+    # 손상 수신: 서버 데이터 폴더의 객체를 같은 길이로 변조(임시 폴더이므로 가능)
+    old = snap(dst)
+    write_lib(src, v=2, names=NAMES[10:13])
+    S.run(R.up_cfg(src), stats)
+    st, data, _ = R.http("GET", C.PATH_MANIFEST, R.rd, tls=True)
+    sha = json.loads(data)["files"][NAMES[11]]["sha256"]
+    with open(R.obj_path(sha), "rb") as f:
+        good = f.read()
+    with open(R.obj_path(sha), "wb") as f:
+        f.write(b"z" * len(good))
+    u2 = R.updater(base, dst)
+    s4 = u2.cycle()
+    test("[실서버] 손상 파일 수신 거부: hash_mismatch, 기존 파일 동일, applied_version 불변",
+         s4 == "hash_mismatch" and snap(dst) == old and json.load(open(os.path.join(base, G.STATE_NAME)))["applied_version"] == 2, s4)
+    with open(R.obj_path(sha), "wb") as f:
+        f.write(good)
+    # 설치 중단
+    cnt = {"n": 0}
+    real_replace = G._replace
+
+    def flaky(a, b):
+        cnt["n"] += 1
+        if cnt["n"] == 2:
+            raise OSError(28, "injected")
+        return real_replace(a, b)
+
+    new = {n: file_bytes(src, n) for n in NAMES[10:13]}
+    oldb = {n: file_bytes(dst, n) for n in NAMES[10:13]}
+    with patched(G, "_replace", flaky):
+        s5 = R.updater(base, dst).cycle()
+    test("[실서버] 설치 중 예외: error, 각 파일은 옛것 또는 새것으로 온전, 버전 불변",
+         s5 == "error" and not all_old_or_new(dst, oldb, new) and json.load(open(os.path.join(base, G.STATE_NAME)))["applied_version"] == 2, s5)
+    test("[실서버] 예외 제거 후 다음 사이클에 마무리", R.updater(base, dst).cycle() == "updated"
+         and all(file_bytes(dst, n) == new[n] for n in NAMES[10:13]))
+    # 객체 삭제(정리와 겹침 흉내): stale_manifest
+    write_lib(src, v=3, names=[NAMES[20]])
+    S.run(R.up_cfg(src), stats)
+    st, data, _ = R.http("GET", C.PATH_MANIFEST, R.rd, tls=True)
+    os.unlink(R.obj_path(json.loads(data)["files"][NAMES[20]]["sha256"]))
+    keep = snap(dst)
+    u3 = R.updater(base, dst)
+    s6 = u3.cycle()
+    test("[실서버] 서버에서 객체가 사라짐(404): stale_manifest, 오류 통지 없음, 기존 파일 유지", s6 == "stale_manifest" and not u3.errs
+         and snap(dst) == keep)
+    stats = {}
+    S.run(R.up_cfg(src), stats)     # 매니페스트가 같아도 업로더가 사라진 객체를 다시 올려 복구
+    test("[실서버] 다음 주기에 업로더가 사라진 객체를 재업로드(PUT 1회)하고 갱신 성공", stats["put"] == 1
+         and R.updater(base, dst).cycle() == "updated")
+
+    # 업로드 실패: lib 불변, exit 1
+    st0 = tree_state(src)
+    for name, cfg_kw, mut in (("토큰 오류", {"token": "wrong"}, None), ("서버 주소 닫힘", {"url": "http://127.0.0.1:%d" % closed_port()}, None)):
+        r = R.cli(R.up_cfg(src, **cfg_kw), "f")
+        test("[실서버] 업로드 실패(%s): exit 1, lib 불변, 토큰 미출력" % name, r.returncode == 1 and tree_state(src) == st0
+             and R.up not in r.stdout + r.stderr and "wrong" not in r.stderr)
+
+
+def real_permissions(R):
+    st, data, _ = R.http("POST", "/api/texts", R.us, json.dumps({"content": "synthetic-private-text"}).encode(),
+                         headers={"Content-Type": "application/json"})
+    item = json.loads(data).get("id") if st in (200, 201) else None
+    test("[실서버] (준비) user 토큰으로 사용자 항목 생성", item is not None, str(st))
+    probes = [("GET", "/api/items", None), ("GET", "/api/items/%s" % item, None), ("GET", "/api/items/%s/content" % item, None),
+              ("PATCH", "/api/items/%s" % item, b'{"pinned":true}'), ("DELETE", "/api/items/%s" % item, None),
+              ("POST", "/api/files", b"x"), ("POST", "/api/texts", b'{"content":"x"}'), ("GET", "/api/me", None),
+              ("GET", "/api/events", None)]
+    for who, tok in (("읽기", R.rd), ("쓰기", R.up)):
+        codes = []
+        for tls in (False, True):
+            for m, p, b in probes:
+                codes.append(R.http(m, p, tok, b, tls=tls, headers={"Content-Type": "application/json"})[0])
+        test("[실서버·15,16] %s 토큰: 기존 API %d종 × HTTP/HTTPS → 전부 403" % (who, len(probes)), set(codes) == {403}, str(sorted(set(codes))))
+    st, data, _ = R.http("GET", "/api/items/%s/content" % item, R.us)
+    test("[실서버·15,16] 시도 후에도 사용자 항목은 그대로(삭제·변경 없음)", st == 200 and b"synthetic-private-text" in data, str(st))
+    sha = next(iter(json.loads(R.http("GET", C.PATH_MANIFEST, R.rd, tls=True)[1])["files"].values()))["sha256"]
+    test("[실서버·16] 쓰기 토큰: 객체 GET 403, 읽기 토큰: 객체 PUT/missing/게시 403",
+         R.http("GET", C.PATH_OBJECTS + sha, R.up)[0] == 403
+         and R.http("PUT", C.PATH_OBJECTS + sha, R.rd, b"x")[0] == 403
+         and R.http("POST", C.PATH_MISSING, R.rd, b'{"sha256":[]}')[0] == 403
+         and R.http("POST", C.PATH_MANIFEST, R.rd, b"{}")[0] == 403)
+    test("[실서버] 쓰기 토큰도 매니페스트 GET 가능, 토큰 없음 401, 틀린 토큰 401",
+         R.http("GET", C.PATH_MANIFEST, R.up)[0] == 200 and R.http("GET", C.PATH_MANIFEST)[0] == 401
+         and R.http("GET", C.PATH_MANIFEST, "wrong")[0] == 401)
+    skip("[실서버] 공간 API에 user/agent 토큰·세션 거부", "sharebox Go 테스트(space_test.go) 몫으로 표시 — 여기서는 user 토큰이 공간 API에서 거부되는지만 확인")
+    test("[실서버] user 토큰으로 공간 API → 403", R.http("GET", C.PATH_MANIFEST, R.us)[0] == 403)
+    R.sb("token", "revoke", "t-rd")
+    test("[실서버·17] 읽기 토큰 폐기 후 다음 요청 401", R.http("GET", C.PATH_MANIFEST, R.rd, tls=True)[0] == 401)
+    R.rd = R.sb("token", "add", "t-rd2", "space:gto:read")
+
+
+def real_paths_and_validation(R):
+    sha = next(iter(json.loads(R.http("GET", C.PATH_MANIFEST, R.rd, tls=True)[1])["files"].values()))["sha256"]
+    probes = ["/api/spaces/gto/objects/../../x", "/api/spaces/gto/objects/../manifest", "/api/spaces/gto/objects/%2e%2e/%2e%2e/x",
+              "/api/spaces/gto/objects/..%2f..%2fx", "/api/spaces/gto/objects/" + sha.upper(), "/api/spaces/gto/objects/" + "g" * 64,
+              "/api/spaces/gto/objects/%s/../%s" % (sha, sha)]
+    rows = []
+    for p in probes:
+        c = C.PinnedConnection("127.0.0.1", R.tp, R.pin)
+        c.request("GET", p, headers={"Authorization": "Bearer " + R.rd})
+        r = c.getresponse()
+        body = r.read()
+        rows.append((p.split("objects/", 1)[-1][:40], r.status, r.getheader("Location"), len(body)))
+        c.close()
+    leak = [x for x in rows if x[1] == 200]
+    test("[실서버] 경로 조작 URL %d종: 200(내용 노출) 없음, 상태 %s" % (len(rows), sorted({x[1] for x in rows})), not leak, str(rows))
+    redirects = [x for x in rows if x[1] in (301, 302, 307, 308)]
+    # 클라이언트는 리다이렉트를 따라가지 않는다: Updater._request 는 첫 응답을 그대로 돌려준다
+    u = R.updater(os.path.join(TMP, "real-base"), os.path.join(TMP, "real-dst"))
+    u._connect()
+    r = u._request("/api/spaces/gto/objects/../../x")
+    r.read()
+    test("[실서버] 클라이언트는 리다이렉트를 따라가지 않음: 첫 응답 %d 을 그대로 돌려줌(추가 요청 0, urllib 미사용)" % r.status,
+         r.status in (307, 404) and len(u.seen) == 1 and "urllib.request" not in source("gto_update.py")
+         and "Location" not in source("gto_update.py"), "리다이렉트 응답 %d건" % len(redirects))
+    u._close()
+    st = R.http("GET", "/api/spaces/gto/objects/../../x", R.rd, tls=True)
+    test("[실서버] 리다이렉트 응답 본문에 객체·매니페스트 내용 없음", b'"files"' not in st[1] and b"synthetic" not in st[1])
+    # 게시 경로 조작: 422, 현재 매니페스트 불변
+    cur = R.http("GET", C.PATH_MANIFEST, R.rd, tls=True)[1]
+    ent = {"sha256": sha, "size": 1}
+    codes = []
+    for bad in ["../x", "hands/a.json.gz", "/abs/BTN_BB_20bb.json.gz", "C:\\x", "BTN_BB_20bb.json.gz.tmp", "turn/../../x.json.gz"]:
+        body = json.dumps({"base_version": json.loads(cur)["version"], "files": {bad: ent}, "allow_shrink": True}).encode()
+        codes.append(R.http("POST", C.PATH_MANIFEST, R.up, body)[0])
+    test("[실서버] 게시 경로 조작 6종 → 전부 422, 현재 매니페스트 불변", set(codes) == {422} and R.http("GET", C.PATH_MANIFEST, R.rd, tls=True)[1] == cur, str(codes))
+    mf = json.loads(cur)
+    code = lambda **kw: R.http("POST", C.PATH_MANIFEST, R.up, json.dumps({"base_version": mf["version"], "files": mf["files"], "allow_shrink": False, **kw}).encode())[0]
+    test("[실서버] 낡은 base_version → 409, 축소 → 409, 동일 파일 집합 → changed:false",
+         code(base_version=mf["version"] - 1) == 409 and
+         R.http("POST", C.PATH_MANIFEST, R.up, json.dumps({"base_version": mf["version"], "files": dict(list(mf["files"].items())[:5])}).encode())[0] == 409
+         and b'"changed":false' in R.http("POST", C.PATH_MANIFEST, R.up, json.dumps({"base_version": mf["version"], "files": mf["files"]}).encode())[1])
+
+    # PUT 검증
+    good = make_obj("lib", 77)
+    gsha = C.sha256_hex(good)
+
+    def put(data, sha=None, extra=None):
+        return R.http("PUT", C.PATH_OBJECTS + (sha or C.sha256_hex(data)), R.up, data, headers=extra)[0]
+
+    chunked = http.client.HTTPConnection("127.0.0.1", R.hp, timeout=30)
+    chunked.putrequest("PUT", C.PATH_OBJECTS + gsha)
+    chunked.putheader("Authorization", "Bearer " + R.up)
+    chunked.putheader("Transfer-Encoding", "chunked")
+    chunked.endheaders()
+    chunked.send(b"0\r\n\r\n")
+    c411 = chunked.getresponse().status
+    chunked.close()
+    big = b"\0" * (C.MAX_OBJECT + 1)
+    nick = gzip.compress(json.dumps({"players": [{"nick": "synthetic"}]}).encode(), mtime=0)
+    r = {"해시 불일치": put(good, "0" * 64), "gzip 아님": put(b"plain"), "잘린 gzip": put(good[:-8]), "닉네임 JSON": put(nick),
+         "길이 없음": c411, "크기 초과": put(big)}
+    want = {"해시 불일치": 422, "gzip 아님": 422, "잘린 gzip": 422, "닉네임 JSON": 422, "길이 없음": 411, "크기 초과": 413}
+    test("[실서버] PUT 거부: " + ", ".join("%s %d" % kv for kv in r.items()), r == want)
+    test("[실서버] 정상 PUT 201 → 같은 해시 재PUT 200, 객체 mtime 불변", put(good) == 201 and
+         (lambda m0: (time.sleep(1.1), put(good) == 200, os.stat(R.obj_path(gsha)).st_mtime_ns == m0)[1:])(os.stat(R.obj_path(gsha)).st_mtime_ns) == (True, True))
+    # Go/Python 판정 비교
+    rows = []
+    for name, data, go_ok in py_verdict_variants():
+        st = put(data)
+        try:
+            C.validate_object(data)
+            py = True
+        except C.ValidationError:
+            py = False
+        rows.append((name, "Go " + ("통과" if st in (200, 201) else "거부%d" % st), "Python " + ("통과" if py else "거부")))
+        test("[실서버·판정] %s: Go %s, 업로더 검증 %s" % (name, "통과" if go_ok else "거부", "통과" if py else "거부"),
+             (st in (200, 201)) == go_ok and (go_ok or not py), str(rows[-1]))
+    old_only = {"UTF-8 BOM", "UTF-16 JSON", "UTF-32 JSON", "gzip 뒤 0바이트 패딩"}
+    test("[실서버·판정] Go가 거부하는 4종은 업로더가 게시 전에 차단(Python 단독 통과 없음)",
+         all(_py_rejects(d) for n, d, g in py_verdict_variants() if n in old_only))
+    # 이런 파일이 lib 에 있을 때 업로더: exit 1, lib 불변, 게시 변화 없음
+    for name, data, go_ok in py_verdict_variants():
+        if _py_rejects(data) is False:
+            continue          # 업로더가 통과시키는 파일은 정상 업로드이므로 제외
+        if "정수" in name:    # 위 PUT 으로 서버에 이미 저장된 객체는 업로더가 검증하지 않으므로 서버에 없는 변종을 쓴다
+            data = bigint_obj(4500)
+        d = os.path.join(TMP, "badlib-" + re.sub(r"\W", "", name))
+        write_lib(d)
+        with open(os.path.join(d, NAMES[6]), "wb") as f:
+            f.write(data)
+        st0, ver0 = tree_state(d), json.loads(R.http("GET", C.PATH_MANIFEST, R.rd, tls=True)[1])["version"]
+        # 이 폴더는 다른 내용이라 게시가 바뀔 수 있으므로 base 서버 상태가 아니라 업로더 종료 상태만 본다
+        r = R.cli(R.up_cfg(d), "bad")
+        ver1 = json.loads(R.http("GET", C.PATH_MANIFEST, R.rd, tls=True)[1])["version"]
+        test("[실서버·판정] 업로드 거부 파일(%s) 포함 lib: exit 1, lib 불변, 게시 버전 불변" % name,
+             r.returncode == 1 and tree_state(d) == st0 and ver0 == ver1 and "invalid_object" in r.stderr, r.stderr.strip()[-90:])
+    print("판정표:", rows)
+
+
+def real_gc_race(R):
+    """48시간 넘은 미참조 객체가 missing 조회 뒤 서버 정리와 겹쳐 사라지는 경우(missing_object)."""
+    src = os.path.join(TMP, "gc-src")
+    shutil.rmtree(src, ignore_errors=True)
+    write_lib(src)         # 현재 서버 상태와 같은 63개 파일 집합(축소 거부를 피한다)
+    S.run(R.up_cfg(src), {})
+    old = time.time() - 3 * 86400
+    out = {}
+    for round_no, (fire, label) in enumerate(((1, "1회 겹침"), (99, "계속 겹침"))):
+        X_rel = NAMES[30 + round_no]
+        x_bytes = file_bytes(src, X_rel)
+        x_sha = C.sha256_hex(x_bytes)
+        for k in range(1, 6):                            # X 를 현재+최근 4개 매니페스트에서 몰아낸다
+            write_lib(src, v=100 * (round_no + 1) + k, names=[X_rel])
+            S.run(R.up_cfg(src), {})
+        os.utime(R.obj_path(x_sha), (old, old))          # 임시 폴더의 객체 mtime 을 3일 전으로
+        out[label + "-사전"] = os.path.exists(R.obj_path(x_sha))
+        with open(os.path.join(src, *X_rel.split("/")), "wb") as f:      # 러너가 옛 내용으로 되돌림
+            f.write(x_bytes)
+        fired = {"n": 0}
+        orig = S.Api.json
+
+        def hooked(self, method, path, obj, fire=fire, fired=fired, orig=orig, x_sha=x_sha):
+            r = orig(self, method, path, obj)
+            if path == C.PATH_MISSING and fired["n"] < fire:
+                fired["n"] += 1
+                if os.path.exists(R.obj_path(x_sha)):
+                    os.utime(R.obj_path(x_sha), (old, old))
+                # 서버 정리는 게시 때 실행되므로 다른 게시를 끼워 넣어 유발한다(실제로는 매시간 Maintain 이 같은 일을 한다)
+                h = json.loads(R.http("GET", C.PATH_MANIFEST, R.rd, tls=True)[1])
+                files = dict(h["files"])
+                alt = make_obj("turn", 999, 1000 * round_no + fired["n"])
+                R.http("PUT", C.PATH_OBJECTS + C.sha256_hex(alt), R.up, alt)
+                files[NAMES[40]] = {"sha256": C.sha256_hex(alt), "size": len(alt)}
+                R.http("POST", C.PATH_MANIFEST, R.up, json.dumps({"base_version": h["version"], "files": files}).encode())
+            return r
+
+        gone = {}
+        st = {}
+        with patched(S.Api, "json", hooked):
+            try:
+                S.run(R.up_cfg(src), st)
+                out[label] = "ok"
+            except S.Fail as e:
+                out[label] = "fail:" + str(e)[:30]
+        out[label + "-삭제됨"] = fired["n"] >= 1
+        if label == "계속 겹침":
+            r = R.cli(R.up_cfg(src), "gc")           # 겹침 없는 다음 타이머 실행
+            cur = json.loads(R.http("GET", C.PATH_MANIFEST, R.rd, tls=True)[1])
+            out["다음주기"] = (r.returncode, cur["files"][X_rel]["sha256"] == x_sha, os.path.exists(R.obj_path(x_sha)))
+    test("[실서버·GC] 사전 조건: 48시간 지난 미참조 객체 X 가 서버에 존재", out["1회 겹침-사전"] and out["계속 겹침-사전"])
+    test("[실서버·GC] missing_object 가 1회 겹치면 같은 실행 안에서 재시도로 복구", out["1회 겹침"] == "ok", str(out))
+    test("[실서버·GC] 계속 겹치면 Fail(exit 1)로 끝남", out["계속 겹침"].startswith("fail:"), str(out))
+    test("[실서버·GC] 다음 주기(겹침 없음): exit 0, X 가 현재 매니페스트에 있고 객체 존재", out["다음주기"] == (0, True, True), str(out))
+
+
+def real_idle_and_stop(R):
+    base, dst = os.path.join(TMP, "idle-base"), os.path.join(TMP, "idle-dst")
+    os.makedirs(base)
+    os.makedirs(dst)
+    u = R.updater(base, dst)
+    u._connect()
+    u._request(C.PATH_MANIFEST).read()
+    time.sleep(125)                                      # sharebox IdleTimeout 2분을 넘긴다
+    r = u._request(C.PATH_MANIFEST)
+    r.read()
+    test("[실서버] 유휴 2분 초과 후 연결 끊김 → 재연결로 성공(200)", r.status == 200)
+    u._close()
+    # 서버 중지
+    s0 = u.cycle()
+    before = snap(dst)
+    R.stop()
+    t0 = time.monotonic()
+    u2 = R.updater(base, dst)
+    s = u2.cycle()
+    test("[실서버] 서버 중지: unreachable, 기존 파일 유지, 오류 통지 없음", s == "unreachable" and snap(dst) == before and not u2.errs, s0)
+    u2.start()
+    test("[실서버] 서버 중지 상태에서 start() 즉시 반환", time.monotonic() - t0 < 5 and u2.thread.daemon)
+    u2.stop()
+    r = R.cli(R.up_cfg(os.path.join(TMP, "real-src")), "down")
+    test("[실서버] 서버 중지 중 업로더: exit 1, lib 불변", r.returncode == 1)
 
 
 def snapshot_shas(d):

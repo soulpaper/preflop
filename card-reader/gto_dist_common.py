@@ -1,9 +1,8 @@
 """GTO 데이터 배포(sharebox 공간 API): 업로더/클라이언트가 공유하는 규칙. 표준 라이브러리만 사용."""
-import gzip
 import hashlib
-import io
 import json
 import re
+import zlib
 
 LIB_RE = r"[A-Z0-9]+_[A-Z0-9]+_\d{2,3}bb\.json\.gz"
 TURN_RE = r"turn/[A-Z0-9]+_[A-Z0-9]+_\d{2,3}bb/(?:[2-9TJQKA][shdc]){3}\.json\.gz"
@@ -61,26 +60,64 @@ def validate_manifest_files(files):
             raise ValidationError("bad_size", repr(rel)[:80])
 
 
+def _gunzip(data):
+    """gzip 멤버를 엄격하게 해제한다. 잘림, CRC 오류, 멤버 뒤의 쓰레기(0바이트 패딩 포함)는 모두 bad_gzip.
+    (Python 의 GzipFile 은 뒤쪽 0바이트를 무시하지만 Go 의 gzip.Reader 는 거부하므로 Go 에 맞춘다.)"""
+    parts, total, rest = [], 0, data
+    while rest:
+        d = zlib.decompressobj(31)             # 31 = gzip 형식만
+        try:
+            chunk = d.decompress(rest, MAX_INFLATED + 1 - total)
+        except zlib.error as e:
+            raise ValidationError("bad_gzip", "zlib")
+        total += len(chunk)
+        if total > MAX_INFLATED:
+            raise ValidationError("bad_gzip", "inflated_too_large")
+        if not d.eof:
+            raise ValidationError("bad_gzip", "truncated")
+        parts.append(chunk)
+        rest = d.unused_data
+    if not parts:
+        raise ValidationError("bad_gzip", "empty")
+    return b"".join(parts)
+
+
 def _reject_constant(name):
     raise ValueError("non-standard JSON constant " + name)     # NaN/Infinity 는 Go 쪽도 거부
+
+
+MAX_DEPTH = 10000          # Go encoding/json 의 중첩 한도. Python 은 버전마다 달라서 직접 확인한다
+_STRUCT = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{}]')
+
+
+def _too_deep(text):
+    if text.count("[") + text.count("{") <= MAX_DEPTH:
+        return False
+    d = 0
+    for m in _STRUCT.finditer(text):
+        c = m.group()
+        if c in "[{":
+            d += 1
+            if d > MAX_DEPTH:
+                return True
+        elif c in "]}":
+            d -= 1
+    return False
 
 
 def validate_object(data):
     """gzip + JSON 스키마 검증. 통과하면 파싱된 dict 를 돌려준다."""
     if len(data) > MAX_OBJECT:
         raise ValidationError("too_large")
+    raw = _gunzip(data)
     try:
-        with gzip.GzipFile(fileobj=io.BytesIO(data)) as g:
-            raw = g.read(MAX_INFLATED + 1)
-    except Exception as e:
-        raise ValidationError("bad_gzip", type(e).__name__)
-    if len(raw) > MAX_INFLATED:
-        raise ValidationError("bad_gzip", "inflated_too_large")
-    try:
-        obj = json.loads(raw, parse_constant=_reject_constant)
+        text = raw.decode("utf-8")          # Go 쪽과 같게: UTF-8 만. BOM, UTF-16/32 는 json.loads(str)에서 거부된다
+        if _too_deep(text):
+            raise ValueError("depth")
+        obj = json.loads(text, parse_constant=_reject_constant)
     except Exception:
         raise ValidationError("bad_schema", "json")
-    del raw
+    del raw, text
     if not isinstance(obj, dict):
         raise ValidationError("bad_schema", "not_object")
     keys = set(obj)
