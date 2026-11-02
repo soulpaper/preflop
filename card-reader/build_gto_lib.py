@@ -615,9 +615,9 @@ def _wait_posix(p, timeout):
     return peak
 
 
-MEM_BUDGET_GB = 26.0   # 솔버들 메모리 합 상한
-MEM_RESERVE_GB = 3.0   # 새 솔브를 시작한 뒤에도 남겨 둘 여유 RAM (다른 프로그램 + 덤프 읽는 파이썬)
-POST_MEM_GB = 2.0      # post_solve 가 원본 덤프를 읽는 동안 파이썬이 쓰는 메모리 (대략)
+MEM_BUDGET_GB = 22.0   # 솔버들 메모리 합 상한
+MEM_RESERVE_GB = 4.0   # 새 솔브를 시작한 뒤에도 남겨 둘 여유 RAM (다른 프로그램 + 덤프 읽는 파이썬)
+POST_MEM_GB = 2.0      # post_solve 가 원본 덤프를 읽는 동안 파이썬이 쓰는 메모리 (대략). 코드에서 쓰이지 않음: 후처리 메모리는 MEM_BUDGET_GB 를 낮춘 여유로 감안
 
 
 class MemModel:
