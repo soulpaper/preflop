@@ -92,6 +92,31 @@ exe: 실행 중에는 사용자 설정 파일을 읽지 않고, 빌드 때 넣�
 - 첫 설치는 5MiB/s 기준 수 분이 걸린다. 여러 PC가 동시에 처음 받는 것은 피한다.
 - 테스트: `python3 test_gto_dist.py` (실제 shareboxd 통합 시험은 `GTO_TEST_SHAREBOXD=<바이너리 경로>`가 있을 때만 실행).
 
+## GTO 계산 러너 서비스 (systemd 사용자 유닛)
+
+`deploy/`의 `gto-runner.service`(러너), `gto-mode.service` + `gto-mode.timer`(04:00 full, 21:00 low 전환)로 `build_gto_lib.py`를 서비스로 돌린다.
+시각별 모드는 04~21시 `--full`, 그 외 `--low`이고 워커 수는 기본 2(`GTO_WORKERS`로 변경)다. 경로는 환경 파일로 받는다.
+
+환경 파일 `~/.config/gto-runner/env` (디렉터리 700, 파일 600, 저장소 제외):
+```
+PREFLOP_TOOLS=<TexasSolver와 solves/가 있는 폴더>
+GTO_LIB_DIR=<gto_lib 출력 폴더>
+CARD_READER_DIR=<card-reader 저장소 폴더>
+```
+- `solves/STOP`이 있으면 시작 스크립트가 아무것도 하지 않고 exit 0으로 끝난다(`Restart=on-failure`라 재시작되지 않음). 로그는 `solves/batch-service.log`에 이어 쓴다.
+- 러너는 잠금 PID가 실제 `build_gto_lib` 러너인지 `/proc/<pid>/cmdline`으로 확인하고, 아니면 낡은 잠금으로 처리한다. `--stop --now`와 `--set-mode`도 `console_solver`로 확인된 PID에만 작용한다. 그래서 유닛에 `runner.lock` 삭제 단계가 없다.
+- 시험: `python3 test_build_gto_safety.py`, `bash deploy/test_gto_deploy.sh`. 문법: `systemd-analyze --user verify deploy/gto-runner.service deploy/gto-mode.service deploy/gto-mode.timer`
+
+**수동 실행 중인 러너에서 이전** (진행 중 솔브를 잃지 않으려면 `--now`를 쓰지 않는다)
+1. `python3 build_gto_lib.py --stop` (STOP 파일 생성). 진행 중 솔브가 모두 끝나 러너가 스스로 종료할 때까지 기다린다(`--status`).
+2. 러너 프로세스와 `console_solver`가 없고 `runner.lock`의 PID가 죽었는지 확인한다(`pgrep -af 'build_gto_lib|console_solver'`).
+3. 환경 파일을 만들고 유닛 3개를 `~/.config/systemd/user/`에 복사, `systemctl --user daemon-reload`.
+4. `solves/STOP`을 지운다.
+5. `systemctl --user start gto-runner.service` 후 `python3 build_gto_lib.py --status`와 `solves/batch-service.log`로 확인한다.
+6. 정상이면 `systemctl --user enable gto-runner.service` 와 `systemctl --user enable --now gto-mode.timer`. 부팅 후에도 돌리려면 `loginctl enable-linger <사용자>`가 필요하다.
+
+주의: `systemctl --user stop gto-runner.service`(와 재부팅)는 SIGTERM 뒤 control-group 전체를 정리하므로 진행 중 솔브가 사라진다. 완료된 솔브는 보존되고 다음 시작 때 이어서 푼다. 솔브를 지키며 멈추려면 `--stop`을 쓴다. 이미 돌고 있는 러너에는 코드 수정이 적용되지 않으므로 재시작 때 반영된다.
+
 ## 학습 데이터
 
 `templates/`에 게임 화면에서 뽑은 실제 카드 템플릿이 들어 있다 (30종). exe로 쓸 때는 이 폴더를 exe 옆에 두면 된다.

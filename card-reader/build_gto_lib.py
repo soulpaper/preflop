@@ -203,6 +203,43 @@ def pid_alive(pid):
         return False
 
 
+def _proc_argv(pid):
+    """/proc/<pid>/cmdline 의 인자 목록. 프로세스가 없거나 읽을 수 없으면 None.
+    /proc 자체가 없는 환경(Windows 등)이면 False (확인 수단이 없다는 뜻)."""
+    if WINDOWS or not os.path.isdir("/proc/self"):
+        return False
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            raw = f.read()
+    except (OSError, ValueError, TypeError):
+        return None
+    args = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+    return args or None
+
+
+def is_runner_pid(pid):
+    """pid 가 살아 있는 build_gto_lib 러너인가. 재부팅 뒤 pid 재사용으로 남의 프로세스를 러너로 착각하지 않게 한다.
+    /proc 이 없는 환경은 예전처럼 생존만 본다."""
+    if not pid_alive(pid):
+        return False
+    argv = _proc_argv(pid)
+    if argv is False:
+        return True
+    if not argv or not os.path.basename(argv[0]).startswith("python"):
+        return False
+    return any(os.path.basename(a) in ("build_gto_lib.py", "build_gto_lib") for a in argv[1:])
+
+
+def is_solver_pid(pid):
+    """pid 가 살아 있는 console_solver 인가 (kill·우선순위 변경 전에 확인)."""
+    if not pid_alive(pid):
+        return False
+    argv = _proc_argv(pid)
+    if argv is False:
+        return True
+    return bool(argv) and os.path.basename(argv[0]) == os.path.basename(EXE)
+
+
 def low_threads():
     return max(1, CPU - 2)
 
@@ -606,7 +643,7 @@ class MemModel:
 # --- 러너 ---------------------------------------------------------------------------------
 def acquire_lock():
     old = read_json(LOCK, {}) or {}
-    if pid_alive(old.get("pid")) and old.get("pid") != os.getpid():
+    if old.get("pid") != os.getpid() and is_runner_pid(old.get("pid")):   # 다른 프로그램이 pid 를 재사용했으면 낡은 잠금
         print(f"이미 실행 중 (pid {old.get('pid')}). --stop 으로 먼저 멈추세요.")
         sys.exit(1)
     os.makedirs(SOLVES, exist_ok=True)
@@ -827,7 +864,7 @@ def stop(now=False):
     print("STOP 파일 생성: 지금 솔브(들)가 끝나면 멈춥니다.")
     if now:
         for spid in solver_pids(load_progress()):
-            if pid_alive(spid):
+            if is_solver_pid(spid):
                 if WINDOWS:
                     subprocess.run(["taskkill", "/F", "/PID", str(spid)], capture_output=True)
                 else:
@@ -842,7 +879,7 @@ def set_mode(m, workers=None):
     total = low_threads() if low else CPU
     write_json(CONTROL, {"low": low, "threads": total, "workers": nw})
     for spid in solver_pids(load_progress()):
-        if pid_alive(spid):
+        if is_solver_pid(spid):
             set_priority(spid, low)
             print(f"현재 솔버(pid {spid}) 우선순위 → {'보통 이하 + 논리 CPU %d개만' % total if low else '보통 + 모든 CPU'}")
     split = worker_threads(total, low, nw)

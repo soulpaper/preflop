@@ -1,0 +1,18 @@
+[Unit]
+Description=GTO library solver batch (build_gto_lib.py)
+StartLimitIntervalSec=3600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# PREFLOP_TOOLS, CARD_READER_DIR, GTO_LIB_DIR, GTO_WORKERS(선택)
+EnvironmentFile=%h/.config/gto-runner/env
+Environment=PYTHONUNBUFFERED=1
+# solves/STOP 확인과 04~21시 full / 그 외 low 선택은 시작 스크립트가 한다 (ConditionPathExists 는 환경변수를 못 쓴다).
+# 로그는 스크립트가 $PREFLOP_TOOLS/solves/batch-service.log 에 append.
+ExecStart=/bin/bash ${CARD_READER_DIR}/deploy/gto-runner-start.sh
+Restart=on-failure
+RestartSec=60
+KillMode=control-group
+TimeoutStopSec=60
+OOMScoreAdjust=500

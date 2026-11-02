@@ -1,0 +1,11 @@
+[Unit]
+Description=GTO runner mode switch at 04:00 (full) and 21:00 (low)
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+OnCalendar=*-*-* 21:00:00
+Persistent=false
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

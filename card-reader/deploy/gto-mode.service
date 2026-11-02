@@ -1,0 +1,7 @@
+[Unit]
+Description=Switch the GTO runner between full and low mode by time of day
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/gto-runner/env
+ExecStart=/bin/bash ${CARD_READER_DIR}/deploy/gto-mode-sync.sh
