@@ -19,10 +19,45 @@ python reader.py
 ## exe 빌드
 
 ```
-pyinstaller --onefile --windowed --name CardReader --collect-all winrt --hidden-import names --hidden-import handlog --hidden-import profiles --hidden-import handread --hidden-import rangeq --hidden-import recorder --hidden-import userinfo --hidden-import advisor --hidden-import tablestate --hidden-import solverlib --hidden-import icm --hidden-import eqtable --hidden-import decisionlog --add-data "eqtable/preflop_random.json;eqtable" reader.py
+pyinstaller --onefile --windowed --name CardReader --collect-all winrt --hidden-import masterlock --hidden-import masterlock_build --hidden-import names --hidden-import handlog --hidden-import profiles --hidden-import handread --hidden-import rangeq --hidden-import recorder --hidden-import userinfo --hidden-import advisor --hidden-import tablestate --hidden-import solverlib --hidden-import icm --hidden-import eqtable --hidden-import decisionlog --add-data "eqtable/preflop_random.json;eqtable" reader.py
 ```
 
 exe 옆에 `templates/`, `font_glyphs/`, `gto_lib/` 를 둔다.
+
+복기 도구 exe:
+
+```
+pyinstaller --onefile --name ReviewApp --hidden-import masterlock --hidden-import masterlock_build review_app.py
+```
+
+`reader.py`와 `review_app.py`는 시작할 때 마스터 비밀번호를 묻는다 (`masterlock.py`). 취소하거나 3회 틀리면 종료한다.
+`masterlock`은 `_optional`로 불러오지 않는다. 빠지면 잠금이 풀리기 때문이다.
+솔트와 해시는 코드에도 저장소에도 없다. 값이 없거나 형식이 틀리거나 반복 수가 60만 회 미만이면 입력창을 띄우기 전에 실행을 거부한다.
+
+### 마스터 잠금 설치
+
+값은 `masterlock_setup.py`(표준 라이브러리만)로 만든다. 비밀번호는 getpass로 두 번 입력하거나 `--stdin`(첫 줄)으로만 받고, 명령행 인자로는 받지 않는다. 해시와 비밀번호는 출력하지 않는다.
+
+소스 실행 (`python reader.py`, `python review_app.py`): 사용자 설정 파일을 읽는다.
+
+- Linux: `~/.config/card-reader/masterlock.json` (`XDG_CONFIG_HOME`이 있으면 그 아래 `card-reader/`)
+- Windows: `%APPDATA%\card-reader\masterlock.json`
+
+```
+python masterlock_setup.py            # 위 위치에 만든다. 이미 있으면 --force 없이는 거부
+```
+
+Linux에서는 폴더 700, 파일 600으로 만든다. Windows에서는 `chmod 600`이 ACL을 대신하지 않으므로 `%APPDATA%` 폴더가 다른 계정에 열려 있지 않은지 직접 확인한다.
+
+exe: 실행 중에는 사용자 설정 파일을 읽지 않고, 빌드 때 넣은 `masterlock_build` 모듈의 값만 쓴다 (파일 하나 놓는 것으로 비밀번호가 바뀌면 안 되기 때문).
+
+1. 빌드 전에 `python masterlock_setup.py --write-build-module`. 사용자 설정 파일이 있으면 그 값을 옮기고, 없으면 새로 만든다. 같은 PC에서 만든 두 빌드(CardReader, ReviewApp)는 이 파일 하나를 공유한다.
+2. 위 pyinstaller 명령 2개를 실행한다 (`--hidden-import masterlock_build` 포함).
+3. 빌드 후 `masterlock_build.py`를 지우거나 안전한 곳에 보관한다. `.gitignore`에 들어 있어 커밋되지는 않는다.
+
+빌드 PC에 `masterlock_build.py`가 없으면 exe는 만들어지더라도 실행을 거부한다.
+
+한계: 코드가 공개이므로 소스에서 `reader.py`의 잠금 호출을 지우거나 모듈을 직접 불러 쓰면 우회할 수 있다. exe 안의 해시도 꺼낼 수 있어서, 약한 비밀번호는 오프라인으로 추측당할 수 있다. 이 잠금은 우연한 실행을 막는 정도이고 강한 보안 경계가 아니다.
 
 `reader.py`는 위 모듈들을 "있으면 사용"(`_optional`)으로 불러오므로 PyInstaller가 자동으로 찾지 못한다.
 `--hidden-import`를 빼면 exe에서 추천·상황 인식·기록이 조용히 꺼진다.

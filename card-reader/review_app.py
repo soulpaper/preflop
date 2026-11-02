@@ -14,10 +14,14 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+
+import masterlock  # noqa: E402  (_optional 금지: 빠지면 잠금이 풀린다)
+
 DEFAULT_GTO = os.path.normpath(os.path.join(HERE, "..", "..", "gto-data", "card-reader", "gto_lib"))
 
 
 def main(argv=None):
+    masterlock.require()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("synth")

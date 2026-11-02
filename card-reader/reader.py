@@ -29,6 +29,7 @@ import numpy as np
 import evaluator as ev
 import glyphs
 import layout
+import masterlock
 from fastmatch import FastMatcher
 import ocr
 import odds
@@ -5070,4 +5071,5 @@ class App:
 
 
 if __name__ == "__main__":
+    masterlock.require()
     App().run()

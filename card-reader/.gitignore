@@ -18,3 +18,6 @@ config.json.*
 eqtable/postflop_cache.sqlite*
 eqtable/*.partial.jsonl
 eqtable/build.log
+# 마스터 잠금 값 (솔트·해시): 저장소에 올리지 않는다
+masterlock.json
+masterlock_build.py
