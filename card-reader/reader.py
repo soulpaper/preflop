@@ -1452,6 +1452,15 @@ class App:
             threading.Thread(target=self.ocr_worker, daemon=True).start()
         if self.tablestate is not None:
             threading.Thread(target=self.state_worker, daemon=True).start()
+        self.gto_updater = None      # GTO 데이터 백그라운드 갱신 (gto_update.json 이 있을 때만)
+        gu = _optional("gto_update")
+        if gu is not None:
+            try:
+                self.gto_updater = gu.start(BASE,
+                    on_done=lambda m: self.post(lambda: self.show_toast(m)),
+                    on_error=lambda *a: self.log_once("gto_update"))
+            except Exception:
+                self.log_once("gto_update")
         self.root.after(100, self.tick)
 
     # --- 배율 ---------------------------------------------------------------
@@ -5049,6 +5058,8 @@ class App:
 
     def close(self):
         self.closed = True
+        if self.gto_updater is not None:
+            self.gto_updater.stop()
         self.rec_on = False
         try:
             if self.tracker is not None:

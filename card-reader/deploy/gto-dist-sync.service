@@ -1,0 +1,11 @@
+[Unit]
+Description=Upload changed GTO data to the local sharebox GTO space
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/share/gto-dist/app/gto_dist_sync.py --config %h/.config/gto-dist/sync.json
+Nice=15
+IOSchedulingClass=idle
+UMask=0077
+TimeoutStartSec=1h
+Environment=PYTHONDONTWRITEBYTECODE=1

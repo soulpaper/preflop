@@ -19,7 +19,7 @@ python reader.py
 ## exe 빌드
 
 ```
-pyinstaller --onefile --windowed --name CardReader --collect-all winrt --hidden-import masterlock --hidden-import masterlock_build --hidden-import names --hidden-import handlog --hidden-import profiles --hidden-import handread --hidden-import rangeq --hidden-import recorder --hidden-import userinfo --hidden-import advisor --hidden-import tablestate --hidden-import solverlib --hidden-import icm --hidden-import eqtable --hidden-import decisionlog --add-data "eqtable/preflop_random.json;eqtable" reader.py
+pyinstaller --onefile --windowed --name CardReader --collect-all winrt --hidden-import masterlock --hidden-import masterlock_build --hidden-import names --hidden-import handlog --hidden-import profiles --hidden-import handread --hidden-import rangeq --hidden-import recorder --hidden-import userinfo --hidden-import advisor --hidden-import tablestate --hidden-import solverlib --hidden-import icm --hidden-import eqtable --hidden-import decisionlog --hidden-import gto_update --hidden-import gto_dist_common --add-data "eqtable/preflop_random.json;eqtable" reader.py
 ```
 
 exe 옆에 `templates/`, `font_glyphs/`, `gto_lib/` 를 둔다.
@@ -63,6 +63,34 @@ exe: 실행 중에는 사용자 설정 파일을 읽지 않고, 빌드 때 넣�
 `--hidden-import`를 빼면 exe에서 추천·상황 인식·기록이 조용히 꺼진다.
 
 `config.json`과 `templates/`는 exe 옆에 생성된다.
+
+## GTO 데이터 공유 (sharebox 공간)
+
+서버 PC가 계산한 `gto_lib`을 sharebox의 GTO 전용 공간에 올리고, 각 PC의 CardReader가 변경분만 받아 간다.
+설계는 `홀덤연구소/sharebox-gto-design.md`. 공간 API는 sharebox 쪽(`/api/spaces/gto/...`, 토큰 역할 `space:gto:read|write`)이 구현되어 있어야 한다.
+`gto_update.json`을 읽는 쪽은 로컬 파일을 삭제하지 않고 파일 단위로만 교체한다. 서버가 꺼져 있어도 기존 데이터로 동작한다.
+
+**서버 PC (업로더, 15분 타이머)** — 러너(`build_gto_lib.py`)와는 프로세스, 잠금, 쓰기를 공유하지 않고 `gto_lib`을 읽기만 한다.
+1. sharebox에서 `shareboxd token add gto-uploader space:gto:write`로 토큰을 발급한다. 토큰은 저장소에 넣지 않는다.
+2. `~/.config/gto-dist/sync.json`(디렉터리 700, 파일 600)을 만든다.
+   `{"url":"http://127.0.0.1:8737","token":"<업로드 토큰>","lib_dir":"<gto_lib 경로>","cache":"~/.local/state/gto-dist/sync_cache.json"}`
+   (업로더는 루프백 http 주소만 받는다.)
+3. `gto_dist_common.py`, `gto_dist_sync.py`를 `~/.local/share/gto-dist/app/`에 복사하고 `deploy/gto-dist-sync.service`, `.timer`를 `~/.config/systemd/user/`에 복사한다.
+4. `systemctl --user daemon-reload && systemctl --user enable --now gto-dist-sync.timer`, `journalctl --user -u gto-dist-sync`로 첫 게시를 확인한다.
+- `sync.json`이 있는 PC에서는 `gto_update`가 시작을 거부한다(러너의 원본 폴더 보호).
+- 업로드 실패는 exit 1이고 다음 타이머가 재시도한다. 계산에는 영향이 없다.
+
+**각 PC (CardReader)** — exe 옆에 `gto_update.json`을 둔다(git 제외).
+```
+{"enabled":true,
+ "urls":["https://<LAN 주소>:1213","https://<Tailscale 주소>:1213","https://<공인 주소>:1213"],
+ "token":"<읽기 토큰, PC별 발급>","cert_sha256":"<shareboxd cert-pin 값>",
+ "check_interval_sec":1800,"max_bytes_per_sec":5242880}
+```
+- 읽기 토큰은 `shareboxd token add gto-read-<PC이름> space:gto:read`로 PC마다 발급한다. 폐기하면 즉시 401이 된다.
+- 인증서 지문이 다르면 토큰을 보내기 전에 연결을 끊는다. 주소가 바뀌면 JSON만 고친다(exe 재빌드 불필요).
+- 첫 설치는 5MiB/s 기준 수 분이 걸린다. 여러 PC가 동시에 처음 받는 것은 피한다.
+- 테스트: `python3 test_gto_dist.py` (실제 shareboxd 통합 시험은 `GTO_TEST_SHAREBOXD=<바이너리 경로>`가 있을 때만 실행).
 
 ## 학습 데이터
 

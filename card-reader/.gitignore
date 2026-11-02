@@ -21,3 +21,11 @@ eqtable/build.log
 # 마스터 잠금 값 (솔트·해시): 저장소에 올리지 않는다
 masterlock.json
 masterlock_build.py
+# GTO 배포: 비밀값/상태
+gto_update.json
+gto_update_state.json
+.update-tmp/
+gto_dist_*.json
+*.pem
+*.key
+*.crt
