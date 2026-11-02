@@ -51,8 +51,10 @@ PROGRESS = os.path.join(SOLVES, "progress.json")
 STOP_FILE = os.path.join(SOLVES, "STOP")
 LOCK = os.path.join(SOLVES, "runner.lock")
 CONTROL = os.path.join(SOLVES, "control.json")
-EXE = os.path.join(sl.SOLVER_DIR, "console_solver.exe")
+WINDOWS = os.name == "nt"
+EXE = os.path.join(sl.SOLVER_DIR, "console_solver.exe" if WINDOWS else "console_solver")
 CPU = os.cpu_count() or 4
+POSIX_LOW_NICE = 10      # POSIX 에서 '보통 이하' 우선순위에 해당하는 nice 값
 BELOW_NORMAL, NORMAL = 0x00004000, 0x00000020
 CREATE_NO_WINDOW = 0x08000000
 JOB_TIMEOUT = 75 * 60
@@ -181,6 +183,14 @@ def is_done(spot, stack, flop, rh):
 def pid_alive(pid):
     if not pid:
         return False
+    if not WINDOWS:
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except PermissionError:
+            return True
+        except (OSError, ValueError):
+            return False
     try:
         k = ctypes.windll.kernel32
         h = k.OpenProcess(0x00100000 | 0x1000, False, int(pid))   # SYNCHRONIZE | QUERY_LIMITED
@@ -200,6 +210,8 @@ def low_threads():
 def set_priority(pid, low, affinity=True):
     """우선순위 + (affinity=True 면) CPU 선호도. low 면 마지막 논리 CPU 2개를 비워 둔다
     → 이미 돌고 있는 솔버도 스레드를 바꾸지 않고 바로 cpu-2 개 안에서만 돈다."""
+    if not WINDOWS:
+        return _set_priority_posix(pid, low, affinity)
     try:
         k = ctypes.windll.kernel32
         h = k.OpenProcess(0x0200 | 0x1000, False, int(pid))   # SET_INFORMATION | QUERY_LIMITED
@@ -213,6 +225,28 @@ def set_priority(pid, low, affinity=True):
     except Exception:
         pass
     return False
+
+
+def _set_priority_posix(pid, low, affinity=True):
+    """Linux 는 nice·CPU 선호도가 스레드 단위라 프로세스의 모든 스레드에 적용한다.
+    nice 를 다시 낮추는 일(full 전환)은 권한이 없으면 실패하므로 그때는 그대로 둔다."""
+    try:
+        tids = [int(t) for t in os.listdir(f"/proc/{int(pid)}/task")]
+    except OSError:
+        tids = [int(pid)]
+    ok = False
+    for tid in tids:
+        try:
+            os.setpriority(os.PRIO_PROCESS, tid, POSIX_LOW_NICE if low else 0)
+            ok = True
+        except OSError:
+            pass
+        if affinity and hasattr(os, "sched_setaffinity"):
+            try:
+                os.sched_setaffinity(tid, range(low_threads() if low else CPU))
+            except OSError:
+                pass
+    return ok
 
 
 def split_threads(total, n):
@@ -264,19 +298,22 @@ def solve_proc(spot, stack, flop, rngs, threads, low, accuracy, max_iter, progre
         os.remove(raw)
     t0 = time.time()
     with open(logp, "w", encoding="utf-8") as lf:
-        p = subprocess.Popen(solver_cmd(inp), cwd=sl.SOLVER_DIR, stdout=lf, stderr=subprocess.STDOUT,
-                             creationflags=(BELOW_NORMAL if low else NORMAL) | CREATE_NO_WINDOW)
+        kw = {"creationflags": (BELOW_NORMAL if low else NORMAL) | CREATE_NO_WINDOW} if WINDOWS else {}
+        p = subprocess.Popen(solver_cmd(inp), cwd=sl.SOLVER_DIR, stdout=lf, stderr=subprocess.STDOUT, **kw)
         if low:   # 낮 모드: 다른 워커와 함께 마지막 논리 CPU 2개는 비워 둔다
             set_priority(p.pid, True)
         if progress_cb:
             progress_cb(p.pid)
         try:
-            p.wait(timeout=JOB_TIMEOUT)
+            posix_peak = None if WINDOWS else _wait_posix(p, JOB_TIMEOUT)
+            if WINDOWS:
+                p.wait(timeout=JOB_TIMEOUT)
         except subprocess.TimeoutExpired:
             p.kill()
             p.wait()
             raise RuntimeError("timeout")
-        mem = peak_mem_gb(getattr(p, "_handle", 0))   # 이 스팟·스택의 메모리 기록 (워커 스케줄링용)
+        # 이 스팟·스택의 메모리 기록 (워커 스케줄링용)
+        mem = peak_mem_gb(getattr(p, "_handle", 0)) if WINDOWS else posix_peak
     secs = time.time() - t0
     with open(logp, encoding="utf-8", errors="replace") as f:
         iters, expl, _tm = parse_log(f.read())
@@ -486,6 +523,12 @@ class _MemStatus(ctypes.Structure):
 
 
 def avail_gb():
+    if not WINDOWS:
+        try:
+            with open("/proc/meminfo", encoding="ascii") as f:
+                return int(re.search(r"MemAvailable:\s+(\d+) kB", f.read()).group(1)) * 1024 / 1e9
+        except (OSError, AttributeError):
+            return 99.0
     try:
         m = _MemStatus()
         m.dwLength = ctypes.sizeof(_MemStatus)
@@ -515,6 +558,24 @@ def peak_mem_gb(handle):
     except Exception:
         pass
     return None
+
+
+def _wait_posix(p, timeout):
+    """솔버가 끝날 때까지 기다리며 /proc 의 VmHWM 으로 최대 메모리(GB)를 잰다. 시간 초과면 TimeoutExpired."""
+    deadline = time.time() + timeout
+    peak = None
+    while p.poll() is None:
+        if time.time() > deadline:
+            raise subprocess.TimeoutExpired(p.args, timeout)
+        try:
+            with open(f"/proc/{p.pid}/status", encoding="ascii", errors="replace") as f:
+                m = re.search(r"VmHWM:\s+(\d+) kB", f.read())
+            if m:
+                peak = round(int(m.group(1)) * 1024 / 1e9, 2)
+        except OSError:
+            pass
+        time.sleep(1)
+    return peak
 
 
 MEM_BUDGET_GB = 26.0   # 솔버들 메모리 합 상한
@@ -767,7 +828,10 @@ def stop(now=False):
     if now:
         for spid in solver_pids(load_progress()):
             if pid_alive(spid):
-                subprocess.run(["taskkill", "/F", "/PID", str(spid)], capture_output=True)
+                if WINDOWS:
+                    subprocess.run(["taskkill", "/F", "/PID", str(spid)], capture_output=True)
+                else:
+                    os.kill(int(spid), 9)
                 print("솔버 종료:", spid)
 
 

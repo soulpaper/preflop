@@ -59,7 +59,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLS_DIR = os.environ.get("PREFLOP_TOOLS") or os.path.normpath(os.path.join(HERE, "..", "..", "preflop-tools"))
 SOLVER_DIR = os.path.join(TOOLS_DIR, "TexasSolver")
 SOLVES_DIR = os.path.join(TOOLS_DIR, "solves")
-LIB_DIR = os.path.join(HERE, "gto_lib")
+LIB_DIR = os.environ.get("GTO_LIB_DIR") or os.path.join(HERE, "gto_lib")   # 배치가 쓰는 곳도 GTO_LIB_DIR 를 따른다
 LIB_VERSION = 1
 
 ANTE_TOTAL = 9 * 0.125     # 9명 × 0.125BB
