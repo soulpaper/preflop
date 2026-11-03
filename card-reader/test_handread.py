@@ -306,8 +306,8 @@ def _a(seat, act, **kw):
     return dict(seat=seat, act=act, **kw)
 _h1 = _hl.to_handread({"preflop": [_a("A", "raise", raises_before=0), _a("B", "call", raises_before=1)],
                        "flop": [_a("B", "bet"), _a("A", "call")], "turn": [_a("B", "check"), _a("A", "bet"), _a("B", "call")]}, _pos)
-test("to_handread: 콜러 선벳 = lead, 턴 어그레서 없이 체크 → 어그레서 벳 = cbet(턴 주도권)",
-     _h1["B"]["bet_role"] == {"flop": "lead"} and _h1["A"].get("bet_role") == {"turn": "cbet"} or _h1["A"].get("bet_role") == {"turn": "lead"},
+test("to_handread: 플랍을 콜러 B가 리드하면 주도권이 B로 넘어가 턴 A의 벳은 lead (cbet 아님)",
+     _h1["B"].get("bet_role") == {"flop": "lead"} and _h1["A"].get("bet_role") == {"turn": "lead"},
      str({k: v.get("bet_role") for k, v in _h1.items()}))
 _h2 = _hl.to_handread({"preflop": [_a("A", "raise", raises_before=0), _a("B", "call", raises_before=1)],
                        "flop": [_a("B", "check"), _a("A", "bet"), _a("B", "call")],
