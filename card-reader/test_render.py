@@ -139,7 +139,13 @@ def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     reader.save_config = lambda *a, **k: None   # 점검이 config.json 을 바꾸지 않게
+    # 실제 화면을 읽는 스레드·주기 갱신(tick)을 꺼서 점검이 만든 상태만 남게 한다 (게임 중 화면이 view/table_state 를 덮어써 흔들리던 문제)
+    real_optional = reader._optional
+    reader._optional = lambda name, *a, **k: None if name in ("tablestate", "gto_update") else real_optional(name, *a, **k)
+    reader.ocr.available = lambda *a, **k: False
+    reader.App.tick = lambda self: None
     app = reader.App()
+    reader._optional = real_optional
     print("window", app.root.geometry())
     fails = 0
     cases = [("preflop", []), ("flop", ["7h", "4s", "2d"]), ("turn", ["7h", "4s", "2d", "Jc"]),
