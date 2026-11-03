@@ -154,6 +154,8 @@ F_NUM = "Segoe UI"
 # 글자 크기 (pt, 배율 1.0 기준)
 FS_TITLE, FS_H, FS_BODY, FS_NOTE, FS_SMALL = 14, 13, 12, 11, 10
 FS_HAND, FS_EQ, FS_BIG, FS_ACTION = 16, 38, 30, 30
+# 추천 박스 전용 글자 크기 (고령 사용자 가독성) - 다른 곳에는 쓰지 않는다
+FS_ADV_CAP, FS_ADV_REASON, FS_ADV_PLAN, FS_ADV_DETAIL, FS_ADV_STATUS = 12, 16, 15, 13, 15
 
 # 용어 설명: (용어, 한 줄 요약 — 화면에 항상 표시, 자세한 설명 — 마우스를 올리면)
 EXPLAIN = {
@@ -4350,7 +4352,7 @@ class App:
             cap = self.text(c, tx, iy, "추천" + ("  ·  폴드 전 마지막 분석 (복기용)" if self.fold_view is not None else
                                                 "  ·  미리 계산 (내 차례 전)" if pre and not stale else
                                                 ("  ·  차례가 오면" if waiting else "") + ("  ·  이전 계산" if stale else "")),
-                            FS_NOTE, "bold", WARN if stale else MUTED, tags=tag)
+                            FS_ADV_CAP, "bold", WARN if stale else MUTED, tags=tag)
             self.bind_tip(c, tag, f"{EXPLAIN['advice'][0]}: {EXPLAIN['advice'][2]}")
             rx, cap_bottom = x1 - pad, c.bbox(cap)[3]
             if gate_closed and not pre:  # 내 차례가 아니라 계산을 미뤘다 → 직접 계산 버튼
@@ -4361,7 +4363,7 @@ class App:
                 cap_bottom = max(cap_bottom, iy - s(2) + bh)
             conf = "" if stale else CONFIDENCE.get(adv.get("confidence"), "")
             if conf:
-                self.text(c, rx, iy, conf, FS_NOTE, fill=MUTED, anchor="ne")
+                self.text(c, rx, iy, conf, FS_ADV_CAP, fill=MUTED, anchor="ne")
             iy = cap_bottom + s(2)
             action = str(adv.get("action") or "")
             size = str(adv.get("size_text") or "")
@@ -4374,7 +4376,7 @@ class App:
             iy = b[3] + s(4)
             reason = adv.get("reason")
             if reason:
-                t = self.text(c, tx, iy, str(reason), FS_BODY, "bold", MUTED if waiting else TEXT, width=tw)
+                t = self.text(c, tx, iy, str(reason), FS_ADV_REASON, "bold", MUTED if waiting else TEXT, width=tw)
                 iy = c.bbox(t)[3] + s(4)
             plan = adv.get("plan") or []
             if isinstance(plan, str):
@@ -4382,21 +4384,21 @@ class App:
             if plan:  # 대응 계획: 눈에 잘 띄게 본문보다 한 단계 크게
                 iy += s(2)
                 for line in list(plan)[:3]:
-                    t = self.text(c, tx, iy, f"\u25b8 {line}", FS_BODY + 1, "bold", TEXT, width=tw)
+                    t = self.text(c, tx, iy, f"\u25b8 {line}", FS_ADV_PLAN, "bold", TEXT, width=tw)
                     iy = c.bbox(t)[3] + s(3)
                 iy += s(2)
             details = adv.get("detail") or []
             if isinstance(details, str):
                 details = [details]
             for d in list(details)[:3]:
-                t = self.text(c, tx, iy, f"· {d}", FS_NOTE, fill=MUTED, width=tw)
+                t = self.text(c, tx, iy, f"· {d}", FS_ADV_DETAIL, fill=blend(MUTED, TEXT, 0.35), width=tw)
                 iy = c.bbox(t)[3] + s(2)
         elif status:
             text, kind, buttons = status
             color = {"warn": WARN, "err": LOSE_C}.get(kind, MUTED)
-            t = self.text(c, tx, iy, text, FS_BODY + 1, "bold", color, width=tw)
+            t = self.text(c, tx, iy, text, FS_ADV_STATUS, "bold", color, width=tw)
             b = c.bbox(t)
-            line_h = self.measure("가", FS_BODY + 1, "bold")
+            line_h = self.measure("가", FS_ADV_STATUS, "bold")
             bx, by, bottom = b[2] + s(10), b[1], b[3]
             for key in buttons:
                 bkey, label = {"learn": ("st_learn", "학습"), "auto": ("st_auto", "자동 지정"),
