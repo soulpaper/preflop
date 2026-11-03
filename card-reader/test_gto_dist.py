@@ -34,6 +34,7 @@ import gto_update as G  # noqa: E402
 results = []
 TMP = tempfile.mkdtemp(prefix="gto-dist-test-")
 os.environ["HOME"] = os.path.join(TMP, "home")           # server_marker() 가 진짜 ~/.config 를 보지 않게
+os.environ["USERPROFILE"] = os.environ["HOME"]           # Windows 의 expanduser("~") 는 HOME 이 아니라 이것을 본다
 os.makedirs(os.environ["HOME"])
 G._sleep = lambda s: None                                 # 해시 간 쉼, 공유 위반 재시도 대기 제거
 UP_TOKEN, RD_TOKEN = "synthetic-upload-token", "synthetic-read-token"
@@ -1099,10 +1100,14 @@ def update_malicious_manifest():
                  and not [d for d in diff if d != "base"] and open(sentinel).read() == "k", "%s %s" % (s, sorted(diff)[:3]))
         # 심볼릭 링크 탈출
         e.share.raw_manifest = None
-        os.symlink(outside, os.path.join(e.dst, "turn"))
-        s = e.updater().cycle()
-        test("심볼릭 링크로 대상 밖을 가리키는 경로: 거부, 대상 밖 쓰기 없음", s == "bad_manifest" and os.listdir(outside) == ["keep.txt"], s)
-        os.unlink(os.path.join(e.dst, "turn"))
+        try:
+            os.symlink(outside, os.path.join(e.dst, "turn"), target_is_directory=True)
+        except OSError:  # Windows: 개발자 모드나 관리자 권한 없이는 심볼릭 링크를 만들 수 없다
+            results.append(("SKIP", "심볼릭 링크로 대상 밖을 가리키는 경로", "심볼릭 링크 생성 권한 없음"))
+        else:
+            s = e.updater().cycle()
+            test("심볼릭 링크로 대상 밖을 가리키는 경로: 거부, 대상 밖 쓰기 없음", s == "bad_manifest" and os.listdir(outside) == ["keep.txt"], s)
+            os.unlink(os.path.join(e.dst, "turn"))
         for name, raw in {"format 모름": {**good, "format": 99}}.items():
             e.share.raw_manifest = json.dumps(raw).encode()
             test("매니페스트 %s: 무시" % name, e.updater().cycle() == "format_unknown" and snap(e.dst) == {})
@@ -1239,7 +1244,8 @@ class Real:
         self.binary = binary
         self.data = os.path.join(TMP, "sharebox-data")
         os.makedirs(self.data)
-        self.env = {**os.environ, "SHAREBOX_DATA": self.data, "HOME": os.path.join(TMP, "home")}
+        self.env = {**os.environ, "SHAREBOX_DATA": self.data, "HOME": os.path.join(TMP, "home"),
+                    "USERPROFILE": os.path.join(TMP, "home")}
         self.hp, self.tp = free_port(), free_port()
         assert self.hp not in (8737, 1213) and self.tp not in (8737, 1213) and self.hp != self.tp
         self.proc = None

@@ -51,6 +51,8 @@ XDG = os.path.join(TMP, "xdg")
 os.makedirs(XDG)
 saved_env = dict(os.environ)
 os.environ["XDG_CONFIG_HOME"] = XDG
+if sys.platform == "win32":                    # Windows 는 %APPDATA% 를 본다
+    os.environ["APPDATA"] = XDG
 os.environ.pop("MASTERLOCK_CHECK", None)
 CFG = os.path.join(XDG, "card-reader", "masterlock.json")
 PW = "right-한글"
@@ -91,11 +93,14 @@ def refuses_without_prompt(label):
 
 
 # --- 경로
-test("경로: XDG_CONFIG_HOME 존중", ml.config_path() == CFG)
-del os.environ["XDG_CONFIG_HOME"]
-os.environ["HOME"] = os.path.join(TMP, "home")
-test("경로: XDG 없으면 ~/.config", ml.config_path() == os.path.join(TMP, "home", ".config", "card-reader", "masterlock.json"))
-os.environ["XDG_CONFIG_HOME"] = XDG
+if sys.platform == "win32":
+    test("경로: APPDATA 존중 (Windows)", ml.config_path() == CFG)
+else:
+    test("경로: XDG_CONFIG_HOME 존중", ml.config_path() == CFG)
+    del os.environ["XDG_CONFIG_HOME"]
+    os.environ["HOME"] = os.path.join(TMP, "home")
+    test("경로: XDG 없으면 ~/.config", ml.config_path() == os.path.join(TMP, "home", ".config", "card-reader", "masterlock.json"))
+    os.environ["XDG_CONFIG_HOME"] = XDG
 
 # --- fail closed: 입력창 호출 없이 종료
 drop()
@@ -211,6 +216,8 @@ cfg2 = os.path.join(TMP, "tool", "cfg", "masterlock.json")
 build2 = os.path.join(TMP, "tool", "masterlock_build.py")
 sub_env = {k: v for k, v in saved_env.items() if k != "MASTERLOCK_CHECK"}
 sub_env["XDG_CONFIG_HOME"] = XDG
+if sys.platform == "win32":
+    sub_env["APPDATA"] = XDG
 
 
 def run_setup(*args, stdin=""):
@@ -313,10 +320,13 @@ run = lambda: subprocess.run([sys.executable, "-I", os.path.join(HERE, "review_a
 drop()
 p = run()
 test("review_app: 설정 없으면 종료 코드 1, 안내만 stderr", p.returncode == 1 and not p.stdout and p.stderr, f"rc={p.returncode}")
-put(GOOD)
-p = run()
-test("review_app: 설정 있어도 입력 불가면 종료 코드 1, 출력 없음", p.returncode == 1 and not p.stdout, f"rc={p.returncode}")
-drop()
+if sys.platform == "win32":  # Windows 는 화면이 늘 있어 실제 입력창이 뜬다
+    results.append(("SKIP", "review_app: 설정 있어도 입력 불가면 종료 코드 1, 출력 없음", "Windows: 입력창이 뜸"))
+else:
+    put(GOOD)
+    p = run()
+    test("review_app: 설정 있어도 입력 불가면 종료 코드 1, 출력 없음", p.returncode == 1 and not p.stdout, f"rc={p.returncode}")
+    drop()
 
 os.environ.clear()
 os.environ.update(saved_env)
