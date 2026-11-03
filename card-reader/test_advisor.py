@@ -1068,6 +1068,23 @@ check("림프 없이 첫 진입 (hero_bet 0, 콜 1) 은 그대로 오픈 판단"
       dict(PF, hero=["Ah", "Kd"], players=6, hero_pos="CO", situation="open", stack_bb=100, my_stack=100,
            pot=1.5, pot_total=1.5, call=1.0, hero_bet=0.0), "레이즈")
 
+# --- 체크 버튼이 없는데 콜 금액 0 (금액을 못 읽음): 체크를 권하면 안 된다 (실제 2026-11-04: CO 10BB 레이즈에 BB 64o '체크')
+BB_NOCHECK = dict(PF, hero=["6h", "4d"], players=7, hero_pos="BB", villain_pos="CO", situation="jamcall",
+                  stack_bb=17.6, my_stack=17.6, pot=16.1, pot_total=16.1, call=0.0, can_check=False, to_act=True)
+check("실제: BB 64o, 체크 버튼 없음 + 콜 0 오인식 → 체크 아님(폴드)", BB_NOCHECK, "폴드")
+check("BB AA 17.6BB, 체크 버튼 없음 + 콜 0 → 올인 (크기 = 내 스택)", dict(BB_NOCHECK, hero=["As", "Ad"]), "올인")
+BB_DEEP = dict(BB_NOCHECK, hero=["As", "Ad"], stack_bb=80, my_stack=80, situation="vsopen")
+check("BB AA 80BB, 체크 버튼 없음 + 콜 0 → 레이즈하되 크기는 지어내지 않음", BB_DEEP, "레이즈",
+      detail_has="콜 금액을 읽지 못함")
+r = recommend(BB_DEEP)
+results.append((r["size_bb"] is None, "BB AA 80BB 콜 금액 모름: 레이즈 크기 없음", r))
+check("BB 64o, 진짜 체크 가능(림프 팟) → 체크 그대로",
+      dict(BB_NOCHECK, situation="open", call=0.0, can_check=True, pot=5.5, pot_total=5.5), "체크")
+r = recommend(dict(PF, street="flop", board=["Kd", "8c", "2h"], hero=["7c", "2d"], players=6, hero_pos="BB",
+                   situation="vsopen", opponents=1, pot=12.0, pot_total=12.0, stack_bb=40, my_stack=40,
+                   call=0.0, can_check=False, to_act=True))
+results.append((r["action"] != "체크", "플랍: 체크 버튼 없음 + 콜 0 → '체크 가능이니 폴드 대신 체크' 로 바꾸지 않음", r))
+
 # --- 결과 -----------------------------------------------------------------------
 failed = 0
 for ok, name, res in results:

@@ -436,6 +436,10 @@ class _Ctx:
             call = 0.0
         if self.can_check is True and call is None:
             call = 0.0
+        if self.can_check is False and call is not None and call <= 0:
+            # 체크 버튼이 없는데 콜 금액이 0 → 금액을 못 읽은 것 (콜 0 이면 체크할 수 있어야 한다).
+            # 0 으로 두면 'BB 체크 옵션' · '체크 가능하면 폴드 안 함' 이 레이즈를 마주한 자리에서 체크를 권했다
+            call = None
         self.call = call if call and call > 0 else 0.0
         self.call_known = call is not None
         mine = self.my_stack or self.eff   # 내 뒷스택 (없으면 유효 스택)
@@ -863,6 +867,10 @@ def recommend(ctx):
                  detail=[f"보드 {len(c.board)}장 인식됨"], confidence="low")
     elif c.street == "preflop":
         r = _preflop(c)
+        if c.can_check is False and not c.call_known and r.get("action") in (RAISE, CALL):
+            # 콜 금액을 못 읽었다: 행동(레인지 판단)은 두되 크기를 지어내지 않는다 (콜 0 기준 3벳 크기는 상대 레이즈보다 작았다)
+            r.update(size_bb=None, size_text="금액 확인", confidence="low",
+                     detail=["콜 금액을 읽지 못함 — 화면의 콜 금액을 확인하세요"] + list(r.get("detail") or [])[:2])
     else:
         r = _postflop(c)
         if c.opp >= 2:  # 멀티웨이는 휴리스틱이 약하다 — 신뢰도 하향
@@ -1367,6 +1375,8 @@ def _preflop_core(c, state):
     head = f"{hand} (강도 {strength}/169)"
 
     unopened = call + posted <= 1.0 + 1e-6
+    if unopened and c.can_check is False and not c.call_known and posted >= 1.0 - 1e-6:
+        unopened = False   # BB 인데 체크 버튼이 없다 = 레이즈가 있었다 (콜 금액만 못 읽음)
     sit = c.situation if c.situation in DEEP_SITUATIONS + SHORT_SITUATIONS else None
     if sit is None:
         sit = "open" if unopened else ("vsopen" if not c.facing_allin else "jamcall")
