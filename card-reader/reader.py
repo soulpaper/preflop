@@ -600,6 +600,8 @@ def analyze(hero, board, opponents, iterations=None):
     res["hand"] = ev.hand_name(ev.evaluate(hero + board)) if board else preflop_name(hero)
     res["hero"], res["board"] = list(hero), list(board)
     res["opponents"] = opponents
+    if board and ev.evaluate(hero + board)[0] >= 1:  # 메이드 패: 지금 나를 이기는 상대 두 장 (몇 ms)
+        res["beaters"] = ev.beaters(hero, board)
     if len(board) in (3, 4):
         d = ev.draws(hero, board)
         n = len(d["outs"])
@@ -661,6 +663,14 @@ def draw_card(c, x, y, w, h, label):
                   font=(F_NUM, -max(9, int(h * 0.27)), "bold"))
     c.create_text(x + w * 0.5, y + h * 0.66, text=ev.SUIT_SYMBOLS[suit], fill=color,
                   font=("Segoe UI Symbol", -max(10, int(h * 0.48))))
+
+
+def draw_rank_card(c, x, y, w, h, rank, suited=False):
+    """상대 예상 핸드용 카드: 무늬를 모르므로 랭크만 크게. 수딧이면 두 장 모두 청록 테두리."""
+    r = max(3, w // 8)
+    round_rect(c, x, y, x + w, y + h, r, fill=CARD_FACE, outline=ACCENT if suited else "", width=2 if suited else 1)
+    c.create_text(x + w / 2, y + h / 2, text="10" if rank == "T" else rank, fill=BLACK_SUIT,
+                  font=(F_NUM, -max(9, int(h * (0.42 if rank == "T" else 0.5))), "bold"))
 
 
 class Button:
@@ -2425,6 +2435,7 @@ class App:
         return {"key": key, "sig": hash(key), "hero": tuple(hero), "board": tuple(board), "order": order,
                 "ranges": {k: est[k]["range"] for k in order if k in est},
                 "lines": {k: self.handread.describe(est[k]) for k in order if k in est},
+                "top": {k: list(est[k].get("top_hands") or []) for k in order if k in est},
                 "width": {k: est[k].get("width_pct") for k in order if k in est}}
 
     def reads_now(self):
@@ -4035,7 +4046,7 @@ class App:
         return self.draw_summary(c, y) - self.s(10)
 
     def opp_blocks(self):
-        """[(이름, 포지션, 성향 한 줄, 요약 줄들)] 최대 3명, 주 상대(마지막 공격자) 먼저. 내 차례에 계산된 것만."""
+        """[(이름, 포지션, 성향 한 줄, 요약 줄들, 가능성 높은 핸드 [(코드, %)])] 최대 3명, 주 상대(마지막 공격자) 먼저. 내 차례에 계산된 것만."""
         reads = self.reads_now()
         if not reads or self.view.get("message") or (self.table_state or {}).get("hero_folded"):
             return []
@@ -4056,7 +4067,7 @@ class App:
             if p.get("reliable"):
                 pline = " / ".join(f"{n} {p[key]:.0f}" for n, key in (("VPIP", "vpip"), ("PFR", "pfr")) if p.get(key) is not None)
                 pline = (pline + " · " if pline else "") + f"{p.get('hands', 0)}핸드"
-            out.append((label, pos, pline, lines))
+            out.append((label, pos, pline, lines, (reads.get("top") or {}).get(k) or []))
             if len(out) == 3:
                 break
         return out
@@ -4074,7 +4085,7 @@ class App:
 
     def sec_opp(self, c, idx, blk, y):
         s, W, P = self.s, self.s(self.W), self.s(self.P)
-        label, pos, pline, lines = blk
+        label, pos, pline, lines, top = (tuple(blk) + ([],))[:5]
         if idx == 0:  # 첫 블록에만 섹션 제목
             stale = self.reads_now() and tuple(self.reads_now()["board"]) != tuple(
                 c_ for c_ in self.view.get("board", []) if ev.is_card(c_))
@@ -4090,10 +4101,39 @@ class App:
         if pline:
             t = self.text(c, P, y, pline, FS_NOTE, "bold", ACCENT, width=W - 2 * P)
             y = c.bbox(t)[3] + s(2)
+        shown_top = False
         for ln in lines:
+            if top and ln.startswith("가능성 높은 핸드"):
+                y = self.draw_top_hands(c, y + s(2), top)   # 글 대신 카드 그림 + 확률
+                shown_top = True
+                continue
             t = self.text(c, P, y, ln, FS_NOTE, fill=MUTED, width=W - 2 * P)
             y = c.bbox(t)[3] + s(2)
+        if top and not shown_top:
+            y = self.draw_top_hands(c, y + s(2), top)
         return y
+
+    def draw_top_hands(self, c, y, top):
+        """상대의 가능성 높은 핸드: 카드 두 장(랭크) + 확률, 한 줄에 들어가는 만큼 (최대 5개)."""
+        s, W, P = self.s, self.s(self.W), self.s(self.P)
+        cw, ch, gap = s(24), s(32), s(3)
+        tile_w = max(2 * cw + gap, self.measure("100%", FS_BODY + 1, "bold")) + s(14)
+        x, row_bottom = P, y
+        for code, pct in list(top)[:5]:
+            code = str(code)
+            if len(code) < 2:
+                continue
+            if x > P and x + tile_w > W - P:
+                x, y = P, row_bottom + s(6)
+            kind = "페어" if code[0] == code[1] else ("수딧" if code.endswith("s") else "오프")
+            for i, r in enumerate(code[:2]):
+                draw_rank_card(c, x + i * (cw + gap), y, cw, ch, r, suited=kind == "수딧")
+            t = self.text(c, x + cw + gap / 2, y + ch + s(3), f"{float(pct):.0f}%", FS_BODY + 1, "bold", ACCENT,
+                          anchor="n")
+            k = self.text(c, x + cw + gap / 2, c.bbox(t)[3], kind, FS_SMALL, fill=MUTED, anchor="n")
+            row_bottom = max(row_bottom, c.bbox(k)[3])
+            x += tile_w
+        return row_bottom + s(4)
 
     def sec_notes(self, c, notes):
         s, W, P = self.s, self.s(self.W), self.s(self.P)
@@ -4530,7 +4570,7 @@ class App:
             bh = self.measure("가", FS_SMALL) + s(8)
             self.buttons["calc2"].draw(c, P, y, P + bw, y + bh, "지금 계산", primary=self.click_mode(),
                                        font=self.font(FS_SMALL, "bold"), r=s(6))
-            return y + bh + s(4)
+            return self.render_beaters(c, y + bh + s(4), res)
 
         # 에쿼티 + 상대 수 조절
         num = self.text(c, P - s(2), y - s(4), f"{eq['equity'] * 100:.1f}%", FS_EQ, "bold",
@@ -4573,7 +4613,40 @@ class App:
             c.create_oval(x, y + lh / 2 - s(4), x + s(9), y + lh / 2 + s(5), fill=color, outline="")
             t = self.text(c, x + s(14), y, f"{name} {value * 100:.1f}%", FS_BODY)
             x = c.bbox(t)[2] + s(18)
-        return c.bbox(t)[3] + s(4)
+        return self.render_beaters(c, c.bbox(t)[3] + s(4), res)
+
+    def render_beaters(self, c, y, res):
+        """메이드 패일 때 '질 수 있는 패': 족보마다 한 줄 (센 족보 먼저, 최대 4줄), 줄마다 예시 최대 4개 + 조합 수."""
+        info = res.get("beaters")
+        if not info or not info.get("total"):
+            return y
+        s, W, P = self.s, self.s(self.W), self.s(self.P)
+        y += s(6)
+        if not info["count"]:
+            t = self.text(c, P, y, "질 수 있는 패: 없음 (지금은 넛)", FS_BODY, "bold", WIN_C, width=W - 2 * P)
+            return c.bbox(t)[3] + s(4)
+        pct = info["count"] / info["total"] * 100
+        t = self.text(c, P, y, f"질 수 있는 패  ·  상대 두 장 {info['total']}가지 중 {info['count']}가지 ({pct:.0f}%)",
+                      FS_NOTE, "bold", MUTED, width=W - 2 * P)
+        y = c.bbox(t)[3] + s(3)
+        rows = {}
+        for g in info["groups"]:
+            row = rows.setdefault(g["name"], [g["cat"], 0, []])
+            row[1] += g["combos"]
+            row[2].append(g)
+        order = sorted(rows.items(), key=lambda kv: (-kv[1][0], -kv[1][1]))
+        name_w = max(self.measure(n, FS_BODY, "bold") for n, _ in order[:4]) + s(12)
+        for name, (_, combos, gs) in order[:4]:
+            gs.sort(key=lambda g: -g["combos"])
+            labels = " · ".join(g["label"] for g in gs[:4]) + (f" 외 {len(gs) - 4}" if len(gs) > 4 else "")
+            self.text(c, P, y, name, FS_BODY, "bold", LOSE_C)
+            t = self.text(c, P + name_w, y, f"{labels}   ({combos})", FS_BODY, "bold", TEXT, width=W - 2 * P - name_w)
+            y = c.bbox(t)[3] + s(3)
+        if len(order) > 4:
+            t = self.text(c, P, y, f"그 밖에 {', '.join(n for n, _ in order[4:7])}" + (" …" if len(order) > 7 else ""),
+                          FS_NOTE, fill=MUTED, width=W - 2 * P)
+            y = c.bbox(t)[3] + s(3)
+        return y + s(2)
 
     def render_outs(self, c, y, outs):
         s, W, P = self.s, self.s(self.W), self.s(self.P)

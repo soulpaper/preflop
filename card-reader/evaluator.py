@@ -126,6 +126,52 @@ def evaluate_fast(cards):
     return v
 
 
+def beaters(hero, board):
+    """보드에서 지금 내 패를 이기는 상대 두 장 (남은 카드 전체 조합 기준, 상대 범위는 보지 않음).
+    {"total": 전체 조합 수, "count": 이기는 조합 수, "groups": [{"cat", "name", "label", "combos"}, ...]}
+    groups 는 센 족보 먼저, 같은 족보면 조합 많은 순. label: 두 장이 필요하면 "KQ"·"77"·"♥♥", 한 장으로 되면 "K 한 장"·"♥ 한 장"."""
+    hero, board = list(hero), list(board)
+    me = evaluate(hero + board)
+    dead = set(hero) | set(board)
+    deck = [c for c in range(52) if c not in dead]
+    one_memo = {}
+
+    def alone(k, cat):  # 이 한 장만 더해도 이 족보로 이기나 (다른 한 장은 상관없음)
+        v = one_memo.get(k)
+        if v is None:
+            v = one_memo[k] = evaluate(board + [k])
+        return v > me and v[0] == cat
+
+    groups, total, count = {}, 0, 0
+    for x, y in combinations(deck, 2):
+        total += 1
+        sc = evaluate_fast(board + [x, y])
+        if sc <= me:
+            continue
+        count += 1
+        cat = sc[0]
+        flushy = cat in (5, 8)
+        singles = [k for k in (x, y) if alone(k, cat)]
+        if singles:
+            k = max(singles)
+            label = (SUIT_SYMBOLS[SUITS[k & 3]] if flushy else RANKS[k >> 2]) + " 한 장"
+        elif flushy:
+            label = SUIT_SYMBOLS[SUITS[x & 3]] * 2
+        else:
+            hi, lo = sorted((x >> 2, y >> 2), reverse=True)
+            label = RANKS[hi] + RANKS[lo]
+        name = CATEGORY_NAMES[cat]
+        if cat == 3:
+            name = "트립스" if singles else "셋"
+        if cat == me[0]:
+            name += " (더 높음)"
+        key = (cat, name, label)
+        groups[key] = groups.get(key, 0) + 1
+    out = [{"cat": k[0], "name": k[1], "label": k[2], "combos": n} for k, n in groups.items()]
+    out.sort(key=lambda g: (-g["cat"], -g["combos"], g["label"]))
+    return {"total": total, "count": count, "groups": out}
+
+
 def _showdown(hero, opps, board):
     """hero 기준 획득 지분 (승=1, k명 무승부=1/k, 패=0)과 결과 종류."""
     h = evaluate_fast(hero + board)
