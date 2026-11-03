@@ -16,3 +16,6 @@ RestartSec=60
 KillMode=control-group
 TimeoutStopSec=60
 OOMScoreAdjust=500
+
+[Install]
+WantedBy=default.target

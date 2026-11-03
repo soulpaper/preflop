@@ -26,4 +26,6 @@ out="$(ACTIVE_RC=0 GTO_HOUR=4 bash "$here/gto-mode-sync.sh")"; check "active 4�
 out="$(ACTIVE_RC=0 GTO_HOUR=21 bash "$here/gto-mode-sync.sh")"; check "active 21시 -> --set-mode low" "$out" "FAKE-RUNNER --set-mode low"
 out="$(ACTIVE_RC=3 GTO_HOUR=21 bash "$here/gto-mode-sync.sh")"; rc=$?
 check "inactive: 러너 호출 없음" "$(echo "$out" | grep -c FAKE-RUNNER)" 0
+grep -q "^\[Install\]" "$here/gto-runner.service"; check "gto-runner.service 에 [Install] 있음" $? 0
+grep -q "^WantedBy=default.target" "$here/gto-runner.service"; check "gto-runner.service WantedBy=default.target" $? 0
 exit $fail

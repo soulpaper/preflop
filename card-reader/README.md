@@ -113,7 +113,7 @@ CARD_READER_DIR=<card-reader 저장소 폴더>
 3. 환경 파일을 만들고 유닛 3개를 `~/.config/systemd/user/`에 복사, `systemctl --user daemon-reload`.
 4. `solves/STOP`을 지운다.
 5. `systemctl --user start gto-runner.service` 후 `python3 build_gto_lib.py --status`와 `solves/batch-service.log`로 확인한다.
-6. 정상이면 `systemctl --user enable gto-runner.service` 와 `systemctl --user enable --now gto-mode.timer`. 부팅 후에도 돌리려면 `loginctl enable-linger <사용자>`가 필요하다.
+6. 정상이면 `systemctl --user enable gto-runner.service` (`[Install] WantedBy=default.target`이라 부팅 때 자동 시작)와 `systemctl --user enable --now gto-mode.timer`. 로그인하지 않은 부팅에서도 돌리려면 `loginctl enable-linger "$USER"`가 필요하다(`loginctl show-user "$USER" -p Linger`로 확인).
 
 주의: `systemctl --user stop gto-runner.service`(와 재부팅)는 SIGTERM 뒤 control-group 전체를 정리하므로 진행 중 솔브가 사라진다. 완료된 솔브는 보존되고 다음 시작 때 이어서 푼다. 솔브를 지키며 멈추려면 `--stop`을 쓴다. 이미 돌고 있는 러너에는 코드 수정이 적용되지 않으므로 재시작 때 반영된다.
 
