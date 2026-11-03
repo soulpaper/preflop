@@ -269,6 +269,62 @@ test("SB 블라인드→콜, 체크·체크·리버 벳 (A9439): 투페어 비�
 test("SB 블라인드→콜, 체크·체크·리버 벳 (A9439): 범위 폭 5% 이상 (상위 2% 로 좁혀지지 않음)",
      _sb["width_pct"] >= 5, f"{_sb['width_pct']}%")
 
+# --- 주도권: 리드 vs C-벳 / 딜레이드 벳 ------------------------------------------------------
+_B = [{"a": "bet", "size": 0.66}]
+_lead = one({"pos": "BB", "preflop": ["blind", "call"], "flop": [{"a": "lead", "size": 0.66}]}, ["Kd", "8h", "3c"])
+_cbet = one({"pos": "BB", "preflop": ["blind", "call"], "flop": [{"a": "cbet", "size": 0.66}]}, ["Kd", "8h", "3c"])
+_plain = one({"pos": "BB", "preflop": ["blind", "call"], "flop": [{"a": "bet", "size": 0.66}]}, ["Kd", "8h", "3c"])
+_MADE = ("스트레이트 이상", "셋/트립스", "투페어", "탑페어+", "중간·약한 페어")
+test("같은 사이즈 플랍 벳: 리드가 C-벳보다 made 비중 높음", cl(_lead, *_MADE) > cl(_cbet, *_MADE) + 8,
+     f"리드 {cl(_lead, *_MADE):.0f}% vs c-bet {cl(_cbet, *_MADE):.0f}%")
+test("같은 사이즈 플랍 벳: 리드가 C-벳보다 에어(노페어) 적음", _lead["classes"]["노페어"] < _cbet["classes"]["노페어"] * 0.7,
+     f"리드 {_lead['classes']['노페어']}% vs c-bet {_cbet['classes']['노페어']}%")
+test("C-벳은 일반 벳보다 넓다 (에어 유지), 리드는 일반 벳보다 좁다",
+     _cbet["classes"]["노페어"] > _plain["classes"]["노페어"] > _lead["classes"]["노페어"]
+     and _cbet["width_pct"] > _plain["width_pct"] > _lead["width_pct"],
+     f"폭 {_cbet['width_pct']} / {_plain['width_pct']} / {_lead['width_pct']}")
+test("리드 벳 노트에 설명이 나온다", "콜하고 먼저 벳" in _lead["note"] and "리드 벳" in _lead["note"], _lead["note"])
+test("MULT 행: 모든 역할 x 크기", all(f"{r}_{z}" in hr.MULT and f"{r}_{z}" in hr.KIND_KO and f"{r}_{z}" in hr.KIND_NOTE
+                                   for r in hr.ROLE_ADJ for z in ("small", "med", "big")))
+_seatr = one({"pos": "BB", "preflop": ["blind", "call"], "flop": [{"a": "bet", "size": 0.66}], "bet_role": {"flop": "lead"}},
+             ["Kd", "8h", "3c"])
+test("좌석 bet_role 로 지정해도 리드와 같다", abs(_seatr["width_pct"] - _lead["width_pct"]) < 1e-6)
+_BR = ["Kd", "8h", "3c", "Ts"]       # 턴에 T: 87/T9/QJ 등 좋아진 패
+_xb = {"pos": "CO", "preflop": ["open"], "flop": ["check"]}
+_delay = one(dict(_xb, turn=[{"a": "delay", "size": 0.66}]), _BR)
+_cb_t = one(dict(_xb, turn=[{"a": "cbet", "size": 0.66}]), _BR)
+test("플랍 체크 후 딜레이드 턴 벳: 턴에 좋아진 패(탑페어+) 비중이 C-벳보다 높음", cl(_delay, "탑페어+", *STRONG) > cl(_cb_t, "탑페어+", *STRONG) + 3,
+     f"{cl(_delay, '탑페어+', *STRONG):.0f}% vs {cl(_cb_t, '탑페어+', *STRONG):.0f}%")
+_probe = one({"pos": "BB", "preflop": ["blind", "call"], "flop": ["check"], "turn": [{"a": "probe", "size": 0.66}]}, _BR)
+_lead_t = one({"pos": "BB", "preflop": ["blind", "call"], "flop": ["check"], "turn": [{"a": "lead", "size": 0.66}]}, _BR)
+test("프로브(체크 넘어온 턴 벳): 좋아진 패가 리드보다 높음", cl(_probe, "탑페어+", *STRONG) > cl(_lead_t, "탑페어+", *STRONG),
+     f"{cl(_probe, '탑페어+', *STRONG):.0f}% vs {cl(_lead_t, '탑페어+', *STRONG):.0f}%")
+# handlog.to_handread 가 역할을 붙인다
+import handlog as _hl
+_pos = {"A": "CO", "B": "BB", "C": "BTN"}
+def _a(seat, act, **kw):
+    return dict(seat=seat, act=act, **kw)
+_h1 = _hl.to_handread({"preflop": [_a("A", "raise", raises_before=0), _a("B", "call", raises_before=1)],
+                       "flop": [_a("B", "bet"), _a("A", "call")], "turn": [_a("B", "check"), _a("A", "bet"), _a("B", "call")]}, _pos)
+test("to_handread: 콜러 선벳 = lead, 턴 어그레서 없이 체크 → 어그레서 벳 = cbet(턴 주도권)",
+     _h1["B"]["bet_role"] == {"flop": "lead"} and _h1["A"].get("bet_role") == {"turn": "cbet"} or _h1["A"].get("bet_role") == {"turn": "lead"},
+     str({k: v.get("bet_role") for k, v in _h1.items()}))
+_h2 = _hl.to_handread({"preflop": [_a("A", "raise", raises_before=0), _a("B", "call", raises_before=1)],
+                       "flop": [_a("B", "check"), _a("A", "bet"), _a("B", "call")],
+                       "turn": [_a("B", "bet"), _a("A", "call")]}, _pos)
+test("to_handread: 플랍 어그레서 cbet, 턴 콜러가 어그레서에게 선벳 = lead",
+     _h2["A"]["bet_role"] == {"flop": "cbet"} and _h2["B"]["bet_role"] == {"turn": "lead"}, str(_h2))
+_h3 = _hl.to_handread({"preflop": [_a("A", "raise", raises_before=0), _a("B", "call", raises_before=1)],
+                       "flop": [_a("B", "check"), _a("A", "check")],
+                       "turn": [_a("B", "bet"), _a("A", "call")]}, _pos)
+_h4 = _hl.to_handread({"preflop": [_a("A", "raise", raises_before=0), _a("B", "call", raises_before=1)],
+                       "flop": [_a("B", "check"), _a("A", "check")],
+                       "turn": [_a("B", "check"), _a("A", "bet"), _a("B", "call")]}, _pos)
+test("to_handread: 체크 넘어온 턴 — 콜러 = probe, 어그레서 = delay",
+     _h3["B"]["bet_role"] == {"turn": "probe"} and _h4["A"]["bet_role"] == {"turn": "delay"})
+_h5 = _hl.to_handread({"preflop": [_a("A", "call", raises_before=0), _a("B", "check")], "flop": [_a("B", "bet")]}, _pos)
+test("to_handread: 림프 팟(프리플랍 레이저 없음)은 역할 없음", "bet_role" not in _h5["B"])
+
 # --- 결과 ---------------------------------------------------------------------------------------
 failed = 0
 for ok, name, info in results:

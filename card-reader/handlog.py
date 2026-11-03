@@ -683,16 +683,32 @@ def to_handread(actions, pos):
         else:
             continue
         out[k]["preflop"].append(word)
+    # 주도권: 프리플랍 마지막 레이저 = 어그레서. 스트리트의 첫 벳이 (이전 스트리트 어그레서의 벳 = cbet / 어그레서 없이 콜러가 리드 = lead /
+    # 어그레서가 앞 스트리트를 체크로 넘기고 벳 = delay / 체크로 넘어온 스트리트에 콜러가 벳 = probe)
+    pre_raises = [a["seat"] for a in actions.get("preflop", []) if a["act"] == "raise" and a["seat"] in out]
+    aggr = pre_raises[-1] if pre_raises else None
+    prev_street_aggr = aggr
     for street in STREETS[1:]:
+        street_aggr, first_bet = None, True
         for a in actions.get(street, []):
             k, act = a["seat"], a["act"]
             if k not in out or act not in ("check", "bet", "call", "raise", "fold"):
                 continue
+            if act in ("bet", "raise"):
+                first, first_bet = first_bet, False
+                street_aggr = k
+                if first and act == "bet" and aggr is not None and not a.get("allin"):
+                    if street == "flop" or prev_street_aggr is not None:
+                        role = "cbet" if k == prev_street_aggr else "lead"
+                    else:   # 앞 스트리트가 체크로 끝남
+                        role = "delay" if k == aggr else "probe"
+                    out[k].setdefault("bet_role", {})[street] = role
             seq = out[k][street]
             word = "allin" if a.get("allin") and act in ("bet", "raise") else act
             if act == "raise" and "check" in seq:
                 word = "checkraise"
             seq.append(word)
+        prev_street_aggr = street_aggr
     for k in out:
         if opener and out[k]["pos"] != opener:
             out[k]["opener"] = opener

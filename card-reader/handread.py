@@ -34,6 +34,9 @@
   에어에 부분 가중)로 분류하고 액션별 배율표를 곱한다.
     작은 벳 병합 · 큰 벳/레이즈 양극화(중간 페어 크게 감소) · 체크레이즈 강+양극화 ·
     콜 응축(중간·드로우 유지, 최강 약간 감소, 에어 크게 감소) · 체크 캡(최강 일부 감소, 슬로플레이 잔존)
+  주도권: 벳은 누가 했나로 나뉜다 — cbet(주도권 있음: 넓게) / lead(콜하고 먼저 벳: 맞은 패 위주) /
+    delay(어그레서가 체크 후 늦게 벳) / probe(체크로 넘어온 뒤 콜러가 벳) — 후자 둘은 이번 스트리트에 좋아진 패를 더 올린다.
+    액션 이름으로 직접 'lead' 등을 주거나, 좌석에 "bet_role": {"flop": "lead", ...} 를 주면 그 스트리트 첫 벳에 적용(없으면 일반 벳).
   프로필(신뢰될 때만, 가중치 = hands/(hands+50)):
     fold_to_bet 높음 → 계속하는 레인지가 더 강함 / 낮음(콜링스테이션) → 약한 패가 더 남음
     AF 높음 → 벳 레인지에 블러프 증가, 낮음 → 벳이 강함 (콜/체크에서는 반대로 최강 패 비중 조정)
@@ -68,12 +71,39 @@ MULT = {
     "call_big":   ([0.75, 0.90, 0.90, 0.65, 0.08], 0.85),
     "check":      ([0.40, 0.65, 0.85, 1.00, 1.00], 1.00),
 }
-_AGGR = ("bet_small", "bet_med", "bet_big", "raise", "checkraise", "allin")
+# --- 주도권(이니셔티브)별 벳 --------------------------------------------------------------
+#   같은 크기의 벳도 '누가 벳했나'에 따라 범위가 다르다. 크기별 기본 행(bet_*)에 역할 보정 [N, W, T, M, A] 과 드로우 배율을 곱해
+#   MULT 에 lead_/cbet_/delay_/probe_ + small/med/big 행을 만든다 (실제 곱셈 결과는 MULT 에서 그대로 확인 가능).
+#   cbet  주도권 있는 쪽(프리플랍 어그레서, 이전 스트리트 마지막 벳/레이즈)의 컨티뉴에이션 → 넓다: 에어·약한 페어 유지
+#   lead  주도권 없이(콜러가 레이저에게, 또는 이전 스트리트 어그레서에게) 먼저 벳 → 보드에 맞은 패 위주, 에어 크게 감소
+#   delay 어그레서가 앞 스트리트를 체크로 넘기고 늦게 벳 → 체크로 캡된 범위, 이번 스트리트에 좋아진 패 위주(IMPROVE)
+#   probe 콜러가 체크로 넘어온 스트리트에 벳 → 리드와 비슷, 이번 스트리트에 좋아진 패 위주(IMPROVE)
+ROLE_ADJ = {
+    "cbet":  ([1.00, 1.00, 1.00, 1.15, 1.70], 1.15),
+    "lead":  ([1.15, 1.15, 1.10, 0.95, 0.55], 0.95),
+    "delay": ([1.10, 1.10, 1.00, 0.90, 0.70], 1.00),
+    "probe": ([1.10, 1.10, 1.10, 1.00, 0.60], 0.95),
+}
+IMPROVE = {"delay": 1.35, "probe": 1.35}   # 직전 스트리트 보드보다 이번 스트리트에 좋아진 콤보의 추가 배율
+for _r, (_adj, _dadj) in ROLE_ADJ.items():
+    for _sz in ("small", "med", "big"):
+        _b, _d = MULT["bet_" + _sz]
+        MULT[f"{_r}_{_sz}"] = ([x * y for x, y in zip(_b, _adj)], min(1.0, _d * _dadj))
+_AGGR = ("bet_small", "bet_med", "bet_big", "raise", "checkraise", "allin") + tuple(
+    f"{r}_{s}" for r in ROLE_ADJ for s in ("small", "med", "big"))
 _CALL = ("call_small", "call_med", "call_big")
 SMALL_BET, BIG_BET, DEFAULT_SIZE = 0.40, 0.75, 0.55
 
 KIND_KO = {"bet_small": "작은 벳", "bet_med": "벳", "bet_big": "큰 벳", "raise": "레이즈", "checkraise": "체크레이즈",
            "allin": "올인", "call_small": "콜", "call_med": "콜", "call_big": "콜", "check": "체크"}
+_ROLE_KO = {"cbet": "C-벳", "lead": "리드 벳", "delay": "딜레이드 벳", "probe": "프로브 벳"}
+_ROLE_NOTE = {
+    "cbet": "주도권 있는 컨티뉴에이션 → 에어도 섞인 넓은 범위",
+    "lead": "콜하고 먼저 벳 → 보드에 맞은 패 위주",
+    "delay": "체크 후 늦게 벳 → 이번 카드로 좋아진 패 위주",
+    "probe": "체크로 넘어온 뒤 먼저 벳 → 이번 카드로 좋아진 패 위주",
+}
+_SIZE_KO = {"small": "작은 ", "med": "", "big": "큰 "}
 KIND_NOTE = {
     "bet_small": "얇은 밸류와 약한 패가 섞인 넓은 범위",
     "bet_med": "밸류 위주, 일부 드로우·블러프",
@@ -86,6 +116,10 @@ KIND_NOTE = {
     "call_big": "강한 패·드로우 위주 (약한 페어는 줄어듦)",
     "check": "캡된 범위 (최강 패는 줄어듦)",
 }
+for _r in ROLE_ADJ:
+    for _sz, _pre in _SIZE_KO.items():
+        KIND_KO[f"{_r}_{_sz}"] = _pre + _ROLE_KO[_r]
+        KIND_NOTE[f"{_r}_{_sz}"] = _ROLE_NOTE[_r] + (" (큰 사이즈: 강한 패·드로우 더 집중)" if _sz == "big" else "")
 PRE_KO = {"open": "오픈", "limp": "림프", "call": "콜", "call_open": "콜", "3bet": "3벳", "call_3bet": "3벳콜",
           "4bet": "4벳", "jam": "올인", "call_jam": "올인콜", "check": "체크", "blind": "블라인드"}
 
@@ -94,8 +128,9 @@ _PRE_ALIAS = {"raise": "open", "cold_call": "call", "limp_call": "limp", "3-bet"
               "4-bet": "4bet", "fourbet": "4bet", "5bet": "jam", "allin": "jam", "all_in": "jam", "call_open": "call",
               "call_allin": "call_jam"}
 _POST_ALIAS = {"check_raise": "checkraise", "check-raise": "checkraise", "cr": "checkraise", "xr": "checkraise",
-               "all_in": "allin", "all-in": "allin", "jam": "allin", "donk": "bet", "lead": "bet", "cbet": "bet",
-               "c-bet": "bet", "limp": "call", "x": "check"}
+               "all_in": "allin", "all-in": "allin", "jam": "allin", "donk": "lead", "c-bet": "cbet",
+               "delayed": "delay", "delayed_cbet": "delay", "limp": "call", "x": "check"}
+_ROLES = tuple(ROLE_ADJ)
 
 
 def _split_action(a):
@@ -124,13 +159,18 @@ def _norm_pre(actions):
     return out
 
 
-def _norm_post(actions):
-    """스트리트 액션 → [(kind, size)] ; fold 제외, 체크→레이즈는 체크레이즈 하나로 합친다."""
+def _norm_post(actions, role=None):
+    """스트리트 액션 → [(kind, size)] ; fold 제외, 체크→레이즈는 체크레이즈 하나로 합친다.
+    role(cbet/lead/delay/probe): 이 스트리트 첫 벳에 붙일 주도권 역할 (액션 이름으로 직접 'lead' 등을 줘도 된다)."""
     raw = []
     for a in actions or []:
         n, s = _split_action(a)
         n = _POST_ALIAS.get(n, n)
-        if n in ("check", "bet", "call", "raise", "checkraise", "allin"):
+        if n in _ROLES:
+            raw.append((n, s))
+        elif n in ("check", "bet", "call", "raise", "checkraise", "allin"):
+            if n == "bet" and role in _ROLES and not any(x[0] in _ROLES or x[0] == "bet" for x in raw):
+                n = role
             raw.append((n, s))
     out = []
     for n, s in raw:
@@ -140,9 +180,9 @@ def _norm_post(actions):
         out.append((n, s))
     kinds = []
     for n, s in out:
-        if n == "bet":
+        if n == "bet" or n in _ROLES:
             sz = DEFAULT_SIZE if s is None else s
-            kinds.append(("bet_small" if sz <= SMALL_BET else "bet_big" if sz >= BIG_BET else "bet_med", s))
+            kinds.append((f"{n}_" + ("small" if sz <= SMALL_BET else "big" if sz >= BIG_BET else "med"), s))
         elif n == "call":
             sz = DEFAULT_SIZE if s is None else s
             kinds.append(("call_small" if sz <= SMALL_BET else "call_big" if sz >= BIG_BET else "call_med", s))
@@ -417,15 +457,20 @@ def _kind_mults(kind, adj_f, afx):
     return m, d
 
 
-def _apply_kind(weights, bi, kind, adj_f, afx, combos):
+def _apply_kind(weights, bi, kind, adj_f, afx, combos, prev_bi=None):
     m, d = _kind_mults(kind, adj_f, afx)
     cls = _classify
+    boost = IMPROVE.get(kind.split("_")[0], 1.0) if prev_bi is not None else 1.0
     for i, key in enumerate(combos):
         w = weights[i]
         if w <= 0:
             continue
         b, _, df = cls(bi, key[0], key[1])
         f = m[b]
+        if boost != 1.0:   # 이번 스트리트에 좋아진 패(약한 패/에어 → 페어 이상, 또는 드로우 완성)
+            pb = cls(prev_bi, key[0], key[1])[0]
+            if b <= T and pb > b and (pb >= M or b <= W):
+                f *= boost
         if df:
             if b == A:
                 f = f + df * (d - f)
@@ -537,15 +582,16 @@ def _estimate_one(seat, board, players, dead, profile, stack_bb, ante=False):
     n_actions = 0
     skipped = False
     for name, need, ko in _STREETS:
-        kinds = _norm_post(seat.get(name))
+        kinds = _norm_post(seat.get(name), (seat.get("bet_role") or {}).get(name))
         if not kinds:
             continue
         if nb < need:
             skipped = True
             continue
         bi = _board_info(board[:need])
+        prev_bi = _board_info(board[:need - 1]) if need > 3 else None
         for kind, _ in kinds:
-            _apply_kind(weights, bi, kind, adj_f, afx, combos)
+            _apply_kind(weights, bi, kind, adj_f, afx, combos, prev_bi)
             last_kind, last_street = kind, ko
             n_actions += 1
         if sum(weights) <= 0:
