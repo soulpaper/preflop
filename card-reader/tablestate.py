@@ -10,8 +10,10 @@
   나               내 카드가 뒷면이거나 내 아바타가 흑백이면 폴드
   딜러/블라인드      펠트 위 흰 원판 (D: 검은 글자, SB: 파란 글자, BB: 빨간 글자) → 가장 가까운 좌석의 벳 자리
   액션 바           폴드/콜/레이즈 버튼. 버튼 왼쪽에 작은 램프 칸이 있으면 '예약' 버튼 (내 차례 아님)
-  말풍선            콜(파랑)/레이즈(주황)/올인(빨강)/폴드(밝은 회색)/자리 비움(커피잔)/체크(초록, 추정) → seats[].bubble
+  말풍선            콜(파랑)/레이즈(주황)/올인(빨강)/폴드(밝은 회색)/자리 비움(커피잔)/체크(민트) → seats[].bubble
                     'call'/'raise'/'allin'/'fold'/'away'/'check'/None. handlog.Tracker 가 액션 증거로 씀
+  차례 고리        지금 액션할 사람 아바타 둘레의 카운트다운 고리 (약 9.8초) → acting_seat (좌석 키/None),
+                    acting_progress (쓴 시간 비율 0..1/None). 고리가 흐려지는 마지막 ~30% 와 불확실하면 None
   좌석              보정 결과에 geom 이 있으면 모든 고정 자리(layout.slot_seats: 9인+6인 합집합 9자리 + 나)를 매 프레임
                     픽셀로 확인 → 보정 뒤에 앉거나 떠난 사람도 반영. 키는 자리 이름 ('seat_BL'.. / 'hero')이라 바뀌지 않음.
                     geom 이 없는 옛 보정이면 보정 때 좌석만 확인하고 notes 에 '다시 자동 지정 필요'
@@ -50,6 +52,17 @@ MID_BLUE = 0.15         # 가운데 버튼이 '콜' (파란 바탕 비율, 실�
 MID_TEAL = 0.08         # 가운데 버튼이 '체크' (청록 바탕 비율, 실측 ≥0.16, 다른 화면 0.00)
 AVATAR_STD = 40        # 아바타 가운데 원 밝기 표준편차가 이보다 크면 사람 있음 (실측 사람 ≥48, 빈 자리 ≤30)
 LEFT_SLOTS = {"BL", "L", "UL", "TL"}  # 테이블 왼쪽 좌석: 카드 아이콘이 아바타 오른쪽, 말풍선은 왼쪽
+# 차례 고리: 지금 액션할 사람 아바타 둘레의 빛 고리 = 약 9.8초 카운트다운 (녹화 252턴 실측).
+#   반짝이가 12시에서 시계 방향으로 돌고, 지나간 쪽은 어두운 회색 트랙, 남은 쪽(반짝이 → 약 315°)이 빛남.
+#   색은 파랑 → 보라 → 자홍 → 빨강으로 바뀜. 오른쪽 절반은 금색/흰색 하이라이트. 반짝이 각도 / 360° ≈ 쓴 시간 비율.
+#   마지막 ~30% (자홍/빨강, 걱정하는 얼굴) 는 고리가 흐려져서 못 잡음 → None.
+RING_BINS = 48                     # 각도 칸 (7.5°)
+RING_END = 42                      # 고리 빛은 315° 근처에서 끝남 (그 뒤 12시까지는 원래 흐림)
+RING_RADII = (1.0, 1.05, 1.1, 1.15, 1.2, 1.25)   # 아바타 반지름 배수 (보정 중심이 조금 어긋나도 잡게 넓게)
+RING_OUTER = 1.45                  # 이 바깥까지 같은 색이면 고리가 아님 (쇼다운 보라 화면 등)
+RING_HUE = (95, 172)               # 파랑~자홍 (빨강 제외: 올인 불꽃·펠트와 겹침)
+RING_MIN_LIT = 0.55                # 남은 구간에서 빛나는 칸 비율 (아이콘·머리카락이 일부 가림)
+RING_PROGRESS_LIT = 0.7            # 진행도는 이만큼 깨끗할 때만 (머리카락이 반짝이 쪽을 가리면 각도가 틀림)
 
 # 카드 뒷면 아이콘 (그레이 36x30, pw=228 화면에서 잘라 냄)
 _ICON_B64 = (
@@ -407,6 +420,20 @@ class TableReader:
         layout_ok = hero is None or hero["stack_box"] is not None
         if not layout_ok:
             notes.append("내 스택이 안 보임: 화면이 보정과 다름 (창 이동/크기 변경?) → 다시 자동 지정")
+        # 8. 차례 고리: 앉아 있고 폴드/올인 아닌 좌석 중 딱 한 곳일 때만 (둘 이상이면 모름)
+        rings = {}
+        if layout_ok:
+            for s in seats:
+                if s["occupied"] and not s["folded"] and not s["allin"] and s["bubble"] != "allin":
+                    r = self._ring(hsv, s["cfg"]["avatar"])
+                    if r is not None:
+                        rings[s["key"]] = r
+            if len(rings) > 1:
+                notes.append("차례 고리가 여러 곳: " + ", ".join(rings))
+        acting = next(iter(rings)) if len(rings) == 1 else None
+        if hero is not None and "hero" in rings and hero["bubble"] == "call":
+            # 내 아바타는 커서 말풍선 칸이 내 차례 고리(파란 빛)와 겹침 → 파란 '콜' 로 잘못 읽음 (감사 5/5 장 오인식)
+            hero["bubble"] = None
         state = {
             "players": sum(1 for s in seats if s["occupied"]) if layout_ok else None,
             "layout_ok": layout_ok,
@@ -430,6 +457,8 @@ class TableReader:
             "call": call,
             "can_check": can_check,
             "can_raise": bool(to_act and bar_st["raise"]),
+            "acting_seat": acting,      # 차례 고리가 있는 좌석 키 (모르면 None)
+            "acting_progress": rings[acting]["progress"] if acting else None,  # 쓴 시간 비율 0..1 (약 9.8초 기준)
             "street": None,
             "facing_allin": False,
             "preflop": None,
@@ -616,11 +645,14 @@ class TableReader:
         """아바타 바깥쪽 말풍선 → 액션 이름 또는 None. 빛 고리(더 밝고 진함)는 범위 밖.
 
         색으로 가림 (samples/ 7장 실측, 창 0.18x0.16pw):
-          'call'  파랑 (≥0.14)            'raise' 주황 (≥0.13) — 벳도 같은 색일 수 있음 (샘플 없음, 앞선 벳으로 구별)
-          'allin' 빨강 빛 (빨강 0.17 > 주황 0.09)
+          'call'  파랑 (≥0.14)            'raise' 주황 (≥0.13) — '벳' 말풍선도 같은 색 (채도가 조금 낮음 ~110)
+          'allin' 빨강 + 주황 불꽃 (빨강 0.17 이상, 주황의 절반 이상)
           'fold'  밝은 회색 말풍선 + 검은 글자 (밝은 회색 0.24~0.35, 흰색 ≤0.007)
           'away'  회색 말풍선 + 흰 커피잔 (자리 비움; 흰색 0.029)
-          'check' 초록 (샘플 없음 — 추정)
+          'check' 민트색 (색상 70~89, 채도 ~100, 밝기 ~175) — 예전 기준(채도 >120)은 한 번도 못 잡았음
+        2026-11-04 녹화 감사 (내 차례 첫 프레임 66장, 좌석 403칸 수작업 라벨, 보이는 말풍선 170개):
+          맞음 127 → 162, 틀린 종류·없는데 읽음 9 → 0 (내 '콜' 오인식은 read() 에서 내 차례 고리로 거름).
+        남은 놓침: 왼쪽 좌석의 커피잔 아이콘(말풍선 반대편에 뜸), 나타나는 중인 작은 말풍선.
         """
         ax, ay, ar = s["cfg"]["avatar"]
         is_hero = s["key"] == "hero"
@@ -630,23 +662,72 @@ class TableReader:
         if win.size == 0:
             return None
         h, sat, v = win[:, 0], win[:, 1], win[:, 2]
-        blue = ((h >= 100) & (h <= 112) & (sat >= 140) & (sat <= 195) & (v >= 180) & (v <= 235)).mean()
-        orange = ((h >= 5) & (h <= 25) & (sat > 140) & (v > 180)).mean()
+        blue = ((h >= 100) & (h <= 112) & (sat >= 100) & (sat <= 195) & (v >= 180) & (v <= 235)).mean()
+        orange = ((h >= 5) & (h <= 25) & (sat > 90) & (v > 180)).mean()
         red = (((h <= 4) | (h >= 170)) & (sat > 140) & (v > 150)).mean()
-        green = ((h >= 40) & (h <= 90) & (sat > 120) & (v > 150)).mean()
+        green = ((h >= 65) & (h <= 95) & (sat >= 60) & (sat <= 150) & (v >= 140) & (v <= 215)).mean()
         light = ((sat < 35) & (v >= 150) & (v <= 240)).mean()
         white = ((sat < 25) & (v > 235)).mean()
-        if red > 0.10 and red > orange:
+        if red > 0.10 and red > 0.5 * orange:  # 올인 말풍선은 주황 불꽃이 둘러쌈 (레이즈 말풍선엔 빨강이 거의 없음)
             return "allin"
         if blue > 0.12:
             return "call"
         if orange > 0.08:
             return "raise"
-        if green > 0.12:
+        if green > 0.10:
             return "check"
         if light > 0.15:
             return "away" if white > 0.015 else "fold"
         return None
+
+    _ring_xy = {}
+
+    @classmethod
+    def _ring(cls, hsv, avatar):
+        """아바타 둘레의 차례 고리 → {'k': 반짝이 칸, 'progress': 0..1 또는 None, ...} 또는 None (고리 없음/불확실).
+
+        각도 48칸 × 반지름 6개 픽셀만 봄 (좌석당 ~0.1ms). 칸마다 '색 있음' (파랑~자홍, 진하고 밝음) /
+        '빛남' (색 있음 또는 흰·금색 하이라이트). 남은 구간 [k, 315°) 가 빛나고 그 앞 [0, k) 는 어두운 계단 모양에
+        가장 잘 맞는 k 를 고른다. 고리 판정 (녹화 4개 세션에서 맞춘 값):
+          남은 구간 빛남 ≥ 55%, 색 칸 ≥ max(5, 15%), k 앞의 색 칸 ≤ 1, 왼쪽 위(210°~315°)에 색 칸 ≥ 2,
+          바깥(1.45r)까지 같은 색인 칸이 적음, 파란 색만 짧게(10칸 미만) 있으면 '콜' 말풍선이라 아님."""
+        ax, ay, ar = avatar
+        H, W = hsv.shape[:2]
+        key = (ax, ay, ar, H, W)
+        xy = cls._ring_xy.get(key)
+        if xy is None:
+            t = (np.arange(RING_BINS) + 0.5) * 2 * np.pi / RING_BINS
+            rf = np.array(RING_RADII + (RING_OUTER,))[:, None]
+            xs = np.rint(ax + rf * ar * np.sin(t)).astype(int)
+            ys = np.rint(ay - rf * ar * np.cos(t)).astype(int)
+            ok = (xs >= 0) & (xs < W) & (ys >= 0) & (ys < H)
+            xy = cls._ring_xy[key] = (np.clip(ys, 0, H - 1), np.clip(xs, 0, W - 1), ok)
+            if len(cls._ring_xy) > 256:
+                cls._ring_xy.clear()
+        ys, xs, ok = xy
+        px = hsv[ys, xs].astype(np.int16)
+        h, s, v = px[..., 0], px[..., 1], px[..., 2]
+        col = (s >= 110) & (v >= 215) & (h >= RING_HUE[0]) & (h <= RING_HUE[1]) & ok
+        n = len(RING_RADII)
+        colored = col[:n].sum(0) >= 2
+        blue = (col[:n] & (h[:n] <= 118)).sum(0) >= 2
+        lit = colored | (((s[:n] < 110) & (v[:n] >= 235) & ok[:n]).sum(0) >= 1)
+        end = RING_END
+        pre = np.concatenate(([0], np.cumsum(lit[:end])))
+        ks = np.arange(end - 3)
+        k = int(np.argmax(pre[end] + ks - 2 * pre[ks]))  # 남은 구간은 빛나고 앞 구간은 어두운 정도
+        arc = end - k
+        lit_frac = float(pre[end] - pre[k]) / arc
+        c_in = int(colored[k:end].sum())
+        idx = np.flatnonzero(colored[k:end])
+        span = int(idx[-1] - idx[0] + 1) if idx.size else 0
+        if (c_in < max(5, 0.15 * arc) or int(colored[:k].sum()) > 1 or lit_frac < RING_MIN_LIT
+                or int(colored[28:end].sum()) < 2 or int(col[n][k:end].sum()) > max(2, 0.25 * arc)):
+            return None
+        if 2 * int(blue[k:end].sum()) > c_in and span < 10:
+            return None
+        return {"k": k, "lit": round(lit_frac, 2),
+                "progress": round(k / RING_BINS, 2) if lit_frac >= RING_PROGRESS_LIT else None}
 
     # --- 포지션 ---------------------------------------------------------------------------
     @staticmethod

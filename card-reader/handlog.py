@@ -20,6 +20,10 @@
   - 한 프레임 사이에 여러 액션: 지난번 마지막 행동자 다음부터 행동 순서대로 처리. '콜' 말풍선인데 금액이 지금 최대보다
     크면 같은 프레임의 레이즈 뒤로 미룸. 같은 사람이 벳하고 폴드까지 했으면 폴드는 맨 뒤.
   - 다음 스트리트에 남아 있는데 금액을 못 본 사람 = 콜로 추정 (issues 에 남김)
+차례 고리 (state['acting_seat'], 있으면)
+  - rec['turns']: 스트리트별 차례 [{street, seat, t0, t1, p(본 최대 진행도)}] — 결정 시간(텔) 분석용
+  - 고리가 다음 사람으로 넘어갔는데 그 사람의 새 액션을 RING_GRACE 프레임 안에 못 읽음 → issue 'ring_no_action' (참고용,
+    액션을 지어내지 않음)
 믿을 수 없는 핸드는 confidence='low' + issues (profiles.Store 는 통계에 안 넣고 JSONL 에만 표시해 저장)
 
 절대 예외를 밖으로 내지 않는다 (update/flush 는 실패하면 [] 반환, 진행 중 핸드는 low 로 표시).
@@ -34,9 +38,11 @@ WOBBLE_BB, WOBBLE_FRAC = 0.15, 0.10   # 직전 콜보다 이만큼(BB 또는 비
 SB_AMOUNT, BB_AMOUNT = 0.5, 1.0
 GAP_FATAL = 8.0            # 핸드 중 프레임 간격이 이보다 길면 놓친 액션이 있을 수 있음 → low
 STALE_HAND = 90.0          # 이만큼 새 프레임이 없으면 진행 중 핸드를 닫음
+TURN_GAP = 3.5             # 같은 자리의 차례 고리가 이 간격 안에 다시 보이면 같은 차례
+RING_GRACE = 2             # 고리가 다음 사람으로 넘어간 뒤 이 프레임 수 안에 액션이 안 읽히면 ring_no_action
 PRE_RANK = ("UTG", "U1", "U2", "U3", "MP", "LJ", "HJ", "CO", "BTN", "SB", "BB")
 # 이 문제가 하나라도 있으면 confidence='low' (통계에 안 넣음). 나머지(inferred_call, positions_unknown,
-# bubble_conflict, short_call)는 참고용
+# bubble_conflict, short_call, ring_no_action)는 참고용
 FATAL = {"mid_hand_start", "bet_decreased", "ambiguous_order", "tracker_error", "gap", "allin_unread", "incomplete"}
 
 
@@ -96,6 +102,9 @@ class _Hand:
         self.blind_keys = {}
         self.pos_players = Counter()
         self.late = {}           # 핸드 중간에 처음 카드를 받은 듯 보인 자리 -> 연속 프레임 수 (2프레임째에 추가)
+        self.turns = []          # 차례 고리 (tablestate acting_seat): {street, seat, t0, t1, p} — 결정 시간 분석용
+        self.ring_wait = {}      # 고리가 지나간 자리 -> (스트리트, 남은 프레임, 차례 시작 때 액션 수): 새 액션이 안 읽히면 issue
+        self.turn_acts = 0
 
     def issue(self, code, detail=None):
         if not any(i["code"] == code and i.get("detail") == detail for i in self.issues):
@@ -287,7 +296,37 @@ class Tracker:
             h.notes.append("skipped a frame (possible new hand)")
         elif not h.over:
             self._actions(h, seats)
+            self._turns(h, state, t)
         return out
+
+    def _turns(self, h, state, t):
+        """차례 고리 기록 + 고리가 지나간 자리인데 RING_GRACE 프레임 안에 액션(벳/폴드/체크 말풍선)을 못 읽었으면
+        issue 'ring_no_action' (참고용 — 액션을 지어내지 않음. 스트리트가 끝나면 _close_street 가 하던 대로 추정)."""
+        def n_acts(key):
+            return sum(1 for a in h.actions[STREETS[h.street]] if a["seat"] == key and a["act"] != "post")
+        for k, (street, left, n0) in list(h.ring_wait.items()):
+            seat = h.seats.get(k)
+            if street != h.street or seat is None or seat.folded or n_acts(k) > n0:
+                del h.ring_wait[k]
+            elif left <= 1:
+                h.issue("ring_no_action", f"{k}@{STREETS[street]}")
+                del h.ring_wait[k]
+            else:
+                h.ring_wait[k] = (street, left - 1, n0)
+        k = state.get("acting_seat")
+        if not k or k not in h.seats:
+            return
+        p = _num(state.get("acting_progress"))
+        cur = h.turns[-1] if h.turns else None
+        if cur and cur["seat"] == k and cur["street"] == STREETS[h.street] and t - cur["t1"] <= TURN_GAP:
+            cur["t1"] = round(t, 3)
+            if p is not None:
+                cur["p"] = max(cur["p"] or 0.0, p)
+            return
+        if cur and cur["seat"] != k and cur["street"] == STREETS[h.street] and cur["seat"] in h.seats:
+            h.ring_wait[cur["seat"]] = (h.street, RING_GRACE, h.turn_acts)
+        h.turn_acts = n_acts(k)  # 이 차례가 시작될 때까지 그 사람이 이번 스트리트에 한 액션 수
+        h.turns.append({"street": STREETS[h.street], "seat": k, "t0": round(t, 3), "t1": round(t, 3), "p": p})
 
     def _start(self, state, seats, board, t):
         self.count += 1
@@ -650,6 +689,7 @@ class Tracker:
             "seats": {},
             "issues": h.issues,
             "notes": h.notes,
+            "turns": h.turns,
         }
         for k, seat in h.seats.items():
             name = seat.names.most_common(1)[0][0] if seat.names else (None, False)
