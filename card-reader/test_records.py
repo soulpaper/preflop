@@ -48,6 +48,19 @@ HID0 = "20261105_120000-0001"
 DID0 = HID0 + "/1"
 
 
+WIN = os.name == "nt"
+# 수신기(records_pull)와 POSIX 권한 검사는 리눅스 전용이다
+linux_only = unittest.skipIf(WIN, "리눅스 전용 (수신기, POSIX 권한)")
+
+
+def symlink_or_skip(src, dst):
+    """Windows 는 개발자 모드가 아니면 심볼릭 링크를 못 만든다 (WinError 1314): 시험을 건너뛴다."""
+    try:
+        os.symlink(src, dst)
+    except (OSError, NotImplementedError, AttributeError) as e:
+        raise unittest.SkipTest("심볼릭 링크를 만들 수 없음: %s" % type(e).__name__)
+
+
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 
@@ -561,7 +574,7 @@ class T26_ReadScope(unittest.TestCase):
             wr(base, "hands/pic" + ext, b"img")
             wr(base, "pic" + ext, b"img")
             wr(base, "hands/2026-11-01" + ext, b"img")
-        os.symlink(outside, os.path.join(base, "hands", "2026-11-02.jsonl"))
+        symlink_or_skip(outside, os.path.join(base, "hands", "2026-11-02.jsonl"))
         os.makedirs(os.path.join(base, "hands", "2026-11-03.jsonl"))
         return base
 
@@ -638,7 +651,7 @@ class T26_ReadScope(unittest.TestCase):
         os.makedirs(real, exist_ok=True)
         wr(real, D1, hline(1))
         shutil.rmtree(os.path.join(base, "hands"))
-        os.symlink(real, os.path.join(base, "hands"))
+        symlink_or_skip(real, os.path.join(base, "hands"))
         up = mk(base, fake_cfg(), fake=True)
         self.assertEqual(run(up), 2)
         self.assertEqual(up.puts, [])
@@ -867,7 +880,11 @@ def good_body(name, n=2):
 class PullEnv:
     """수신기 시험 공용 준비 (가짜 서버, 임시 HOME, pull.json)."""
 
+    WIN_OK = ()           # Windows 에서도 도는 시험 이름 (수신기를 쓰지 않는 것)
+
     def setUp(self):
+        if WIN and self._testMethodName not in self.WIN_OK:
+            self.skipTest("수신기는 리눅스 전용")
         self.fs = FakeServer()
         self.home = os.path.join(TMP, "pullhome")
         shutil.rmtree(self.home, ignore_errors=True)
@@ -882,6 +899,8 @@ class PullEnv:
         self.write_cfg()
 
     def tearDown(self):
+        if not hasattr(self, "fs"):
+            return
         self.fs.close()
         os.environ["HOME"] = REAL_HOME
 
@@ -1253,6 +1272,7 @@ class T40_ShrinkFilter(unittest.TestCase):
                 self.assertEqual(up.files[D1]["result"], "shrink_local")
 
 
+@linux_only
 class T41_PullRange(unittest.TestCase):
     def test_41_accept_min(self):
         home = os.path.join(TMP, "t41")
@@ -1302,6 +1322,7 @@ class T42_Stale304(PullEnv, unittest.TestCase):
             self.assertEqual(f.read(), b)
 
 
+@linux_only
 class T43_ConfigPerms(unittest.TestCase):
     def setUp(self):
         self.d = os.path.join(TMP, "t43")
@@ -1337,7 +1358,7 @@ class T43_ConfigPerms(unittest.TestCase):
         os.chmod(self.d, 0o700)
         real = self.p + ".real"
         os.rename(self.p, real)
-        os.symlink(real, self.p)
+        symlink_or_skip(real, self.p)
         self.assertEqual(self.main(), 2)
         os.unlink(self.p)
         os.rename(real, self.p)
@@ -1353,6 +1374,7 @@ class T43_ConfigPerms(unittest.TestCase):
         self.assertIn("chmod 600", str(cm.exception))
         self.assertNotIn("synthetic-pull-token", str(cm.exception))
 
+    @linux_only
     def test_43_upload_config_posix(self):
         base = mkbase("t43u")
         os.chmod(base, 0o700)
@@ -1369,6 +1391,8 @@ class T43_ConfigPerms(unittest.TestCase):
 
 
 class T44_OpenRecheck(PullEnv, unittest.TestCase):
+    WIN_OK = ("test_44_changed_during_open",)
+
     def test_44_changed_during_open(self):
         base = mkbase("t44")
         p = wr(base, "hands/" + D1, hline(1))
@@ -1390,7 +1414,7 @@ class T44_OpenRecheck(PullEnv, unittest.TestCase):
         os.makedirs(os.path.join(self.data, "raw"), mode=0o700)
         outside = os.path.join(self.home, "outside")
         os.makedirs(outside)
-        os.symlink(outside, os.path.join(self.data, "raw", "a"))
+        symlink_or_skip(outside, os.path.join(self.data, "raw", "a"))
         self.fs.set("a", D1, good_body(D1))
         self.assertEqual(self.pull(), 2)
         self.assertEqual(os.listdir(outside), [])
@@ -1399,7 +1423,7 @@ class T44_OpenRecheck(PullEnv, unittest.TestCase):
         os.makedirs(self.data, mode=0o700)
         outside = os.path.join(self.home, "outside2")
         os.makedirs(outside)
-        os.symlink(outside, os.path.join(self.data, "quarantine"))
+        symlink_or_skip(outside, os.path.join(self.data, "quarantine"))
         self.assertEqual(self.pull(), 2)
 
     def test_44_raw_file_link_skipped(self):
@@ -1410,7 +1434,7 @@ class T44_OpenRecheck(PullEnv, unittest.TestCase):
         with open(other, "wb") as f:
             f.write(good_body(D1, 3))
         os.unlink(raw)
-        os.symlink(other, raw)
+        symlink_or_skip(other, raw)
         self.assertEqual(self.pull("--recheck"), 1)
         self.assertIn("symlink_skipped a " + D1, self.inbox_text())
         self.assertTrue(os.path.islink(raw))                  # 링크는 그대로 둔다 (읽지 않음)
@@ -2024,6 +2048,7 @@ class T56_AuditGate(unittest.TestCase):
         self.assertEqual(a.files[D1]["result"], "audit_required")
 
 
+@linux_only
 class T57_WorkDir(unittest.TestCase):
     def cfg(self, name, **kw):
         d = os.path.join(TMP, name)
@@ -2084,6 +2109,112 @@ class T57_WorkDir(unittest.TestCase):
                 text = fh.read().lower()
             for w in words:
                 self.assertNotIn(w, text, os.path.basename(f))
+
+
+class _ZeroIdEntry:
+    """Windows 의 os.scandir 흉내: DirEntry.stat() 이 st_ino=0, st_dev=0 을 준다 (나머지는 그대로)."""
+
+    def __init__(self, e):
+        self._e = e
+
+    def __getattr__(self, k):
+        return getattr(self._e, k)
+
+    def stat(self, *a, **kw):
+        st = self._e.stat(*a, **kw)
+        l = list(st)
+        l[1], l[2] = 0, 0                   # st_ino, st_dev
+        return os.stat_result(l)
+
+
+class _ZeroIdScandir:
+    def __init__(self, real):
+        self.real = real
+
+    def __call__(self, *a, **kw):
+        it = self.real(*a, **kw)
+        outer = self
+
+        class W:
+            def __enter__(s):
+                s.it = it.__enter__()
+                return s
+
+            def __exit__(s, *x):
+                return it.__exit__(*x)
+
+            def __iter__(s):
+                return (_ZeroIdEntry(e) for e in s.it)
+        return W()
+
+
+class T58_WindowsIdent(unittest.TestCase):
+    """리눅스에서 Windows 동작(DirEntry.stat 의 ino/dev 가 0)을 흉내 낸 회귀 시험."""
+
+    def setUp(self):
+        self.real_scandir = RS.os.scandir
+        RS.os.scandir = _ZeroIdScandir(self.real_scandir)
+
+    def tearDown(self):
+        RS.os.scandir = self.real_scandir
+
+    def test_58_targets_and_open_ok(self):
+        base = mkbase("t58a")
+        wr(base, "hands/" + D1, hline(1) + hline(2))
+        up = mk(base, fake_cfg(), fake=True)
+        self.assertEqual(run(up), 0)
+        self.assertNotIn("changed_during_open", str(up.files))
+        self.assertEqual(up.errors, [])
+        self.assertEqual(len(up.puts), 1)
+        self.assertNotEqual(up.idents[D1][:2], (0, 0))
+
+    def test_58_replacement_still_caught(self):
+        base = mkbase("t58b")
+        p = wr(base, "hands/" + D1, hline(1))
+
+        class Swap(Rec):
+            def targets(self, lo, hi):
+                names = super().targets(lo, hi)
+                with open(p + ".new", "wb") as f:
+                    f.write(hline(1) + hline(2))
+                os.replace(p + ".new", p)
+                return names
+        up = mk(base, fake_cfg(), cls=Swap, fake=True)
+        self.assertEqual(run(up), 1)
+        self.assertEqual(up.files[D1]["result"], "changed_during_open")
+        self.assertEqual(up.puts, [])
+
+    def test_58_audit_no_unreadable(self):
+        base = _audit_base("t58c", {D1: hline(1) + hline(2), D0: _dec(1, advice={"reason": "폴드"})})
+        up = mk(base, {}, fake=True)
+        code, out, err = _capture(lambda: up.audit())
+        self.assertEqual(code, 0, out)
+        self.assertIn("unreadable=0", out)
+
+    def test_58_same_file_fallback_without_ino(self):
+        """ino 를 못 믿을 때: 커지는 것(이어 쓰기)은 같은 파일, 줄거나 mtime 이 되돌아가면 다른 파일."""
+        base = mkbase("t58d")
+        p = wr(base, "hands/" + D1, hline(1) + hline(2))
+        st = os.stat(p)
+        ident = (0, 0, st.st_size, st.st_mtime_ns)
+        self.assertTrue(RS._same_file(st, ident))
+        self.assertTrue(RS._same_file(st, (0, 0, st.st_size - 5, st.st_mtime_ns - 1)))       # 이어 쓰는 중
+        self.assertFalse(RS._same_file(st, (0, 0, st.st_size + 5, st.st_mtime_ns)))          # 줄어듦
+        self.assertFalse(RS._same_file(st, (0, 0, st.st_size, st.st_mtime_ns + 1)))          # mtime 되돌아감
+        # 양쪽 ino 가 실제 값이면 ino 비교
+        self.assertFalse(RS._same_file(st, (st.st_dev, st.st_ino + 1, st.st_size, st.st_mtime_ns)))
+
+    def test_58_zero_ident_open_checked(self):
+        base = mkbase("t58e")
+        p = wr(base, "hands/" + D1, hline(1) + hline(2))
+        st = os.stat(p)
+        up = mk(base, fake_cfg(), fake=True)
+        self.assertEqual(up._open_checked(p, (0, 0, st.st_size, st.st_mtime_ns)), hline(1) + hline(2))
+        with open(p + ".new", "wb") as f:
+            f.write(hline(1))
+        os.replace(p + ".new", p)                                    # 더 작은 다른 파일
+        with self.assertRaises(RS.FileError):
+            up._open_checked(p, (0, 0, st.st_size, st.st_mtime_ns))
 
 
 _MISSING = object()

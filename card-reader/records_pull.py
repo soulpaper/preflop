@@ -19,8 +19,6 @@ import time
 import urllib.parse
 from datetime import datetime, timezone
 
-import fcntl
-
 import records_check as RC
 
 API = "/api/spaces/records"
@@ -470,6 +468,7 @@ def main(argv=None):
     except Refuse as r:
         print("records_pull: %s" % r, file=sys.stderr)
         return 2
+    import fcntl      # 수신기는 리눅스 전용: Windows 에서 이 모듈을 불러오기만 해도 실패하지 않게 여기서 가져온다
     lockf = open(os.path.join(data, ".pull.lock"), "a+")
     _chmod(os.path.join(data, ".pull.lock"), 0o600)
     try:

@@ -935,16 +935,17 @@ def read_private_json(path):
         st = os.fstat(f.fileno())
         if not stat.S_ISREG(st.st_mode):
             raise ConfigPerms("file is not regular")
-        if st.st_uid != os.geteuid():
+        posix = hasattr(os, "geteuid")      # Windows 는 소유자·mode 비트가 의미 없다 (NTFS ACL)
+        if posix and st.st_uid != os.geteuid():
             raise ConfigPerms("file owner")
-        if st.st_mode & 0o077:
+        if posix and st.st_mode & 0o077:
             raise ConfigPerms("file mode")
         parent = os.path.dirname(os.path.abspath(path))
         ps = os.lstat(parent)
-        if stat.S_ISLNK(ps.st_mode) or not stat.S_ISDIR(ps.st_mode):
+        if stat.S_ISLNK(ps.st_mode) or getattr(ps, "st_file_attributes", 0) & 0x400 or not stat.S_ISDIR(ps.st_mode):
             raise ConfigPerms("folder is a link")
-        if ps.st_uid != os.geteuid():
+        if posix and ps.st_uid != os.geteuid():
             raise ConfigPerms("folder owner")
-        if ps.st_mode & 0o022:
+        if posix and ps.st_mode & 0o022:
             raise ConfigPerms("folder mode")
         return json.loads(f.read().decode("utf-8"))

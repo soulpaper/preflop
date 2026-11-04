@@ -297,6 +297,16 @@ def _verdict_rank(v):
 
 # --- 업로더 --------------------------------------------------------------------
 
+def _same_file(st, ident):
+    """targets() 때의 ident=(dev, ino, size, mtime_ns) 와 열고 나서의 fstat 이 같은 파일인가.
+    ino 가 양쪽 다 실제 값이면 (dev, ino) 로 비교한다. 한쪽이라도 0 이면(Windows 일부 환경) ino 는 믿지 않고
+    대체 비교: 파일을 쓰는 중에 커지는 것은 정상이므로 크기는 줄지 않았고 mtime 은 되돌아가지 않았을 때만 같다고 본다."""
+    dev, ino, size, mtime = ident
+    if ino != 0 and st.st_ino != 0:
+        return (st.st_dev, st.st_ino) == (dev, ino)
+    return st.st_size >= size and st.st_mtime_ns >= mtime
+
+
 class Uploader:
     def __init__(self, base, cfg, on_error=None, extra_names=None, today=None, require_audit=True):
         self.base, self.cfg = base, cfg
@@ -309,7 +319,7 @@ class Uploader:
         self.last_url = None
         self.files = {}       # name -> state entry
         self.errors = []
-        self.idents = {}      # name -> (st_dev, st_ino) (targets 때)
+        self.idents = {}      # name -> (st_dev, st_ino, st_size, st_mtime_ns) (targets 때)
         self.keystats = {}    # name -> 필터가 버린 키 통계
 
     # 상태
@@ -356,15 +366,16 @@ class Uploader:
                 try:
                     if not e.is_file(follow_symlinks=False):
                         continue
-                    est = e.stat(follow_symlinks=False)
-                    if getattr(est, "st_file_attributes", 0) & REPARSE:
+                    # DirEntry.stat() 은 Windows 에서 st_ino/st_dev 가 0 이다: 식별용 값은 os.stat 으로 얻는다
+                    est = os.stat(os.path.join(d, e.name), follow_symlinks=False)
+                    if getattr(est, "st_file_attributes", 0) & REPARSE or not S.S_ISREG(est.st_mode):
                         continue
                 except OSError:
                     continue
                 dt = RC.file_date(e.name)
                 if lo <= dt <= hi:
                     out.append(e.name)
-                    self.idents[e.name] = (est.st_dev, est.st_ino)
+                    self.idents[e.name] = (est.st_dev, est.st_ino, est.st_size, est.st_mtime_ns)
         return sorted(out)
 
     def check_scrubbed(self):
@@ -391,7 +402,7 @@ class Uploader:
             st = os.fstat(fd)
             if not S.S_ISREG(st.st_mode) or getattr(st, "st_file_attributes", 0) & REPARSE:
                 raise FileError("changed_during_open")
-            if ident is not None and st.st_ino != 0 and (st.st_dev, st.st_ino) != ident:
+            if ident is not None and not _same_file(st, ident):
                 raise FileError("changed_during_open")
             with os.fdopen(fd, "rb") as f:
                 fd = -1
