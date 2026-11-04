@@ -109,6 +109,50 @@ def postflop_cases(app):
     return fails
 
 
+def opp_basis_case(app):
+    """에쿼티 줄의 상대 수 근거: BB 가 UTG 오픈 + BTN 콜을 마주함 (폴드 놓친 CO 는 안 셈) → 실제 계산 경로로 '상대 2명 기준 (오픈·콜한 사람)'."""
+    fails = []
+    saved = app.track, set(app.manual)
+    app.track, app.manual = {}, set()
+    try:
+        opps = [seat("seat_TL", "UTG", bet=2.5, bubble="raise"), seat("seat_TR", "CO"),
+                seat("seat_R", "BTN", bet=2.5, bubble="call"), seat("seat_UL", "SB", in_hand=False)]
+        ts = table(opps, call=1.5)
+        ts["seats"][-1]["bet"] = 1.0
+        ts["preflop"] = {"raises": 1}
+        app.table_state = ts
+        app.view = {"hero": ["9h", "8h"], "board": []}
+        n = app.opponents()
+        st = (tuple(ev.parse_card(c) for c in ["9h", "8h"]), (), n)
+        app.computed_state = st
+        # 작업자 스레드 대신 이 스레드에서 같은 작업을 돌린다 (mainloop 없이 root.after 를 다른 스레드에서 부를 수 없어서)
+        keep_thread, keep_post = app.job_thread, app.post
+        app.job_thread, app.post = object(), (lambda fn: fn())
+        try:
+            app.start_analysis(st)
+            job, app.job_next = app.job_next, None
+            if job is not None:
+                app.run_job(job)
+        finally:
+            app.job_thread, app.post = keep_thread, keep_post
+        app.render(force=True)
+        app.root.update()
+        want = "상대 2명 기준 (오픈·콜한 사람)"
+        ok = n == 2 and want in canvas_text(app) and app.result.get("opp_keys") == ("seat_TL", "seat_R")
+        print("ok  " if ok else "FAIL", "에쿼티 상대 수 근거", n, app.result.get("opp_basis"), app.result.get("opp_keys"))
+        if not ok:
+            fails.append("opp basis")
+        app.manual.add("opponents")
+        ok = app.opp_basis(n) == "직접 지정"
+        print("ok  " if ok else "FAIL", "직접 고른 상대 수 → '직접 지정'")
+        if not ok:
+            fails.append("opp basis manual")
+    finally:
+        app.track, app.manual = saved[0], saved[1]
+        app.table_state = None
+    return fails
+
+
 def icm_case(app):
     """ICM 켜지는 경로: max_left 0 + 참가자 수 빈칸이어도 머리글을 읽으면 자동 추정으로 켜짐. 머리글을 못 읽으면 꺼짐 (tournament 없음)."""
     t = app.tcfg()
@@ -347,6 +391,7 @@ def main():
                 fails += 1
     try:
         fails += len(postflop_cases(app))
+        fails += len(opp_basis_case(app))
         fails += len(icm_case(app))
         fails += len(layout_cases(app))
         fails += len(type_cases(app))

@@ -335,6 +335,93 @@ for i in range(1500):
         bad.append((ctx, got))
 test(f"무작위 3명 팟 1500개: 액션·크기·색 불변, 블러프 줄 없음 (줄 표시 {shown}개)", not bad and shown > 50, str(bad[:1]))
 
+# --- 에쿼티 상대 수 (equity_opponents): 프리플랍은 돈을 넣은 사람만, 뒤에 남은 사람은 advisor 의 필요 승률 가산 ---------------
+def pre_table(opps, hero_pos, hero_bet=None, raises=None, acting=None, players=9):
+    ts = table(*opps, hero_pos=hero_pos, players=players)
+    ts["seats"][-1]["bet"] = hero_bet
+    ts["acting_seat"] = acting
+    ts["preflop"] = {"raises": raises} if raises is not None else None
+    return ts
+
+
+def eqopp(ts, nboard=0):
+    return reader.equity_opponents(ts, nboard)
+
+
+r = eqopp(pre_table([seat("seat_A", "UTG", bet=1.0, bubble="call"), seat("seat_B", "CO", bet=1.0),
+                     seat("seat_C", "SB", bet=1.0, bubble="call"), seat("seat_D", "HJ")], "BB", hero_bet=1.0))
+test("BB 림프 팟: 림퍼 2 + SB 컴플리트 = 3 (아직 카드 든 HJ 는 폴드 놓침 → 안 셈)",
+     r["n"] == 3 and set(r["keys"]) == {"seat_A", "seat_B", "seat_C"} and r["basis"] == "림프한 사람", str(r))
+r = eqopp(pre_table([seat("seat_C", "SB", bet=1.0, bubble="call"), seat("seat_A", "UTG"), seat("seat_B", "BTN")], "BB",
+                    hero_bet=1.0))
+test("BB 언오픈: SB 컴플리트만 → 1명 (예전 3명)", r["n"] == 1 and r["keys"] == ["seat_C"], str(r))
+r = eqopp(pre_table([seat("seat_C", "SB", bet=0.5), seat("seat_A", "UTG", bet=1.0)], "BB", hero_bet=1.0))
+test("BB 림프 팟: SB 0.5 만 (폴드 놓침) → 림퍼 1명", r["n"] == 1 and r["keys"] == ["seat_A"], str(r))
+r = eqopp(pre_table([seat("seat_A", "UTG", bet=3.0, bubble="raise"), seat("seat_B", "MP"), seat("seat_C", "CO"),
+                     seat("seat_D", "BTN"), seat("seat_E", "BB", bet=1.0)], "SB", hero_bet=0.5, raises=1))
+test("SB vs UTG 오픈 (SB 까지 폴드, 폴드 놓친 자리 3 + BB) → 1명", r["n"] == 1 and r["keys"] == ["seat_A"]
+     and r["basis"] == "오픈한 사람", str(r))
+r = eqopp(pre_table([seat("seat_A", "UTG", bet=2.5, bubble="raise"), seat("seat_B", "HJ", bet=2.5, bubble="call"),
+                     seat("seat_D", "BTN"), seat("seat_S", "SB", bet=0.5), seat("seat_E", "BB", bet=1.0)], "CO", raises=1))
+test("CO vs 오픈 + 콜 (뒤에 BTN·블라인드) → 2명 '오픈·콜한 사람'", r["n"] == 2 and r["keys"] == ["seat_A", "seat_B"]
+     and r["basis"] == "오픈·콜한 사람", str(r))
+r = eqopp(pre_table([seat("seat_A", "UTG", bet=2.5, bubble="raise"), seat("seat_D", "BTN", bet=2.5, bubble="call"),
+                     seat("seat_S", "SB", in_hand=False)], "BB", hero_bet=1.0, raises=1))
+test("BB vs 오픈 + 뒤에서 콜 → 2명", r["n"] == 2 and set(r["keys"]) == {"seat_A", "seat_D"}, str(r))
+r = eqopp(pre_table([seat("seat_D", "BTN", bet=8.0, bubble="raise"), seat("seat_S", "SB", bet=8.0, bubble="call"),
+                     seat("seat_E", "BB", bet=1.0), seat("seat_A", "UTG")], "CO", hero_bet=2.5, raises=2))
+test("3벳 팟: 3벳 + 콜드콜 → 2명 (BB·폴드 놓친 UTG 제외) '레이즈·콜한 사람'",
+     r["n"] == 2 and set(r["keys"]) == {"seat_D", "seat_S"} and r["basis"] == "레이즈·콜한 사람", str(r))
+jam = seat("seat_A", "UTG", bet=25.0, bubble="allin")
+jam["allin"] = True
+r = eqopp(pre_table([jam, seat("seat_B", "HJ", bet=25.0, bubble="call"), seat("seat_E", "BB", bet=1.0)], "BTN", raises=1))
+test("올인 + 올인 콜 → 2명", r["n"] == 2 and set(r["keys"]) == {"seat_A", "seat_B"}, str(r))
+r = eqopp(pre_table([seat("seat_A", "UTG"), seat("seat_S", "SB", bet=0.5), seat("seat_E", "BB", bet=1.0)], "CO"))
+test("CO 언오픈 (오픈 결정) → BB 1명", r["n"] == 1 and r["keys"] == ["seat_E"] and r["basis"] == "BB", str(r))
+r = eqopp(pre_table([seat("seat_A", "UTG", bet=1.0), seat("seat_S", "SB", bet=0.5), seat("seat_E", "BB", bet=1.0)], "CO"))
+test("CO 림프 팟 → 림퍼 + BB = 2명", r["n"] == 2 and r["keys"] == ["seat_A", "seat_E"] and r["basis"] == "림프한 사람 + BB", str(r))
+r = eqopp(pre_table([seat("seat_A", "UTG", bet=1.0, bubble="fold"), seat("seat_B", "HJ", bet=3.0, bubble="raise")], "BTN",
+                    raises=1))
+test("림프 후 폴드 말풍선 (흑백 놓침, 칩은 남음) → 안 셈", r["n"] == 1 and r["keys"] == ["seat_B"] and r["dropped"] == ["seat_A"], str(r))
+r = eqopp(pre_table([seat("seat_A", "UTG", bet=1.0, bubble="fold"), seat("seat_B", "HJ", bet=3.0, bubble="raise")], "BTN",
+                    raises=1, acting="seat_A"))
+test("폴드 말풍선이어도 차례 고리가 있으면 살아 있음", r["n"] == 2, str(r))
+test("프리플랍 바닥 칩을 하나도 못 읽음 → None (예전 값)", eqopp(pre_table([seat("seat_A", "UTG")], "CO")) is None)
+test("상대가 없으면 None", eqopp(pre_table([seat("seat_A", "UTG", in_hand=False)], "CO", hero_bet=1.0)) is None)
+r = eqopp(pre_table([seat("seat_A", "UTG"), seat("seat_B", "HJ", bubble="check"), seat("seat_C", "CO", bubble="fold")], "BB"), 3)
+test("포스트플랍: 남은 상대 (폴드 말풍선 1명 제외) → 2명", r["n"] == 2 and r["dropped"] == ["seat_C"]
+     and r["basis"] == "남은 상대 · 폴드 1명 제외", str(r))
+r = eqopp(pre_table([seat("seat_A", "UTG"), seat("seat_C", "CO", bubble="fold")], "BB", acting="seat_C"), 3)
+test("포스트플랍: 차례 고리 자리는 폴드 말풍선이어도 남김", r["n"] == 2 and not r["dropped"], str(r))
+r = eqopp(pre_table([seat("seat_C", "CO", bubble="fold")], "BB"), 3)
+test("포스트플랍: 모두 폴드 말풍선이면 빼지 않음 (판정 의심)", r["n"] == 1 and r["keys"] == ["seat_C"], str(r))
+ts_d = reader.drop_missed_folds(pre_table([seat("seat_A", "UTG"), seat("seat_C", "CO", bubble="fold")], "BB"), ["seat_C"])
+test("drop_missed_folds: 뺀 자리는 in_hand False (원본은 그대로)",
+     [s["in_hand"] for s in ts_d["seats"]] == [True, False, True])
+
+
+class _RangeStub:
+    def __init__(self):
+        self.got = None
+
+    def random_range(self):
+        return "RANDOM"
+
+    def equity_vs_ranges(self, hero, board, ranges, n):
+        self.got = list(ranges)
+        return {"equity": 0.5, "win": 0.5, "tie": 0.0, "lose": 0.5, "samples": n, "exact": False}
+
+
+stub = _RangeStub()
+app_r = SimpleNamespace(rangeq=stub, cfg={"iterations": 1000})
+reads = {"order": ["seat_E", "seat_A", "seat_B"], "ranges": {"seat_E": "BB87", "seat_A": "OPEN", "seat_B": "CALL"}}
+h = [reader.ev.parse_card(c) for c in HERO]
+reader.App.range_analyze(app_r, h, [], 2, reads, 100, ("seat_A", "seat_B"))
+test("레인지 에쿼티: 센 상대(오프너·콜러) 레인지를 먼저 (뒤의 BB 레인지가 끼지 않음)", stub.got == ["OPEN", "CALL"], str(stub.got))
+reader.App.range_analyze(app_r, h, [], 2, reads, 100)
+test("레인지 에쿼티: keys 없으면 예전 순서", stub.got == ["BB87", "OPEN"], str(stub.got))
+
+
 # --- 실제 라이브러리 (있을 때만) -----------------------------------------------------------------
 if solverlib.available():
     advisor.GTO_ENABLED = True

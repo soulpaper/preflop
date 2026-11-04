@@ -1266,6 +1266,99 @@ def three_way_ref(ts, hist, memo, nboard, opponents, hero_pos, ocr_bb=None):
     return out
 
 
+# --- 에쿼티 상대 수 (순수 함수) -------------------------------------------------------------------------
+# 규칙 (어디서 무엇을 세는가 — 이중 계산 방지):
+#   프리플랍: 이번 스트리트에 자기 의지로 돈을 넣은 상대만 = 오픈·레이즈·3벳·콜·림프·올인 (블라인드 강제 베팅은 제외).
+#     팟이 열리지 않았으면 (레이즈 없음: 아무도 안 들어왔거나 림프만) BB 를 더한다 — BB 는 체크로 플랍을 공짜로 보므로
+#     내가 림프/오픈하면 사실상 늘 상대가 된다 (내가 BB 가 아닐 때).  아직 행동하지 않은 사람(뒤에 남은 사람)은 세지 않는다.
+#     예전에는 카드를 든 사람 모두(뒤에 남은 사람, 폴드를 못 읽은 자리 포함)를 '모두 콜' 한 상대로 셌다 → 에쿼티가 지나치게 낮았다
+#     (CO 66 vs UTG 오픈: 상대 8명 기준 14% → 폴드, 오프너 기준 49%).
+#   뒤에 남은 사람의 레이즈(스퀴즈) 위험은 advisor 만 본다: 프리플랍 콜 판단의 필요 승률 가산
+#     (advisor._preflop_math 의 MW_BEHIND_STEP × preflop.behind(pos)) — 그래서 여기서 그들을 상대로 세면 이중 감점.
+#   포스트플랍: 핸드에 남은 상대 모두 (뒤에 있는 사람도 이미 팟에 돈을 넣었다).  advisor._behind_pad 가 (상대 수 - 1) 로
+#     뒤 레이즈 위험을 더한다 (마지막 액션이면 0).
+#   폴드(흑백)를 못 읽은 자리 (프리플랍·포스트플랍 공통): '폴드' 말풍선이 보이면 뺀다 — 단 지금 차례 고리가 있는 자리,
+#     올인 자리는 살아 있다는 증거라 빼지 않는다.  핸드 추적기의 폴드는 한 프레임 판정이라 (headsup_villain_pos 참고) 쓰지 않는다.
+OPP_EPS = 0.05     # 같은 금액으로 보는 차이 (BB, tablestate.SAME_BET 과 같다)
+VOLUNTARY_BUBBLES = ("call", "raise", "allin", "bet")
+
+
+def _posted(seat, blinds):
+    """프리플랍 강제 베팅 (BB 단위): SB 0.5, BB 1, 그 밖 0."""
+    key, pos = seat.get("key"), seat.get("pos")
+    if pos == "BB" or (key and key == blinds.get("bb")):
+        return 1.0
+    if pos == "SB" or (key and key == blinds.get("sb")):
+        return 0.5
+    return 0.0
+
+
+def _missed_fold(seat, acting):
+    """테이블 상태가 아직 '남아 있음' 으로 보는데 '폴드' 말풍선이 뜬 자리 (흑백 판정을 놓침).  말풍선은 그 사람의 마지막 액션이라
+    바닥 칩(폴드 전에 낸 림프·콜)이 남아 있어도 폴드다.  살아 있다는 증거(지금 차례 고리, 올인)가 있으면 폴드로 보지 않는다."""
+    return seat.get("bubble") == "fold" and seat.get("key") != acting and not seat.get("allin")
+
+
+def equity_opponents(ts, nboard):
+    """에쿼티 계산에 쓸 상대 → {'n', 'keys', 'basis', 'dropped'} 또는 None (테이블 상태로 정할 수 없음 → 예전 값을 쓴다).
+    keys: 센 상대 좌석 (레인지 에쿼티에서 이 순서로 레인지를 고른다), basis: 화면 표시용 근거 ('오픈·콜한 사람' …),
+    dropped: 폴드 말풍선으로 뺀 좌석.  규칙은 위 주석."""
+    if not isinstance(ts, dict):
+        return None
+    seats = [s for s in ts.get("seats") or [] if isinstance(s, dict)]
+    acting = ts.get("acting_seat")
+    opps = [s for s in seats if s.get("in_hand") and s.get("key") != "hero"]
+    if not opps:
+        return None
+    dropped = [s.get("key") for s in opps if _missed_fold(s, acting)]
+    live = [s for s in opps if s.get("key") not in dropped]
+    if not live:   # 남은 상대가 모두 폴드 말풍선 = 판정이 의심스럽다 → 빼지 않음
+        live, dropped = opps, []
+    if nboard:
+        basis = "남은 상대" + (f" · 폴드 {len(dropped)}명 제외" if dropped else "")
+        return {"n": len(live), "keys": [s.get("key") for s in live], "basis": basis, "dropped": dropped}
+    bets = [_number(s.get("bet")) for s in seats]
+    if all(b is None for b in bets):
+        return None   # 바닥 칩(블라인드 포함)을 하나도 못 읽음 → 누가 돈을 넣었는지 모른다
+    blinds = ts.get("blind_seats") or {}
+    top = max(b for b in bets if b is not None)
+    raises = _number((ts.get("preflop") or {}).get("raises"))
+    raised = top > 1.0 + OPP_EPS or bool(raises and raises >= 1)
+    levels = []
+    for v in sorted(b for b in bets if b is not None and b > 1.0 + OPP_EPS):
+        if not levels or v - levels[-1] > OPP_EPS:
+            levels.append(v)
+    keys = []
+    for s in live:
+        bet = _number(s.get("bet"))
+        vol = bool(s.get("allin")) or s.get("bubble") in VOLUNTARY_BUBBLES or \
+            (bet is not None and bet > _posted(s, blinds) + OPP_EPS)
+        if vol:
+            keys.append(s.get("key"))
+    parts = []
+    if raised:
+        parts.append("레이즈·콜한 사람" if len(levels) >= 2 else ("오픈·콜한 사람" if len(keys) > 1 else "오픈한 사람"))
+    else:
+        if keys:
+            parts.append("림프한 사람")
+        bb = next((s for s in live if s.get("pos") == "BB" or (s.get("key") and s.get("key") == blinds.get("bb"))), None)
+        if bb is not None and bb.get("key") not in keys:
+            keys.append(bb.get("key"))
+            parts.append("BB")
+    if not keys:
+        return {"n": 1, "keys": [], "basis": "최소 1명 (돈을 넣은 상대를 못 찾음)", "dropped": dropped}
+    return {"n": len(keys), "keys": keys, "basis": " + ".join(parts), "dropped": dropped}
+
+
+def drop_missed_folds(ts, keys):
+    """좌석 상태에서 keys 자리를 '핸드에서 빠짐' 으로 바꾼 사본 (포스트플랍 위치·주 상대 계산이 에쿼티 상대 수와 맞게)."""
+    if not keys:
+        return ts
+    out = dict(ts)
+    out["seats"] = [dict(s, in_hand=False) if s.get("key") in keys else s for s in ts.get("seats") or []]
+    return out
+
+
 def flop_line_from(acts, turn_pot):
     """플랍 액션 [{act, to}] + 턴 시작 팟(BB) → solverlib 라인 'x_x' / 'x_bet33_c' / 'x_bet75_c' / 'bet33_c' / 'bet75_c'.
     레이즈·폴드가 섞였거나 크기를 못 잡으면 None.  벳 크기 = 벳 / (플랍 시작 팟 = 턴 시작 팟 - 2 × 벳), 0.5 아래면 33 아니면 75."""
@@ -2685,11 +2778,12 @@ class App:
             return {}
         out = {}
         in_hand = ts.get("hero_in_hand", not ts.get("hero_folded"))
-        if "opponents" not in self.manual and in_hand:  # 다자 팟: 남은 상대 수만큼 (최소 1)
-            n = _number(ts.get("opponents_in_hand"))
+        board = [b for b in self.view.get("board", []) if ev.is_card(b)]
+        if "opponents" not in self.manual and in_hand:  # 에쿼티 상대 수: equity_opponents 규칙 (모르면 남은 상대 수, 최소 1)
+            info = self.opp_info()
+            n = info["n"] if info else _number(ts.get("opponents_in_hand"))
             if n is not None:
                 out["opponents"] = max(1, min(9, int(n)))
-        board = [b for b in self.view.get("board", []) if ev.is_card(b)]
         if "preflop" not in self.manual and not board:  # 플랍 이후의 preflop 값은 무시
             pre = ts.get("preflop") or {}
             auto = {}
@@ -2734,6 +2828,25 @@ class App:
         if sit and auto.get("villain") and sit in pf.VILLAIN_LABEL:
             text += f" · {pf.VILLAIN_LABEL[sit]} {auto['villain']}"
         return text
+
+    def opp_info(self):
+        """지금 테이블 상태로 정한 에쿼티 상대 (equity_opponents) — 직접 고른 상대 수면 None."""
+        ts = self.table_state
+        if not ts or "opponents" in self.manual or ts.get("layout_ok") is False:
+            return None
+        nboard = sum(1 for b in self.view.get("board", []) if ev.is_card(b))
+        try:
+            return equity_opponents(ts, nboard)
+        except Exception:
+            self.log_once("equity_opponents")
+            return None
+
+    def opp_basis(self, n):
+        """에쿼티 줄의 상대 수 근거 ('오픈·콜한 사람' …). 지금 센 상대 수가 n 일 때만, 직접 고른 값이면 '직접 지정'."""
+        if "opponents" in self.manual:
+            return "직접 지정"
+        info = self.opp_info()
+        return info["basis"] if info and info["n"] == n else None
 
     def opponents(self):
         """에쿼티 계산 상대 수. 직접 고른 값이어도 테이블 상태가 본 '핸드에 남은 상대' 수를 넘지 않게."""
@@ -3233,7 +3346,9 @@ class App:
                 turn_pot = pot
                 if turn_pot is None and pot_total and call is not None:
                     turn_pot = pot_total - call
-                ctx.update(self.postflop_ctx(ts, hero_str, len(board), ctx["opponents_in_hand"], turn_pot))
+                # 폴드 말풍선으로 상대 수에서 뺀 자리는 위치·주 상대 계산에서도 뺀다 (equity_opponents 와 같은 기준)
+                ts_live = drop_missed_folds(ts, (self.opp_info() or {}).get("dropped"))
+                ctx.update(self.postflop_ctx(ts_live, hero_str, len(board), ctx["opponents_in_hand"], turn_pot))
             except Exception:
                 self.log_once("postflop_ctx")
         return ctx
@@ -3479,7 +3594,10 @@ class App:
         hero, board, opponents = state
         reads = self.reads_now()
         rkey = reads["sig"] if reads else None
-        cached = self.analysis_cache.get((state, rkey))
+        info = self.opp_info()   # 센 상대 좌석 (레인지 에쿼티는 이 자리들의 레인지를 먼저 쓴다)
+        keys = tuple(info["keys"]) if info and info["n"] == opponents else ()
+        basis = self.opp_basis(opponents)   # 화면 표시용 근거 ('오픈·콜한 사람' …)
+        cached = self.analysis_cache.get((state, rkey, keys))
         if cached is not None:  # 같은 상태 → 같은 숫자 (몬테카를로를 다시 돌리면 값이 흔들림)
             self.result, self.computing, self.result_state, self.job_key = cached, False, state, None
             self.schedule_advice()
@@ -3491,6 +3609,7 @@ class App:
             if not (prev and prev.get("equity") is not None and prev["hero"] == list(hero)
                     and prev["board"] == list(board)):
                 self.result, self.result_state = analyze(list(hero), list(board), opponents), None
+                self.result["opp_basis"] = basis
             if self.anticipating():
                 self.schedule_anticipation()
             self.schedule_advice()
@@ -3499,7 +3618,7 @@ class App:
         self.job_key = (state, rkey)
         self.analysis_starts += 1
         with self.job_cv:
-            self.job_next = {"gen": gen, "state": state, "reads": reads, "rkey": rkey}
+            self.job_next = {"gen": gen, "state": state, "reads": reads, "rkey": rkey, "keys": keys, "basis": basis}
             self.job_cv.notify()
         if self.job_thread is None:
             self.job_thread = threading.Thread(target=self.job_worker, daemon=True)
@@ -3529,11 +3648,11 @@ class App:
         except (RuntimeError, tk.TclError):
             pass
 
-    def equity_pass(self, hero, board, opponents, reads, iterations):
-        """에쿼티 한 번: 상대 레인지 기준 (없거나 실패하면 랜덤 핸드 기준)."""
+    def equity_pass(self, hero, board, opponents, reads, iterations, keys=()):
+        """에쿼티 한 번: 상대 레인지 기준 (없거나 실패하면 랜덤 핸드 기준). keys: 먼저 쓸 상대 좌석 (equity_opponents)."""
         if reads and self.rangeq is not None:
             try:
-                return self.range_analyze(hero, board, opponents, reads, iterations)
+                return self.range_analyze(hero, board, opponents, reads, iterations, keys)
             except Exception:
                 self.log_once("range_equity", {"hero": list(hero), "board": list(board), "opp": opponents,
                                                "order": reads.get("order")})
@@ -3543,15 +3662,16 @@ class App:
 
     def run_job(self, job):
         gen, state, reads, rkey = job["gen"], job["state"], job["reads"], job["rkey"]
+        keys = job.get("keys") or ()
         hero, board, opponents = state
         full = int(self.cfg["iterations"])
         if reads and self.rangeq is not None:
             full = min(6000, full)
         quick = max(1, min(QUICK_ITERS, full))
-        res = self.equity_pass(hero, board, opponents, reads, quick)
+        res = self.equity_pass(hero, board, opponents, reads, quick, keys)
         if res["equity_basis"] != "range" and reads:
             reads, full = None, int(self.cfg["iterations"])  # 1차에서 레인지 계산이 안 됐으면 정밀도 같은 기준(랜덤)으로
-        res["opponents"], res["rkey"] = opponents, rkey
+        res["opponents"], res["rkey"], res["opp_keys"], res["opp_basis"] = opponents, rkey, keys, job.get("basis")
         done = res["equity"]["samples"]
         final = bool(res["equity"].get("exact")) or done >= full
         res["quality"] = "full" if final else "quick"
@@ -3562,7 +3682,7 @@ class App:
         while not final:
             if self.closed or self.generation != gen or self.job_next is not None:
                 return  # 상태가 바뀜 / 새 작업 → 오래된 정밀 계산은 버림
-            part = self.equity_pass(hero, board, opponents, reads, min(CHUNK_ITERS, full - done))
+            part = self.equity_pass(hero, board, opponents, reads, min(CHUNK_ITERS, full - done), keys)
             res = dict(res, equity=merge_equity(res["equity"], part["equity"]))
             done = res["equity"]["samples"]
             final = done >= full
@@ -3574,9 +3694,12 @@ class App:
             self.computing, self.job_key = False, None
             self.update_advice()
 
-    def range_analyze(self, hero, board, opponents, reads, iterations=None):
-        """남은 상대 각자의 추정 범위로 에쿼티 (주 상대 먼저. 범위를 모르는 상대는 랜덤 핸드로 채움)."""
-        order = list(reads["order"])[:opponents]
+    def range_analyze(self, hero, board, opponents, reads, iterations=None, keys=()):
+        """남은 상대 각자의 추정 범위로 에쿼티 (주 상대 먼저. 범위를 모르는 상대는 랜덤 핸드로 채움).
+        keys: 에쿼티 상대로 센 좌석 (equity_opponents — 프리플랍엔 돈을 넣은 사람) → 그 자리 레인지를 먼저 쓴다
+        (reads 의 순서는 공격성 순이라 콜러보다 아직 안 한 블라인드가 앞설 수 있다)."""
+        order = [k for k in reads["order"] if k in keys] + [k for k in reads["order"] if k not in keys]
+        order = order[:opponents]
         ranges = [reads["ranges"][k] for k in order if k in reads["ranges"]]
         while len(ranges) < opponents:
             ranges.append(self.rangeq.random_range())
@@ -3590,7 +3713,7 @@ class App:
         """작업 결과 (빠른 1차 / 정밀). 정밀만 캐시. 지금 작업의 결과면 화면에 반영하고 추천 갱신."""
         try:
             if final:
-                self.analysis_cache[(state, rkey)] = res
+                self.analysis_cache[(state, rkey, tuple(res.get("opp_keys") or ()))] = res
                 while len(self.analysis_cache) > 32:
                     self.analysis_cache.pop(next(iter(self.analysis_cache)))
             if gen == self.generation:
@@ -4861,8 +4984,9 @@ class App:
         y = self.section_title(c, y, W, P, "에쿼티 (승률)", "equity", right=res["hand"], right_color=TEXT,
                                right_pt=FS_BODY, right_weight="bold")
         if eq is None:  # 내 차례 전: 시뮬레이션은 미뤄 둠 (CPU 절약)
-            t = self.text(c, P, y, (f"클릭해서 분석 (상대 {res['opponents']}명 기준)" if self.click_mode() else
-                           f"내 차례가 되면 계산합니다 (상대 {res['opponents']}명 기준)"), FS_BODY, "bold", MUTED,
+            basis = f" · {res['opp_basis']}" if res.get("opp_basis") else ""
+            t = self.text(c, P, y, (f"클릭해서 분석 (상대 {res['opponents']}명 기준{basis})" if self.click_mode() else
+                           f"내 차례가 되면 계산합니다 (상대 {res['opponents']}명 기준{basis})"), FS_BODY, "bold", MUTED,
                           width=W - 2 * P)
             y = c.bbox(t)[3] + s(8)
             bw = self.measure("지금 계산", FS_SMALL, "bold") + s(18)
@@ -4890,7 +5014,9 @@ class App:
         n = res["opponents"]
         busy = ("  (빠른 계산 · 정밀 계산 중…)" if res.get("quality") == "quick" and self.result_state == self.computed_state
                 else "  (다시 계산 중…)")
-        head = self.text(c, P, nb[3] + s(2), f"상대 {n}명 기준 승률" + (busy if self.computing else "  (이전 계산)" if stale else ""),
+        # 상대 수의 근거: 프리플랍은 돈을 넣은 사람만 (뒤에 남은 사람은 추천의 필요 승률 가산이 본다) — equity_opponents
+        who = f"상대 {n}명 기준 ({res['opp_basis']})" if res.get("opp_basis") else f"상대 {n}명 기준 승률"
+        head = self.text(c, P, nb[3] + s(2), who + (busy if self.computing else "  (이전 계산)" if stale else ""),
                          FS_BODY, "bold", MUTED if stale else TEXT, width=mx - P - s(12))
         basis = ("범위 기준 (상대 예상 레인지)" if res.get("equity_basis") == "range" else "랜덤 기준 (랜덤 핸드 가정)")
         t = self.text(c, P, c.bbox(head)[3] + s(2), f"{basis} · {method}", FS_NOTE,

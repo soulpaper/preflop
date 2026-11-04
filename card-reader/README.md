@@ -164,6 +164,7 @@ CARD_READER_DIR=<card-reader 저장소 폴더>
 ## 추천 엔진 (`advisor.py`)
 
 - 프리플랍: `preflop.py` 레인지 (앤티·유효 스택에 따라 연속 변화, `looseness` -1~+1) + 팟 오즈·범위 승률 (`rangeq.py`)
+- 에쿼티 상대 수 (`reader.equity_opponents`): 프리플랍은 이번 스트리트에 자기 의지로 돈을 넣은 상대만 (오픈·레이즈·콜·림프·올인; 레이즈 없는 팟이면 + BB). 아직 행동하지 않은 사람은 세지 않고, 그들의 레이즈 위험은 추천의 필요 승률 가산(`advisor` 의 뒤 사람 보정)만 본다. 포스트플랍은 핸드에 남은 상대 전부. 흑백을 못 읽은 자리는 '폴드' 말풍선이 보이면 뺀다 (차례 고리·올인이면 남김). 에쿼티 줄에 근거를 표시 ("상대 2명 기준 (오픈·콜한 사람)")
 - 포스트플랍(헤즈업): 솔버 데이터로 맞춘 기준표 `HU_GTO`. 다자 팟은 그 위에 다자 보정
 - 상대 패 예상: `handread.py` (행동·성향 기반 범위), 행동 기록 `handlog.py`, 성향 DB `profiles.py`, 게임 '유저 정보' 팝업 읽기 `userinfo.py`
 - 테스트: `python test_advisor.py`, `test_rangeq.py`, `test_handread.py`, `test_handlog.py`, `test_solverlib.py`
