@@ -3334,6 +3334,10 @@ class App:
             "hand_name": res["hand"],
             "facing_allin": facing_allin,
         }
+        if not board:   # 상대 수가 equity_opponents 의 '돈 넣은 사람' 규칙에서 나왔나 (못 정해 예전 값으로 fallback 하면 표시 안 함)
+            info = self.opp_info()
+            if info and info["n"] == ctx["opponents_in_hand"]:
+                ctx["opponents_basis"] = "voluntary"
         if not board and ts.get("seats"):
             # 프리플랍에 이미 낸 내 칩 (림프 1BB 등): 림프 후 레이즈를 '첫 진입' 으로 보지 않게 (advisor 의 hero_bet)
             ctx["hero_bet"] = round(self.hero_invested(ts), 2)

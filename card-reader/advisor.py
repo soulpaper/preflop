@@ -7,7 +7,9 @@ ctx 키
   hero, board          : ['Ah', 'Kd'] 형식 문자열 (또는 evaluator 정수)
   street               : 'preflop' / 'flop' / 'turn' / 'river' (없으면 보드 장수로)
   players              : 테이블 인원 (6~10 범위로 보정)
-  opponents_in_hand    : 핸드에 남은 상대 수
+  opponents_in_hand    : 에쿼티 상대 수.  프리플랍 = 이번 스트리트에 자발적으로 돈을 넣은 상대 (+ 안 열린/림프 팟의 BB), 아직 행동 안 한
+                         사람은 제외.  포스트플랍 = 핸드에 남은 상대.  칩을 못 읽으면 남은 상대 수로 fallback 할 수 있다
+  opponents_basis      : (선택) 'voluntary' 면 opponents_in_hand 가 위 프리플랍 규칙(돈 넣은 사람)으로 센 값 (reader.equity_opponents)
   hero_pos             : preflop.py 포지션 이름 (UTG, U1.., LJ, HJ, MP, CO, BTN, SB, BB)
   situation            : open / vsopen / vs3bet / vs4bet / jam / jamcall (없으면 추정)
   villain_pos          : 상대 포지션
@@ -57,7 +59,7 @@ ctx 키
            rangeq.equity_vs_ranges (2000회, 고정 시드) 로 직접 계산해 팟 오즈로 차트를 검증한다 (_defence_equity)
   밸류 벳: 원페어 계열(탑페어/오버페어)은 상대가 늘수록 작게·드물게, 투페어+ 는 계속 벳 (젖은 보드 3/4 팟)
   블러프: 2명 이상 상대엔 순수 블러프 없음, 세미블러프는 콤보/너트 드로우 vs 2명 이하만
-  프리플랍: 림퍼/콜러 수는 팟에서 역산 (opponents_in_hand 는 아직 안 낸 사람 포함이라 쓰지 않음)
+  프리플랍: 림퍼/콜러 수는 팟에서 역산 (opponents_in_hand 는 돈 넣은 사람 기준이지만 칩을 못 읽으면 남은 상대 수로 fallback 해서 쓰지 않음)
 
 헤즈업 포스트플랍 (opponents_in_hand == 1) — HU_GTO 표 (솔버 데이터셋으로 맞춘 임계값, bench_gto.py 로 재현)
   벳에 콜   : 보정 에쿼티 >= 팟 오즈 + call[거리] + call_slope × (벳/팟 - 0.5)  (올인 콜은 allin_call[거리])
@@ -305,6 +307,7 @@ BLIND_R_BASE, BLIND_R_SLOPE, BLIND_R_FLOOR = 0.92, 0.0043, 0.45   # 블라인드
 BLIND_R_SC = {1: 0.72, 2: 0.66}
 BLIND_R_SC_SB = 0.10       # SB 는 포스트플랍 내내 OOP + 뒤에 BB (스퀴즈) — 바닥을 이만큼 낮춘다 (SB 는 3벳 or 폴드 위주 유지)
 SB_CALL_EXTRA = 0.05       # SB 는 BB 가 뒤에 있어 차트 폴드 → 콜 뒤집기에 여유를 더 둔다
+SB_CALL_EXTRA_VOL = 0.07   # 리더 에쿼티가 '돈 넣은 사람(오프너+콜러)' 기준일 때 SB: 뒤 BB 스퀴즈는 에쿼티에 안 들어 있으므로 더 둔다
 # 프리플랍 차트 + 수학 (범위 기준 에쿼티가 있을 때)
 MATH_CALL_MARGIN = 0.02    # 차트 폴드 → 콜 로 뒤집으려면 필요 승률 위로 이 만큼 더
 MATH_FOLD_MARGIN = 0.04    # 차트 콜 → 폴드 로 뒤집으려면 필요 승률 아래로 이 만큼 더
@@ -422,6 +425,7 @@ class _Ctx:
         opp = _num(g("opponents_in_hand"))
         self.opp = max(1, int(opp)) if opp else 1
         self.opp_known = opp is not None
+        self.opp_voluntary = g("opponents_basis") == "voluntary"   # 프리플랍: 돈 넣은 사람만 센 상대 수 (뒤에 남은 사람 제외)
         self.hero_pos = g("hero_pos") or None
         self.situation = g("situation") or None
         self.villain_pos = g("villain_pos") or None
@@ -1279,8 +1283,12 @@ def _defence_equity(c, villain, players, eff, callers):
 def _preflop_math(c, hand, strength, name, pos, players, call, eff, pot_total, callers, eq=None):
     """차트 판단을 팟 오즈·범위 에쿼티·내재 배당·SPR 로 검증. dict(verdict, lines, ...) 반환.
     verdict: 'call' / 'fold' / None(차트 유지).  eq: 직접 계산한 상대 레인지 에쿼티 (없으면 c.equity)."""
+    eq_arg = eq
     eq = c.equity if eq is None else eq
-    call_margin = MATH_CALL_MARGIN + c.post["math_margin"] + (SB_CALL_EXTRA if pos == "SB" else 0.0)
+    sb_extra = 0.0
+    if pos == "SB":   # 리더 에쿼티(eq 직접 계산 아님)가 돈 넣은 사람 기준이면 뒤 BB 스퀴즈가 에쿼티에 없으니 더 둔다
+        sb_extra = SB_CALL_EXTRA_VOL if (eq_arg is None and c.rb and c.opp_voluntary) else SB_CALL_EXTRA
+    call_margin = MATH_CALL_MARGIN + c.post["math_margin"] + sb_extra
     need = call / (pot_total + call)
     allin = bool(c.facing_allin) or (eff is not None and call >= 0.95 * eff) or         (c.my_stack is not None and call >= c.my_stack)
     spec = _speculative(hand)
@@ -1307,6 +1315,9 @@ def _preflop_math(c, hand, strength, name, pos, players, call, eff, pot_total, c
             req += ipad
             icm_line = f"ICM {c.icm.label}: 위험 프리미엄 +{ipad * 100:.0f}%p"
     big = bool(eff) and call > PRESSURE * eff and not allin
+    if allin and not c.closing and pos not in (None, "BB"):
+        # 올인 콜은 뒤에 아직 안 행동한 사람이 있으면 그 사람이 더 센 핸드로 깨울 수 있다 (콜러/오버콜 위험).  에쿼티는 돈 넣은 사람만 상대라 따로 가산
+        need_a += min(0.04, 0.01 * pf.behind(pos, players))
     verdict = None
     if allin:
         verdict = "call" if eq >= need_a + 0.005 else "fold"   # 올인은 차트가 아니라 수학으로만
@@ -1462,7 +1473,7 @@ def _preflop_core(c, state):
                  and not c.facing_allin and eff and call <= PRESSURE * eff)
     if vsopen_ok and not c.rb and pos in ("BB", "SB"):
         eq_in = _defence_equity(c, villain, players, eff, callers)   # 범위 에쿼티가 안 들어와도 BB/SB 방어는 팟 오즈로 검증
-    elif vsopen_ok and c.rb and c.opp > 1 + callers and pos != "SB":
+    elif vsopen_ok and c.rb and not c.opp_voluntary and c.opp > 1 + callers and pos != "SB":
         # 리더의 범위 에쿼티는 아직 돈을 안 넣은 사람(뒤의 블라인드 등, 상위 87% 레인지 — 폴드를 못 읽은 자리 포함)까지 '모두 콜' 한
         # 것처럼 센다.  그들은 대부분 폴드하고, 레이즈 위험은 필요 승률 가산(MW_BEHIND)으로 따로 본다 → 이중 감점이라 투기 핸드가
         # 지나치게 폴드됐다 (예: CO 66 vs UTG 오픈, 상대 8명 기준 14% → 폴드).  오프너(+콜러) 레인지 대비 에쿼티로 바꾼다.

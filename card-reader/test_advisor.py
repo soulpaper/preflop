@@ -1116,9 +1116,34 @@ check("실제: CO 66 vs UTG, 범위 에쿼티가 8명 기준(14%) → 오프너 
 check("같은 자리 상대 1명(오프너만) 에쿼티는 그대로 씀", dict(CO66, opponents_in_hand=1, equity=0.45), "콜", 2.0, 0.01)
 r = recommend(dict(CO66, opponents_in_hand=1, equity=0.45))
 results.append((not any("오프너 기준" in d for d in r["detail"]), "상대 1명이면 에쿼티 재계산 표기 없음", r))
-check("SB 는 재계산 제외 (3벳 or 폴드 유지): SB KQo vs UTG 상대 6명", dict(CO66, hero=["Kh", "Qd"], players=7, hero_pos="SB",
-                                                                 call=1.5, pot_total=4.4, opponents_in_hand=6,
-                                                                 equity=0.093, stack_bb=118.7, my_stack=118.7), "폴드")
+SB_KQ = dict(CO66, hero=["Kh", "Qd"], players=7, hero_pos="SB", call=1.5, pot_total=4.4, stack_bb=118.7, my_stack=118.7)
+# 리더가 돈 넣은 사람만 센다 (opponents_basis=voluntary): SB vs UTG 는 상대 = 오프너 1명, 에쿼티도 오프너 레인지 기준 (~40%)
+check("SB KQo vs UTG (돈 넣은 사람 1명, 에쿼티 40%) → 폴드", dict(SB_KQ, opponents_in_hand=1, opponents_basis="voluntary",
+                                                         equity=0.40), "폴드")
+check("SB 는 돈 넣은 사람 기준 에쿼티엔 여유를 더 둔다 (0.07): 42% 는 아직 폴드",
+      dict(SB_KQ, opponents_in_hand=1, opponents_basis="voluntary", equity=0.42), "폴드")
+check("같은 42% 도 기준 표시가 없으면(예전 0.05) 콜 — SB 가드가 voluntary 에서만 강해졌다",
+      dict(SB_KQ, opponents_in_hand=1, equity=0.42), "콜")
+check("SB ATs vs UTG, 에쿼티 42% + voluntary → 폴드", dict(SB_KQ, hero=["Ah", "Ts"], opponents_in_hand=1,
+                                                        opponents_basis="voluntary", equity=0.42), "폴드")
+check("SB AJo vs UTG, 에쿼티 42% + voluntary → 차트 콜 유지", dict(SB_KQ, hero=["Ah", "Jd"], opponents_in_hand=1,
+                                                            opponents_basis="voluntary", equity=0.42), "콜")
+check("SB KQo vs UTG: 에쿼티가 충분히 높으면(46%) voluntary 여도 콜",
+      dict(SB_KQ, opponents_in_hand=1, opponents_basis="voluntary", equity=0.46), "콜")
+# 림퍼 + 오프너 (콜러 0 으로 역산) 에 voluntary 상대 2명: '아직 안 낸 사람 제외' 재계산 우회로를 타지 않는다
+r = recommend(dict(CO66, opponents_in_hand=2, equity=0.45, opponents_basis="voluntary"))
+results.append((r["action"] == "콜" and not any("오프너 기준" in d for d in r["detail"]),
+                "voluntary 기준 상대 2명 (림퍼+오프너, 역산 콜러 0): 우회 재계산 문구 없음 + 콜", r))
+r = recommend(dict(CO66, opponents_in_hand=2, equity=0.45))
+results.append((any("오프너 기준" in d for d in r["detail"]), "기준 표시 없는 옛 ctx 는 우회 재계산 그대로", r))
+# 올인 콜: 뒤에 아직 안 행동한 사람이 있으면 필요 승률 가산 (최대 4%p), 닫는 액션/BB 는 그대로
+JAMCALL = dict(PF, hero=["Ah", "Js"], players=9, hero_pos="U1", situation="jamcall", villain_pos="UTG", stack_bb=10,
+               my_stack=10, call=10, pot_total=11.5, facing_allin=True, equity_basis="range", opponents_in_hand=1,
+               can_check=False, equity=0.50)
+check("UTG 10BB 올인에 U1 AJs (9인, 뒤 7명), 승률 50% (필요 47%) → 뒤 사람 가산으로 폴드", JAMCALL, "폴드")
+check("같은 올인을 BB(닫는 액션)에서 AJs 50% → 콜", dict(JAMCALL, hero_pos="BB", closing_action=True), "콜", 10)
+check("같은 올인, 내 뒤에 아무도 안 남은(closing) 액션이면 가산 없음 → 콜", dict(JAMCALL, closing_action=True), "콜", 10)
+check("U1 AJs 승률 52% 면 뒤 사람 가산(4%p)을 넘어서 콜", dict(JAMCALL, equity=0.52), "콜", 10)
 # 3) 헤즈업 진짜 드로우 내재 배당 (실제 2026-11-04: 턴 플러시 드로우, 21BB 콜 / 팟 84BB / 뒷스택 227BB → '+2.3BB 필요' 인데 폴드)
 TFD = dict(hero=["9h", "3h"], board=["2d", "6h", "Ah", "Ad"], opponents_in_hand=1, to_act=True, equity_basis="range")
 check("실제: 턴 플러시 드로우 vs 1/3 팟 벳, 뒷스택 227BB → 콜 (내재 배당)",
