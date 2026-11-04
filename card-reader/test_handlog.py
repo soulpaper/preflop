@@ -812,6 +812,30 @@ def test_to_handread_tiny_allin_is_not_a_3bet():
     assert _pre(raw, "C") == ["open", "call_3bet"], raw["C"]
 
 
+def _derive_stats(pre, seats):
+    rec = {"actions": _rb({"preflop": pre}), "seats": {k: {} for k in seats}, "streets": "preflop"}
+    return {k: s["stats"] for k, s in handlog.derive(rec)["seats"].items()}
+
+
+def test_derive_threebet_uses_clean_preflop():
+    """derive 는 정리된 프리플랍으로 vpip/pfr/3벳을 센다 (짧은 올인·콜 금액 재읽기·오픈 두 번 읽음)."""
+    # ① C 오픈 2.0, B 가 2.1 '레이즈'(올인 아님) = 콜 금액을 다시 읽음: 3벳 기회 1, 3벳 0, pfr 0
+    d = _derive_stats(_BLINDS + [_pa("C", "raise", 2.0), _pa("B", "raise", 2.1)], "SBC")
+    assert (d["B"]["threebet_opp"], d["B"]["threebet"], d["B"]["pfr"], d["B"]["vpip"]) == (1, 0, 0, 1), d["B"]
+    # ② 짧은 올인 S 2.1: 기회는 있되 3벳 아님(pfr 은 공격 행동이라 1), 뒤의 B 콜도 기회 1
+    d = _derive_stats(_BLINDS + [_pa("C", "raise", 2.0), _pa("S", "raise", 2.1, True), _pa("B", "call", 2.1)], "SBC")
+    assert (d["S"]["threebet_opp"], d["S"]["threebet"], d["S"]["pfr"]) == (1, 0, 1), d["S"]
+    assert (d["B"]["threebet_opp"], d["B"]["threebet"]) == (1, 0), d["B"]
+    # ③ 진짜 3벳
+    d = _derive_stats(_BLINDS + [_pa("C", "raise", 2.0), _pa("B", "raise", 6.0)], "SBC")
+    assert (d["B"]["threebet"], d["B"]["threebet_opp"]) == (1, 1), d["B"]
+    assert (d["C"]["threebet_opp"], d["C"]["pfr"]) == (0, 1), d["C"]
+    # ④ 오픈 1.3 → 2.0 두 번 읽음: BTN 6.0 은 3벳, C 는 한 번만 센다
+    d = _derive_stats(_BLINDS + [_pa("C", "raise", 1.3), _pa("C", "raise", 2.0), _pa("D", "raise", 6.0)], "SBCD")
+    assert (d["D"]["threebet"], d["D"]["threebet_opp"]) == (1, 1), d["D"]
+    assert (d["C"]["threebet_opp"], d["C"]["pfr"]) == (0, 1), d["C"]
+
+
 def test_to_handread_tiny_raise_not_allin_is_a_call():
     """올인 아닌 2.0 → 2.1 '레이즈' = 콜 금액을 다시 읽은 것."""
     acts = _rb({"preflop": _BLINDS + [_pa("U", "raise", 2.0), _pa("C", "raise", 2.1), _pa("D", "call", 2.1)]})

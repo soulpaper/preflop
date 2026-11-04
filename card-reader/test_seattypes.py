@@ -5,7 +5,7 @@ import types as _t
 
 import seattypes as sty
 
-NAMES = {"seat_BL": ("Alpha77", False), "seat_UL": ("Bravo", False), "seat_TC": ("User84", True),
+NAMES = {"seat_BL": ("Alpha77", False), "seat_UL": ("Bravo", False), "seat_TC": ("User0", True),
          "seat_UR": ("Charlie", False), "seat_BR": ("Delta", False)}
 KEYS = list(NAMES) + ["hero"]
 POS = {"seat_BL": "SB", "seat_UL": "BB", "seat_TC": "UTG", "seat_UR": "CO", "seat_BR": "BTN", "hero": "MP"}
@@ -29,8 +29,8 @@ def popup(name, style="LP", vpip=48, pfr=6):
 
 
 def test_same_person():
-    assert sty.same_person(("User85", True), "User851112222")       # 잘린 이름 접두사
-    assert not sty.same_person(("User84", True), "User851112222")
+    assert sty.same_person(("User2", True), "User200000002")       # 잘린 이름 접두사
+    assert not sty.same_person(("User0", True), "User200000002")
     assert sty.same_person("Charlie", ("Char1ie", False))           # OCR 오타 한 글자
     assert not sty.same_person("Alpha77", "Bravo")
     assert not sty.same_person(("", False), "x")
@@ -41,9 +41,9 @@ def test_popup_assign_and_profile():
     st.observe(NAMES, state(), 1.0)
     k = st.apply_popup(popup("Charlie", "LAG", 55, 30), NAMES, 2.0)
     assert k == "seat_UR" and st.style("seat_UR") == "LAG" and st.known("seat_UR")
-    assert st.apply_popup(popup("User849990001", "TP"), NAMES, 2.5) == "seat_TC", "잘린 이름 좌석에 전체 이름 팝업"
+    assert st.apply_popup(popup("User000000001", "TP"), NAMES, 2.5) == "seat_TC", "잘린 이름 좌석에 전체 이름 팝업"
     full = st.full_names(NAMES)
-    assert full["seat_TC"] == ("User849990001", False) and full["seat_BL"] == NAMES["seat_BL"]
+    assert full["seat_TC"] == ("User000000001", False) and full["seat_BL"] == NAMES["seat_BL"]
     assert st.apply_popup(popup("Nobody99"), NAMES, 3.0) is None, "모르는 이름 + 안내 없음 → 저장 안 함"
     hero_names = dict(NAMES, hero=("MyName", False))
     assert st.apply_popup(popup("MyName"), hero_names, 3.0) is None, "내 캐릭터"
@@ -243,7 +243,7 @@ def test_synthetic_run_writes_no_names():
         tr = handlog.Tracker("syn")
         tr.on_hand = lambda r: (store.observe(r, names=tr.names_for(r["id"])), log.link_hand(r))
         tps = sty.SeatTypes()
-        names = {"seat_BL": ("Alpha77", False), "seat_UL": ("Bravo", False), "seat_TC": ("User84", True),
+        names = {"seat_BL": ("Alpha77", False), "seat_UL": ("Bravo", False), "seat_TC": ("User0", True),
                  "seat_UR": ("Charlie", False), "seat_BR": ("Delta", False)}
 
         class T(Table):
@@ -261,7 +261,7 @@ def test_synthetic_run_writes_no_names():
                     self.tr.update = orig
         tb = T(tr, names=names)
         tb.step()
-        tps.apply_popup(popup("User849990001", "LAG"), names, tb.t)
+        tps.apply_popup(popup("User000000001", "LAG"), names, tb.t)
         tps.apply_popup(popup("Charlie", "TP"), names, tb.t)
         tb.step(bets={"UTG": 2.5}, bubble={"UTG": "raise"})
         prof = {k: p for k in names for p in [tps.profile(k, store.get_for_table(names).get(k))] if p}
@@ -273,7 +273,7 @@ def test_synthetic_run_writes_no_names():
         tb.step(fold=["UTG"], bubble={"UTG": "fold"})
         rec = finish(tb)
         text = "".join(f.read_text(encoding="utf-8") for f in tmp.rglob("*") if f.is_file())
-        for nm in ("Alpha77", "Bravo", "User84", "Charlie", "Delta", "User849990001"):
+        for nm in ("Alpha77", "Bravo", "User0", "Charlie", "Delta", "User000000001"):
             assert nm not in text, nm
         assert sorted(p.name for p in tmp.rglob("*") if p.is_file() and not p.name.endswith(".jsonl")) == []
         hands = [json.loads(x) for x in next((tmp / "hands").glob("[0-9]*.jsonl")).read_text(encoding="utf-8").splitlines()]

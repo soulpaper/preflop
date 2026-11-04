@@ -36,6 +36,7 @@ import glob
 import json
 import math
 import os
+import random
 import re
 import sys
 from collections import Counter, OrderedDict, defaultdict
@@ -50,6 +51,17 @@ STREET_KO = {"preflop": "프리플랍", "flop": "플랍", "turn": "턴", "river"
 NEED = {"preflop": 0, "flop": 3, "turn": 4, "river": 5}
 EPS = 0.01                     # 범위 확률을 균등과 섞는 비율 (0 확률 → 무한 로그손실 방지)
 VARIANTS = ("live", "raw", "pre", "notype", "uniform")
+# 기여 분리 (순서 고정): 앞 변형에서 한 가지씩 켠다. 입력은 모두 live seats(정리·크기·스택) + 유형 프로필.
+#   base 는 b538c3d 이전 MULT·차트 밖 0·유형 없음, +tail 은 차트 밖 꼬리(PRE_FLOOR), +mult 는 현재 MULT, +style/+style1 은 유형 보정 0.5/1.0
+ABLATION = (
+    ("base", {"mult_set": "prev", "pre_floor": 0, "style_strength": 0}),
+    ("+tail", {"mult_set": "prev", "pre_floor": 0.07, "style_strength": 0}),
+    ("+mult", {"mult_set": "current", "pre_floor": 0.07, "style_strength": 0}),
+    ("+style", {"mult_set": "current", "pre_floor": 0.07, "style_strength": 0.5}),
+    ("+style1", {"mult_set": "current", "pre_floor": 0.07, "style_strength": 1.0}),
+)
+ABL_NAMES = tuple(n for n, _ in ABLATION)
+BOOT_SEED = 20261105
 POST_WORDS = ("check", "bet", "call", "raise", "fold")
 FAMILY = {"check": "체크", "call": "콜", "aggr": "벳/레이즈"}
 OUT_NAME = "read_scores.json"
@@ -411,8 +423,8 @@ def _session_defaults(decs):
     return out
 
 
-def score_hands(hands, decs, ok_only=False):
-    """→ (rows, logged_rows, skipped Counter)."""
+def score_hands(hands, decs, ok_only=False, ablation=False):
+    """→ (rows, logged_rows, skipped Counter). ablation=True 면 행마다 row["abl"][변형] = 점수 (ABLATION 5개)."""
     skipped = Counter()
     decs_by_hand = defaultdict(list)
     for d in sorted(decs, key=lambda d: d.get("t") or 0):
@@ -495,6 +507,13 @@ def score_hands(hands, decs, ok_only=False):
                 for var in ("live", "raw", "pre", "notype"):
                     row[var] = score_result(ests[var], key, code, y, n_live)
                 row["uniform"] = score_uniform(b, dead, y, n_live)
+                if ablation:
+                    row["abl"] = {}
+                    for name, cfg in ABLATION:
+                        with hr.switches(**cfg):
+                            res = hr.estimate({k: truncate(live_seats[k], st)}, b, players, dead=dead,
+                                              profiles=prof_arg, stack_bb=stack, ante=ante)[k]
+                        row["abl"][name] = score_result(res, key, code, y, n_live)
                 row["class_names"] = names
                 rows.append(row)
                 line = logged.get((rec.get("id"), st, k))
@@ -565,7 +584,7 @@ def group(rows, keyfn):
     return g
 
 
-def summarize(rows, lrows, skipped):
+def summarize(rows, lrows, skipped, bet_fold=None):
     post = [r for r in rows if r["street"] != "preflop"]
     final = {}
     for r in rows:
@@ -599,6 +618,8 @@ def summarize(rows, lrows, skipped):
     s["calibration_postflop_all"] = {"n": len(post), "classes": calibration(post)}
     s["calibration_preflop"] = {"n": sum(1 for r in rows if r["street"] == "preflop"),
                                 "classes": calibration([r for r in rows if r["street"] == "preflop"])}
+    if bet_fold:
+        s["bet_fold_by_type"] = bet_fold
     if lrows:
         lg = OrderedDict()
         for k, v in group(lrows, lambda r: r["street"]).items():
@@ -610,6 +631,150 @@ def summarize(rows, lrows, skipped):
                      "summary_claims": _mean([x["covered"] / 100 for x in summ])}
         s["logged"] = lg
     return s
+
+
+# --- 기여 분리: 부트스트랩 -------------------------------------------------------------------------
+def _pctile(sorted_xs, q):
+    return sorted_xs[int(round(q * (len(sorted_xs) - 1)))]
+
+
+def bootstrap_ablation(rows, B=1000, seed=BOOT_SEED, subset=None):
+    """행의 abl 로 변형별 정보이득(bit, 무작위 대비)과 연속 변형 간 Δ(bit, 뒤 - 앞)의 95% 신뢰구간 (짝지은 부트스트랩).
+    묶음 단위 = (hand, seat) (그 좌석의 모든 스트리트 행을 함께 뽑는다 — 같은 상대 패의 행은 독립이 아니다).
+    subset: 행 -> bool (예: 포스트플랍만). STYLE Δ(+style-+mult, +style1-+style)는 유형이 있는 묶음에서만.
+    → {"n_bundles", "n_typed", "bits": {변형: (추정, 하한, 상한)}, "delta": {"+tail-base": (...), ...}}"""
+    bun = OrderedDict()
+    for r in rows:
+        if not r.get("abl") or (subset is not None and not subset(r)):
+            continue
+        v = bun.setdefault((r["hand"], r["seat"]), [0, 0.0] + [0.0] * len(ABL_NAMES) + [False])
+        v[0] += 1
+        v[1] += r["uniform"]["ll"]
+        for i, n in enumerate(ABL_NAMES):
+            v[2 + i] += r["abl"][n]["ll"]
+        v[-1] = v[-1] or r.get("type", "없음") != "없음"
+    vecs = list(bun.values())
+    typed = [v for v in vecs if v[-1]]
+    pairs = [(ABL_NAMES[i + 1] + "-" + ABL_NAMES[i], i) for i in range(len(ABL_NAMES) - 1)]
+    ln2 = math.log(2)
+
+    def stats(vs, which):
+        """which: 'bits' -> {변형: bit}, 'delta' -> {쌍: bit}. 총합 기준 (행 수로 가중한 평균)."""
+        n = sum(v[0] for v in vs)
+        if not n:
+            return None
+        tot = [sum(v[j] for v in vs) for j in range(len(ABL_NAMES) + 2)]
+        if which == "bits":
+            return {nm: (tot[1] - tot[2 + i]) / n / ln2 for i, nm in enumerate(ABL_NAMES)}
+        return {nm: (tot[2 + i] - tot[3 + i]) / n / ln2 for nm, i in pairs}
+
+    def is_typed_pair(nm):
+        return "style" in nm.split("-")[0]
+
+    out = {"n_bundles": len(vecs), "n_typed": len(typed), "bits": {}, "delta": {}}
+    est_b = stats(vecs, "bits")
+    est_d_all, est_d_typed = stats(vecs, "delta"), stats(typed, "delta")
+    draws = {"bits": {nm: [] for nm in ABL_NAMES}, "delta": {nm: [] for nm, _ in pairs}}
+    rng = random.Random(seed)
+    if vecs and B > 0:
+        for _ in range(B):
+            samp = [vecs[rng.randrange(len(vecs))] for _ in vecs]
+            sb, sd = stats(samp, "bits"), stats(samp, "delta")
+            for nm in ABL_NAMES:
+                draws["bits"][nm].append(sb[nm])
+            samp_t = [typed[rng.randrange(len(typed))] for _ in typed] if typed else []
+            sdt = stats(samp_t, "delta") if samp_t else None
+            for nm, _ in pairs:
+                x = sdt[nm] if (is_typed_pair(nm) and sdt) else None if is_typed_pair(nm) else sd[nm]
+                if x is not None:
+                    draws["delta"][nm].append(x)
+
+    def pack(est, xs):
+        if est is None:
+            return None
+        if not xs:
+            return (est, est, est)
+        xs = sorted(xs)
+        return (est, _pctile(xs, 0.025), _pctile(xs, 0.975))
+
+    for nm in ABL_NAMES:
+        out["bits"][nm] = pack(est_b and est_b[nm], draws["bits"][nm])
+    for nm, _ in pairs:
+        est = (est_d_typed if is_typed_pair(nm) else est_d_all)
+        out["delta"][nm] = pack(est and est[nm], draws["delta"][nm])
+    return out
+
+
+def decide(boot):
+    """부트스트랩 결과 → 권고. MULT 먼저, 그다음 STYLE. Δ 신뢰구간 하한 > 0 이면 유지, 상한 < 0 이면 되돌림(MULT→prev, STYLE→0),
+    그 외는 근거 부족 → 되돌림 권고(보류). +style1 - +style 의 하한 > 0 이면 STYLE_STRENGTH 1.0 제안."""
+    def verdict(key, undo):
+        d = (boot.get("delta") or {}).get(key)
+        if d is None:
+            return {"verdict": "보류", "delta": None, "action": f"표본 없음 → {undo} 권고"}
+        _, lo, hi = d
+        if lo > 0:
+            return {"verdict": "유지", "delta": d, "action": "현재 값 유지"}
+        if hi < 0:
+            return {"verdict": "되돌림", "delta": d, "action": f"{undo}"}
+        return {"verdict": "보류", "delta": d, "action": f"근거 부족 → {undo} 권고 (보류)"}
+    out = {"mult": verdict("+mult-+tail", "MULT_SET=prev 로 되돌림"),
+           "style": verdict("+style-+mult", "STYLE_STRENGTH=0 으로 되돌림")}
+    d1 = (boot.get("delta") or {}).get("+style1-+style")
+    out["style_strength_suggest"] = 1.0 if d1 is not None and d1[1] > 0 else None
+    return out
+
+
+# --- 벳 후 폴드율 (유형별) ------------------------------------------------------------------------
+def wilson(k, n, z=1.96):
+    """이항 비율의 Wilson 95% 구간 (하한, 상한)."""
+    if not n:
+        return (None, None)
+    p = k / n
+    den = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / den
+    h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
+    return (max(0.0, c - h), min(1.0, c + h))
+
+
+def bet_fold_rates(hands, decs):
+    """유형(LAG/LP/TAG/TP/없음) x 스트리트별: 상대(hero 아님)의 포스트플랍 벳/레이즈 중 '벳하고 다 폴드시킨' 비율.
+    confidence=ok 기록만. 분자 = 쇼다운 없음 + 핸드의 마지막 벳/레이즈 + 이후 다른 좌석의 콜/벳/레이즈 없음 +
+    다른 좌석이 모두 폴드 + 이 액션 뒤 다른 좌석 폴드 1번 이상. 쇼다운 편향 없이 '벳 = 밸류 vs 블러프' 비율을 가늠하는 데 쓴다.
+    → {유형: {스트리트|'all': {n, k, rate, lo, hi}}}"""
+    profs = defaultdict(dict)
+    for d in decs:
+        for k, s in (d.get("seats") or {}).items():
+            if isinstance(s, dict) and isinstance(s.get("profile"), dict):
+                profs[d.get("hand_id")][k] = s["profile"]
+    cnt = defaultdict(lambda: [0, 0])      # (유형, 스트리트) -> [n, k]
+    for rec in hands:
+        if rec.get("confidence") != "ok":
+            continue
+        acts = rec.get("actions") or {}
+        seats = rec.get("seats") or {}
+        seq = [(st, a) for st in STREETS[1:] for a in acts.get(st) or [] if isinstance(a, dict)]
+        last_aggr = max((i for i, (_, a) in enumerate(seq) if a.get("act") in ("bet", "raise")), default=None)
+        for i, (st, a) in enumerate(seq):
+            k = a.get("seat")
+            if a.get("act") not in ("bet", "raise") or (seats.get(k) or {}).get("hero"):
+                continue
+            typ = seat_type(seats.get(k), profs.get(rec.get("id"), {}).get(k)) or "없음"
+            win = (rec.get("showdown") is None and i == last_aggr
+                   and not any(b.get("seat") != k and b.get("act") in ("call", "bet", "raise") for _, b in seq[i + 1:])
+                   and all(s.get("folded") for kk, s in seats.items() if kk != k)
+                   and any(b.get("seat") != k and b.get("act") == "fold" for _, b in seq[i + 1:]))
+            for key in ((typ, st), (typ, "all")):
+                cnt[key][0] += 1
+                cnt[key][1] += int(win)
+    out = OrderedDict()
+    for t in ("LAG", "LP", "TAG", "TP", "없음"):
+        for st in STREETS[1:] + ("all",):
+            n, k = cnt.get((t, st), (0, 0))
+            if n:
+                lo, hi = wilson(k, n)
+                out.setdefault(t, OrderedDict())[st] = {"n": n, "k": k, "rate": k / n, "lo": lo, "hi": hi}
+    return out
 
 
 # --- 보고 --------------------------------------------------------------------------------------
@@ -670,6 +835,14 @@ def report(s, out=None):
             parts = [f"{n} {_pct(v['pred'])}/{_pct(c['classes_notype'][n]['pred'])}→{_pct(v['actual'])}"
                      for n, v in c["classes"].items() if v["pred"] >= 0.03 or v["actual"] > 0]
             w(f"  보정 {k} (n={c['n']}, 예측 live/notype→실제): " + " · ".join(parts) + "\n")
+    if s.get("bet_fold_by_type"):
+        w("\n[상대 벳/레이즈 후 전원 폴드 비율 (유형별, confidence=ok, Wilson 95%)]\n")
+        for t, by in s["bet_fold_by_type"].items():
+            for st, v in by.items():
+                w(f"  {t:<4} {STREET_KO.get(st, '전체'):<6} n={v['n']:>3} 폴드로 끝 {v['k']:>3} = {_pct(v['rate'], 1)}"
+                  f" (95% {_pct(v['lo'], 1)} ~ {_pct(v['hi'], 1)})\n")
+    if s.get("ablation"):
+        _report_ablation(s["ablation"], w)
     w("\n[기록 신뢰도별]\n")
     for k, a in s["by_confidence"].items():
         w(_line(str(k), a) + "\n")
@@ -691,6 +864,31 @@ def report(s, out=None):
     w("\n주의: 쇼다운까지 간 핸드만 보임 → 폴드시킨 블러프가 빠져 공격 액션의 에어 비중은 실제보다 낮게 관측된다. 표본이 작다.\n")
 
 
+def _ci(x, d=3):
+    return "-" if x is None else f"{x[0]:+.{d}f} [{x[1]:+.{d}f}, {x[2]:+.{d}f}]"
+
+
+def _report_ablation(ab, w):
+    w("\n[기여 분리: 무작위 대비 정보이득(bit) 추정 [95% 구간], (hand, seat) 묶음 부트스트랩]\n")
+    for label, key in (("전체", "all"), ("포스트플랍", "post")):
+        b = ab.get(key)
+        if not b:
+            continue
+        w(f"  {label} (묶음 {b['n_bundles']}, 유형 있는 묶음 {b['n_typed']}):\n")
+        for nm in ABL_NAMES:
+            w(f"    {nm:<8} {_ci(b['bits'].get(nm))}\n")
+        for nm, d in b["delta"].items():
+            w(f"    Δ {nm:<14} {_ci(d)}\n")
+    dec = ab.get("decision")
+    if dec:
+        w("  [판정 (포스트플랍 기준; 구간 하한>0 유지 / 상한<0 되돌림 / 그 외 근거 부족=되돌림 권고)]\n")
+        for nm, ko in (("mult", "MULT 행 변경(b538c3d)"), ("style", "STYLE_ADJ 유형 보정(0.5)")):
+            v = dec[nm]
+            w(f"    {ko}: {v['verdict']} — {v['action']} (Δ {_ci(v['delta'])})\n")
+        if dec.get("style_strength_suggest"):
+            w(f"    STYLE_STRENGTH {dec['style_strength_suggest']} 이 0.5 보다 낫다 (구간 하한>0) → 1.0 제안\n")
+
+
 def _jsonable(rows):
     out = []
     for r in rows:
@@ -699,6 +897,10 @@ def _jsonable(rows):
             if var in r2:
                 r2[var] = {k: (round(v, 4) if isinstance(v, float) else
                                [round(x, 4) for x in v] if isinstance(v, list) else v) for k, v in r2[var].items()}
+        if "abl" in r2:
+            r2["abl"] = OrderedDict((n, {k: (round(v, 4) if isinstance(v, float) else
+                                             [round(x, 4) for x in v] if isinstance(v, list) else v)
+                                         for k, v in sc.items()}) for n, sc in r2["abl"].items())
         out.append(r2)
     return out
 
@@ -709,13 +911,19 @@ def main(argv=None):
     ap.add_argument("--ok-only", action="store_true", help="confidence=ok 기록만")
     ap.add_argument("--json", help=f"JSON 요약 경로 (기본: 데이터 폴더/{OUT_NAME})")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--boot", type=int, default=1000, help="기여 분리 부트스트랩 횟수 (기본 1000, 0 이면 생략)")
+    ap.add_argument("--no-ablation", action="store_true", help="기여 분리(변형별 재생) 건너뜀")
     args = ap.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     folder = data_dir(args.folder)
     hands, decs = load(folder)
-    rows, lrows, skipped = score_hands(hands, decs, ok_only=args.ok_only)
-    s = summarize(rows, lrows, skipped)
+    abl = not args.no_ablation
+    rows, lrows, skipped = score_hands(hands, decs, ok_only=args.ok_only, ablation=abl)
+    s = summarize(rows, lrows, skipped, bet_fold=bet_fold_rates(hands, decs))
+    if abl and args.boot > 0 and rows:
+        post = bootstrap_ablation(rows, args.boot, subset=lambda r: r["street"] != "preflop")
+        s["ablation"] = {"all": bootstrap_ablation(rows, args.boot), "post": post, "decision": decide(post)}
     if not args.quiet:
         report(s)
     path = args.json or os.path.join(folder, OUT_NAME)

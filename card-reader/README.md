@@ -167,6 +167,8 @@ CARD_READER_DIR=<card-reader 저장소 폴더>
 - 포스트플랍(헤즈업): 솔버 데이터로 맞춘 기준표 `HU_GTO`. 다자 팟은 그 위에 다자 보정
 - 상대 패 예상: `handread.py` (행동·성향 기반 범위), 행동 기록 `handlog.py`, 성향 DB `profiles.py`, 게임 '유저 정보' 팝업 읽기 `userinfo.py`
 - 테스트: `python test_advisor.py`, `test_rangeq.py`, `test_handread.py`, `test_handlog.py`, `test_solverlib.py`
+- 상대 패 예상 전환 스위치 (`handread.py`): `MULT_SET`("current"/"prev" = b538c3d 이전 배율), `PRE_FLOOR`(0.07, 0 이면 차트 밖 패 가중치 없음), `STYLE_STRENGTH`(유형 보정 세기). `hr.configure(...)` / `with hr.switches(...)` 로 바꾸고 복원한다. `score_reads.py` 는 이 스위치로 기여를 하나씩 켜 보고(`--boot B`, `--no-ablation`) 부트스트랩 구간으로 유지/되돌림을 권고한다.
+- 동작 변경: `STYLE_STRENGTH` 기본값이 0.5 라서 상대 유형(LAG/LP/TAG/TP) 보정이 e815500(1.0)보다 절반 세기로 적용된다. 앱의 상대 패 예상이 e815500 과 달라진다 (`STYLE_STRENGTH=1.0` 으로 되돌릴 수 있음). `handlog.derive` 의 3벳 집계는 정리된 프리플랍(`clean_preflop`)을 쓴다.
 
 ### GTO 데이터
 

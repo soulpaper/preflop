@@ -231,6 +231,165 @@ _buf2 = _io.StringIO()
 sr.report(sr.summarize([r for r in rows_t if r["type"] == "없음"], [], {}), _buf2)
 test("report: 유형 없는 데이터면 유형 칸 생략", "[상대 유형별" not in _buf2.getvalue())
 
+# --- 8. handlog.derive: 프리플랍 정리본으로 3벳 판정 (합성 4 사례; test_handlog 에도 같은 시험) ----------------------------
+def _derive(pre, seats):
+    acts = []
+    n = 0
+    for k, act, to, allin in pre:
+        a = {"seat": k, "act": act, "raises_before": n}
+        if to is not None:
+            a["to"] = to
+        if allin:
+            a["allin"] = True
+        n += act == "raise"       # Tracker 처럼 정리 전 '레이즈' 수
+        acts.append(a)
+    rec = {"actions": {"preflop": acts}, "seats": {k: {} for k in seats}, "streets": "preflop"}
+    return {k: s["stats"] for k, s in handlog.derive(rec)["seats"].items()}
+
+
+_BL = [("S", "post", 0.5, False), ("B", "post", 1.0, False)]
+d1 = _derive(_BL + [("C", "raise", 2.0, False), ("B", "raise", 2.1, False)], "SBC")
+test("derive ①: 2.1 '레이즈'(올인 아님)는 콜 = B: 3벳기회 1, 3벳 0, pfr 0",
+     (d1["B"]["threebet_opp"], d1["B"]["threebet"], d1["B"]["pfr"], d1["B"]["vpip"]) == (1, 0, 0, 1), str(d1["B"]))
+d2 = _derive(_BL + [("C", "raise", 2.0, False), ("S", "raise", 2.1, True), ("B", "call", 2.1, False)], "SBC")
+test("derive ②: 짧은 올인 S: 기회 1, 3벳 0 (pfr 1), 뒤의 B 콜: 기회 1",
+     (d2["S"]["threebet_opp"], d2["S"]["threebet"], d2["S"]["pfr"]) == (1, 0, 1) and d2["B"]["threebet_opp"] == 1
+     and d2["B"]["threebet"] == 0, str((d2["S"], d2["B"])))
+d3 = _derive(_BL + [("C", "raise", 2.0, False), ("B", "raise", 6.0, False)], "SBC")
+test("derive ③: 진짜 3벳 B: 3벳 1, 오프너 C: 기회 0",
+     (d3["B"]["threebet"], d3["B"]["threebet_opp"], d3["C"]["threebet_opp"], d3["C"]["pfr"]) == (1, 1, 0, 1), str(d3))
+d4 = _derive(_BL + [("C", "raise", 1.3, False), ("C", "raise", 2.0, False), ("D", "raise", 6.0, False)], "SBCD")
+test("derive ④: 오픈 두 번 읽음 → D: 3벳 1, C: 기회 0·pfr 1",
+     (d4["D"]["threebet"], d4["D"]["threebet_opp"], d4["C"]["threebet_opp"], d4["C"]["pfr"]) == (1, 1, 0, 1), str(d4))
+
+# --- 9. 기여 분리 (ablation): 합성 기록 ---------------------------------------------------------------------
+rows_a, _, _ = sr.score_hands([TYP, OLD, OLD2], [DEC_T], ablation=True)
+ba = {(r["hand"], r["street"]): r for r in rows_a}
+test("abl: 모든 행에 변형 5개 (순서 고정)", all(list(r["abl"]) == list(sr.ABL_NAMES) and len(r["abl"]) == 5 for r in rows_a)
+     and sr.ABL_NAMES == ("base", "+tail", "+mult", "+style", "+style1"))
+test("abl: 재생 뒤 스위치 복원", (hr.MULT_SET, hr.PRE_FLOOR, hr.STYLE_STRENGTH) == ("current", 0.07, 0.5))
+test("abl: 유형 없는 행은 +style == +mult == +style1",
+     all(r["abl"]["+style"] == r["abl"]["+mult"] == r["abl"]["+style1"] for r in rows_a if r["type"] == "없음"))
+test("abl: 프리플랍 행은 +mult == +tail, +style == +mult (MULT/유형은 프리플랍에 안 쓰임)",
+     all(r["abl"]["+mult"] == r["abl"]["+tail"] and r["abl"]["+style"] == r["abl"]["+mult"]
+         for r in rows_a if r["street"] == "preflop"))
+test("abl: 유형 있는 포스트플랍 행은 +style != +mult, 0.5 와 1.0 이 다르고 +style == live",
+     ba[("t-0001", "flop")]["abl"]["+style"]["p"] != ba[("t-0001", "flop")]["abl"]["+mult"]["p"]
+     and ba[("t-0001", "flop")]["abl"]["+style1"]["p"] != ba[("t-0001", "flop")]["abl"]["+style"]["p"]
+     and ba[("t-0001", "flop")]["abl"]["+style"]["p"] == ba[("t-0001", "flop")]["live"]["p"])
+test("abl: base 는 차트 밖 꼬리가 없어 +tail 과 프리플랍에서 다름",
+     any(r["abl"]["base"]["p"] != r["abl"]["+tail"]["p"] for r in rows_a if r["street"] == "preflop"))
+test("abl: 기본 호출은 abl 없음 (기존 JSON 형태)", all("abl" not in r for r in rows_t))
+
+
+def srow(h, seat, lls, typ="LP", uni=5.0):
+    return {"hand": h, "seat": seat, "street": "flop", "type": typ, "uniform": {"ll": uni},
+            "abl": {n: {"ll": ll} for n, ll in zip(sr.ABL_NAMES, lls)}}
+
+
+def synth(steps, n=30, typ="LP"):
+    """steps: 변형마다 ll 이 줄어드는 양 (양수 = 좋아짐). 묶음마다 약간의 차이."""
+    out = []
+    for j in range(n):
+        base = 5.0 + (j % 5) * 0.1
+        lls = [base]
+        for st_ in steps:
+            lls.append(lls[-1] - st_ - ((j % 3) * 0.01 if st_ else 0))
+        out.append(srow(f"h{j}", "V", lls, typ))
+    return out
+
+
+good = synth([0.3, 0.3, 0.3, 0.3])
+b1 = sr.bootstrap_ablation(good, B=200)
+b2 = sr.bootstrap_ablation(good, B=200)
+b3 = sr.bootstrap_ablation(good, B=200, seed=1)
+test("bootstrap: 같은 seed 면 같은 결과, 다른 seed 면 구간이 다름", b1 == b2 and b1["delta"] != b3["delta"])
+test("bootstrap: Δ 추정치 = 0.3/ln2 근처, 구간 안에 추정치",
+     all(abs(d[0] - (0.3 + 0.01) / math.log(2)) < 0.05 and d[1] <= d[0] <= d[2] for d in b1["delta"].values()))
+test("bootstrap: 변형별 정보이득은 변형 순서대로 커짐", [b1["bits"][n][0] for n in sr.ABL_NAMES]
+     == sorted(b1["bits"][n][0] for n in sr.ABL_NAMES))
+dup = good + [dict(good[0]), dict(good[0]), dict(good[0], street="turn")]      # 같은 (hand, seat) 행 복제 → 묶음 수 그대로
+test("bootstrap: 묶음 단위 (같은 좌석 행을 복제해도 묶음 수 같음)",
+     sr.bootstrap_ablation(dup, B=20)["n_bundles"] == sr.bootstrap_ablation(good, B=20)["n_bundles"] == 30)
+test("bootstrap: subset (포스트플랍만)", sr.bootstrap_ablation(good, B=20, subset=lambda r: r["street"] == "river")["n_bundles"] == 0)
+mixed = synth([0.3, 0.3, 0.3, 0.3], 10, "없음") + [dict(r, hand="x" + r["hand"]) for r in synth([0.3] * 4, 5)]
+bm = sr.bootstrap_ablation(mixed, B=20)
+test("bootstrap: STYLE Δ 는 유형 있는 묶음만 (유형 5 / 전체 15)", bm["n_bundles"] == 15 and bm["n_typed"] == 5)
+test("decide: 분명히 좋아지면 MULT·STYLE 유지 + 1.0 제안", (lambda d: d["mult"]["verdict"] == "유지" and d["style"]["verdict"] == "유지"
+     and d["style_strength_suggest"] == 1.0)(sr.decide(b1)), str(sr.decide(b1)))
+flat = sr.bootstrap_ablation(synth([0, 0, 0, 0]), B=200)
+df = sr.decide(flat)
+test("decide: Δ 가 0 이면 보류(되돌림 권고), 1.0 제안 없음", df["mult"]["verdict"] == "보류" and df["style"]["verdict"] == "보류"
+     and "되돌림" in df["mult"]["action"] and df["style_strength_suggest"] is None, str(df))
+bad = sr.decide(sr.bootstrap_ablation(synth([0.3, -0.3, -0.3, 0.0]), B=200))
+test("decide: 분명히 나빠지면 되돌림", bad["mult"]["verdict"] == "되돌림" and bad["style"]["verdict"] == "되돌림", str(bad))
+test("wilson: 0/10 하한 0, 5/10 은 0.5 중심", sr.wilson(0, 10)[0] == 0.0 and abs(sum(sr.wilson(5, 10)) / 2 - 0.5) < 1e-9
+     and sr.wilson(0, 0) == (None, None))
+
+# --- 10. 벳 후 폴드율 -------------------------------------------------------------------------------------------
+def bf_hand(hid, flop, typ_v="LP", typ_w="TP", folded=None, showdown=None, conf="ok", turn=None):
+    acts = {"preflop": [], "flop": flop}
+    if turn:
+        acts["turn"] = turn
+    h = hand(hid, acts, ["Ah", "7d", "2s"], {}, conf=conf, folded=folded or {"hero": "preflop"})
+    h["showdown"] = showdown
+    h["seats"]["V"]["type"] = typ_v
+    h["seats"]["W"]["type"] = typ_w
+    return h
+
+
+f1 = bf_hand("b1", [A("W", "check"), A("V", "bet", to=3.0), A("W", "fold", facing=True)],
+             folded={"hero": "preflop", "W": "flop"})
+r1 = sr.bet_fold_rates([f1], [])
+test("bet_fold: 벳 후 전원 폴드 = 분자 1 (LP/flop 1/1)", r1["LP"]["flop"]["k"] == 1 and r1["LP"]["flop"]["n"] == 1
+     and r1["LP"]["all"]["rate"] == 1.0 and r1["LP"]["flop"]["lo"] < 1.0, str(r1))
+f2 = bf_hand("b2", [A("W", "check"), A("V", "bet", to=3.0), A("W", "call", to=3.0, facing=True)], typ_v="TAG",
+             folded={"hero": "preflop"}, showdown={"seats": ["V", "W"], "shown": {}})
+f2b = bf_hand("b2b", [A("W", "check"), A("V", "bet", to=3.0), A("W", "call", to=3.0, facing=True)], typ_v="TAG",
+              folded={"hero": "preflop"})
+r2 = sr.bet_fold_rates([f2, f2b], [])
+test("bet_fold: 콜 / 쇼다운이면 분자 0 (분모에는 포함)", r2["TAG"]["flop"]["n"] == 2 and r2["TAG"]["flop"]["k"] == 0, str(r2))
+f3 = bf_hand("b3", [A("W", "check"), A("V", "bet", to=3.0), A("W", "raise", to=9.0, facing=True), A("V", "fold", facing=True)],
+             typ_v="LAG", typ_w="TAG", folded={"hero": "preflop", "V": "flop"})
+r3 = sr.bet_fold_rates([f3], [])
+test("bet_fold: 레이즈당한 벳은 0 (V 벳 0/1), 그 레이즈는 폴드로 끝 1/1",
+     r3["LAG"]["flop"]["k"] == 0 and r3["LAG"]["flop"]["n"] == 1 and r3["TAG"]["flop"]["k"] == 1, str(r3))
+f4 = bf_hand("b4", [A("W", "check"), A("V", "bet", to=3.0), A("W", "fold", facing=True)], typ_v="TP",
+             folded={"hero": "preflop", "W": "flop"}, conf="low")
+test("bet_fold: low confidence 제외", sr.bet_fold_rates([f4], []) == {})
+f5 = bf_hand("b5", [A("W", "check"), A("V", "bet", to=3.0), A("W", "call", to=3.0, facing=True)], typ_v="TP",
+             turn=[A("W", "check"), A("V", "bet", to=6.0), A("W", "fold", facing=True)], folded={"hero": "preflop", "W": "turn"})
+r5 = sr.bet_fold_rates([f5], [])
+test("bet_fold: 스트리트별 (플랍 벳은 콜 0/1, 턴 벳은 폴드 1/1, all 1/2)",
+     (r5["TP"]["flop"]["k"], r5["TP"]["turn"]["k"], r5["TP"]["all"]["n"], r5["TP"]["all"]["k"]) == (0, 1, 2, 1), str(r5))
+f6 = bf_hand("b6", [A("W", "check"), A("V", "bet", to=3.0), A("W", "fold", facing=True)], typ_v=None,
+             folded={"hero": "preflop", "W": "flop"})
+f6["seats"]["V"].pop("type")
+r6 = sr.bet_fold_rates([f6], [dict(DEC_T, hand_id="b6", street="flop")])
+test("bet_fold: 유형은 결정 기록 프로필의 style (LAG), 없으면 '없음'",
+     "LAG" in r6 and "없음" in sr.bet_fold_rates([f6], []), str(r6))
+f7 = bf_hand("b7", [A("hero", "bet", to=3.0), A("V", "fold", facing=True)], folded={"V": "flop"})
+test("bet_fold: hero 의 벳은 제외", sr.bet_fold_rates([f7], []) == {})
+sbf = sr.summarize(rows_a, [], {}, bet_fold=r1)
+_bb = _io.StringIO()
+sr.report(dict(sbf, ablation={"all": b1, "post": b1, "decision": sr.decide(b1)}), _bb)
+test("report: 벳 후 폴드 절 + 기여 분리 절", "벳/레이즈 후 전원 폴드" in _bb.getvalue() and "기여 분리" in _bb.getvalue()
+     and "MULT 행 변경" in _bb.getvalue() and sbf["bet_fold_by_type"] == r1)
+with tempfile.TemporaryDirectory() as d:
+    with open(os.path.join(d, "2026-01-01.jsonl"), "w", encoding="utf-8") as f:
+        for r in (REC,):
+            f.write(json.dumps(r) + "\n")
+    outp = os.path.join(d, "o.json")
+    sr.main([d, "--json", outp, "--quiet", "--boot", "20"])
+    with open(outp, encoding="utf-8") as f:
+        jj = json.load(f)
+    test("main: 기본은 기여 분리 포함 (rows[].abl, summary.ablation)", "abl" in jj["rows"][0]
+         and set(jj["summary"]["ablation"]) == {"all", "post", "decision"} and len(jj["rows"][0]["abl"]) == 5)
+    sr.main([d, "--json", outp, "--quiet", "--no-ablation"])
+    with open(outp, encoding="utf-8") as f:
+        jj = json.load(f)
+    test("main --no-ablation: abl 없음", "abl" not in jj["rows"][0] and "ablation" not in jj["summary"])
+
 # --- 결과 ---------------------------------------------------------------------------------------
 failed = 0
 for ok, name, info in results:

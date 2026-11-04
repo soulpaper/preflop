@@ -367,6 +367,8 @@ test("describe: '외 N%'(= 나머지 전부 덮는다는 오해) 대신 '중 하
 test("요약 코드 집합 = 표기 토큰을 펼친 것", set(cb["summary_codes"]) and all(len(c) in (2, 3) for c in cb["summary_codes"]))
 
 # --- 상대 유형(유저 정보 팝업 LAG/LP/TAG/TP) 포스트플랍 보정 -------------------------------------------------
+_sw_style = hr.switches(style_strength=1.0)   # 아래 유형 시험은 세기 1.0 (e815500) 기준
+_sw_style.__enter__()
 NP, MP, TP_ = "노페어", "중간·약한 페어", "탑페어+"
 _STY_BET = {"pos": "CO", "preflop": ["open"], "flop": [{"a": "bet", "size": 0.66}]}
 _STY_CALL = {"pos": "BTN", "preflop": ["call"], "opener": "CO", "flop": [{"a": "call", "size": 0.5}]}
@@ -432,6 +434,62 @@ _c_obs_no = sty(_STY_CALL, None, **_obs)
 test("직접 관측 통계가 많으면 유형 보정이 약해진다 (150핸드 → 세기 25%)",
      0 < cl(_c_obs_lp, MP) - cl(_c_obs_no, MP) < (cl(_c["LP"], MP) - cl(_c[None], MP)) * 0.5,
      f"{cl(_c_obs_no, MP)} → {cl(_c_obs_lp, MP)}")
+
+_sw_style.__exit__(None, None, None)
+
+# --- 전환 스위치 (MULT_SET / PRE_FLOOR / STYLE_STRENGTH) ---------------------------------------------
+_orig_mult = {k: (list(v[0]), v[1]) for k, v in hr.MULT.items()}
+_cb_cur = hr._kind_mults_base("cbet_med", 0.0, 0.0)
+with hr.switches(mult_set="prev"):
+    _cb_prev = hr._kind_mults_base("cbet_med", 0.0, 0.0)
+    _prev_mid = hr.MULT["bet_med"]
+_cb_back = hr._kind_mults_base("cbet_med", 0.0, 0.0)
+test("스위치: prev 로 바꾸면 cbet_med 가 다시 계산되고 (M 0.50 기준), 돌아오면 MULT 가 원본과 같다",
+     _prev_mid == ([1.00, 1.00, 1.00, 0.50, 0.30], 0.90) and abs(_cb_prev[0][3] - 0.50 * 1.15) < 1e-12
+     and _cb_prev != _cb_cur and _cb_back == _cb_cur and hr.MULT == _orig_mult and hr.MULT_SET == "current",
+     f"{_cb_prev[0]} / {_cb_cur[0]}")
+hr.MULT_SET = "prev"        # 직접 대입도 동작
+_direct = hr._kind_mults_base("bet_big", 0.0, 0.0)[0][3]
+hr.MULT_SET = "current"
+test("스위치: MULT_SET 직접 대입도 반영", abs(_direct - 0.18) < 1e-12 and abs(hr._kind_mults_base("bet_big", 0, 0)[0][3] - 0.35) < 1e-12)
+_old = hr.configure(mult_set="prev", pre_floor=0.2, style_strength=0.3)
+_mid = (hr.MULT_SET, hr.PRE_FLOOR, hr.STYLE_STRENGTH)
+hr.configure(**_old)
+test("스위치: configure 는 이전 값을 돌려주고 switches/configure 후 복원",
+     _old == {"mult_set": "current", "pre_floor": 0.07, "style_strength": 0.5} and _mid == ("prev", 0.2, 0.3)
+     and (hr.MULT_SET, hr.PRE_FLOOR, hr.STYLE_STRENGTH) == ("current", hr.PRE_FLOOR_DEFAULT, 0.5))
+_bad = 0
+for kw in ({"mult_set": "x"}, {"pre_floor": -1}, {"style_strength": -0.1}, {"pre_floor": "a"}):
+    try:
+        hr.configure(**kw)
+    except ValueError:
+        _bad += 1
+test("스위치: 잘못된 값은 ValueError, 상태는 그대로", _bad == 4 and hr.MULT_SET == "current" and hr.STYLE_STRENGTH == 0.5)
+try:
+    with hr.switches(mult_set="prev", style_strength=0):
+        raise RuntimeError
+except RuntimeError:
+    pass
+test("스위치: 예외가 나도 복원", hr.MULT_SET == "current" and hr.STYLE_STRENGTH == 0.5 and hr.PRE_FLOOR == 0.07)
+
+_pre_open = {"pos": "CO", "preflop": ["open"]}
+_r_floor = one(_pre_open, [])
+with hr.switches(pre_floor=0):
+    _r_nofloor = one(_pre_open, [])
+test("PRE_FLOOR=0: 차트 밖 패는 0 (기본은 차트 밖 패도 > 0)",
+     len(_r_nofloor["range"]) < len(_r_floor["range"]) and len(_r_floor["range"]) >= 1200
+     and all(p > 0 for p in _r_nofloor["range"].values()), f"{len(_r_nofloor['range'])} < {len(_r_floor['range'])}")
+
+with hr.switches(style_strength=0):
+    _s0 = sty(_STY_CALL, "LP")
+test("STYLE 0: 유형 있어도 유형 없음과 출력이 완전히 같고 style 키 없음",
+     _s0 == sty(_STY_CALL, None) and "style" not in _s0 and "style_note" not in _s0)
+with hr.switches(style_strength=1.0):
+    _s1 = sty(_STY_CALL, "LP")
+_s05 = sty(_STY_CALL, "LP")
+_d0, _d1, _d05 = (cl(r, MP) for r in (_s0, _s1, _s05))
+test("STYLE 0.5 (기본): LP 콜 중간 페어 차이가 0 과 1.0 사이", 0 < _d05 - cl(sty(_STY_CALL, None), MP) < _d1 - _d0 and _s05["style"] == "LP",
+     f"{_d0} / {_d05} / {_d1}")
 
 # --- 결과 ---------------------------------------------------------------------------------------
 failed = 0

@@ -50,6 +50,7 @@
   상대 간 카드 제거 효과는 무시하고 상대마다 독립 추정한다.
 """
 import math
+from contextlib import contextmanager
 
 import evaluator as ev
 import preflop as pf
@@ -84,6 +85,17 @@ MULT = {
     "call_big":   ([0.75, 0.90, 0.90, 0.65, 0.08], 0.85),
     "check":      ([0.40, 0.65, 0.50, 1.00, 1.00], 1.00),
 }
+# 전환 스위치용 행 묶음 (score_reads 의 기여 분리 채점): current = 위 MULT, prev = b538c3d 이전 값.
+# prev 와 current 는 bet_small T, bet_med T·M, bet_big M, check T 만 다르다. 직접 MULT 를 고치려면 MULT_SETS["current"] 도 맞출 것.
+MULT_SETS = {"current": {k: (list(v[0]), v[1]) for k, v in MULT.items()}}
+MULT_SETS["prev"] = {k: (list(v[0]), v[1]) for k, v in MULT.items()}
+MULT_SETS["prev"]["bet_small"][0][2] = 1.00
+MULT_SETS["prev"]["bet_med"][0][2] = 1.00
+MULT_SETS["prev"]["bet_med"][0][3] = 0.50
+MULT_SETS["prev"]["bet_big"][0][3] = 0.18
+MULT_SETS["prev"]["check"][0][2] = 0.85
+MULT_SET = "current"
+_MULT_BUILT = None
 # --- 주도권(이니셔티브)별 벳 --------------------------------------------------------------
 #   같은 크기의 벳도 '누가 벳했나'에 따라 범위가 다르다. 크기별 기본 행(bet_*)에 역할 보정 [N, W, T, M, A] 과 드로우 배율을 곱해
 #   MULT 에 lead_/cbet_/delay_/probe_ + small/med/big 행을 만든다 (실제 곱셈 결과는 MULT 에서 그대로 확인 가능).
@@ -109,6 +121,16 @@ def _build_role_rows():
 
 
 _build_role_rows()
+
+
+def _apply_mult_set():
+    """MULT_SET 의 기본 행을 MULT 에 제자리로 써 넣고(dict 참조 유지) 역할 행을 다시 만든다."""
+    global _MULT_BUILT
+    for k, (m, d) in MULT_SETS[MULT_SET].items():
+        MULT[k] = (list(m), d)
+    _build_role_rows()
+    _MULT_BUILT = MULT_SET
+
 
 # --- 상대 유형(게임 유저 정보 팝업의 스타일)별 포스트플랍 보정 ------------------------------------------
 #   유형은 사이트가 VPIP/PFR 로 매긴 것이라, 프리플랍 폭은 지금처럼 VPIP/PFR(rangeq)만 쓰고 이 표는 포스트플랍 액션 배율에만
@@ -433,10 +455,41 @@ def _combo_class_pre(code):
 # 나빠져서 0.07 (차트 폭 15% 범위면 질량의 약 28% 가 차트 밖). 뒤 세션(보류)에서도 같은 방향.
 # PRE_TAIL_MAX: 차트 밖 질량의 상한. 좁은 범위(3벳 5%, 4벳 3%)는 같은 최소값이면 꼬리가 절반 넘게 되어 '3벳 = 아무 패'가 된다 →
 # 꼬리를 40% 로 묶는다 (채점: 0.3~0.5 와 없음이 비슷 — 포커 상식 쪽으로).
-PRE_FLOOR = 0.07
+PRE_FLOOR_DEFAULT = 0.07
+PRE_FLOOR = 0.07       # 0 이면 이전 동작 (_with_floor 가 원본 범위를 그대로 돌려줌)
+STYLE_STRENGTH = 0.5   # 유형 보정의 전체 세기 배율 (e815500 은 1.0; 0 이하면 유형을 아예 무시)
 PRE_TAIL_MAX = 0.4
 JAM_EFFECTIVE = True    # 올인 금액이 내 스택보다 크면 내 스택(유효 스택)으로 — False 면 올인 금액 그대로
+# _PRE_CACHE 키에는 PRE_FLOOR, PRE_TAIL_MAX 가 있다. MULT_SET/STYLE_STRENGTH 는 프리플랍에 안 쓰이므로 키에 넣지 않는다.
 _PRE_CACHE = {}
+
+
+def configure(mult_set=None, pre_floor=None, style_strength=None):
+    """전환 스위치 설정 (None 은 그대로). 바꾸기 전의 값 {mult_set, pre_floor, style_strength} 를 돌려준다 (복원용)."""
+    global MULT_SET, PRE_FLOOR, STYLE_STRENGTH
+    if mult_set is not None and mult_set not in MULT_SETS:
+        raise ValueError(f"mult_set must be one of {sorted(MULT_SETS)}: {mult_set!r}")
+    for name, v in (("pre_floor", pre_floor), ("style_strength", style_strength)):
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not v >= 0):
+            raise ValueError(f"{name} must be a number >= 0: {v!r}")
+    old = {"mult_set": MULT_SET, "pre_floor": PRE_FLOOR, "style_strength": STYLE_STRENGTH}
+    if mult_set is not None:
+        MULT_SET = mult_set
+    if pre_floor is not None:
+        PRE_FLOOR = float(pre_floor)
+    if style_strength is not None:
+        STYLE_STRENGTH = float(style_strength)
+    return old
+
+
+@contextmanager
+def switches(**kw):
+    """with switches(mult_set="prev", pre_floor=0, style_strength=0): ... — 끝나면 이전 값으로 복원."""
+    old = configure(**kw)
+    try:
+        yield
+    finally:
+        configure(**old)
 
 
 def _with_floor(rng):
@@ -579,6 +632,8 @@ def _kind_mults(kind, adj_f, afx, style=None, strength=1.0):
 
 
 def _kind_mults_base(kind, adj_f, afx):
+    if _MULT_BUILT != MULT_SET:
+        _apply_mult_set()
     base, draw = MULT[kind]
     m = list(base)
     d = draw
@@ -739,8 +794,8 @@ def _estimate_one(seat, board, players, dead, profile, stack_bb, ante=False):
     pre_width = _eff_width(weights)
 
     adj_f, afx = _profile_factors(prof)
-    style = _seat_style(seat, prof)
-    s_str = _style_strength(prof) if style else 0.0
+    style = _seat_style(seat, prof) if STYLE_STRENGTH > 0 else None
+    s_str = STYLE_STRENGTH * _style_strength(prof) if style else 0.0
     nb = len(board)
     last_kind = last_street = None
     n_actions = 0

@@ -774,22 +774,24 @@ class Tracker:
 def derive(rec):
     """rec['seats'][k]['stats'] 를 채움: 이번 핸드에서의 카운터 (profiles.Store 가 더함)."""
     acts = rec.get("actions") or {}
+    # 프리플랍은 정리본으로 센다 (금액 재읽기·작은 올인·레이즈가 될 수 없는 '레이즈' 보정; raises_before 도 다시 매김)
+    pre_clean = clean_preflop(acts.get("preflop"))[0]
+    opener = next((x["seat"] for x in pre_clean if x["act"] == "raise" and not x.get("incomplete")), None)
     reached = STREETS.index(rec.get("streets") or "preflop")
     sd = set((rec.get("showdown") or {}).get("seats") or [])
     for k, seat in rec["seats"].items():
         st = {"hands": 1, "vpip": 0, "pfr": 0, "threebet": 0, "threebet_opp": 0, "faced_bet": 0, "fold_to_bet": 0,
               "agg": 0, "calls": 0, "saw_flop": 0, "showdown": 0}
-        pre = [a for a in acts.get("preflop", []) if a["seat"] == k and a["act"] != "post"]
+        pre = [a for a in pre_clean if a.get("seat") == k and a.get("act") != "post"]
         if any(a["act"] in ("call", "raise", "bet", "unknown") for a in pre):
             st["vpip"] = 1
         if any(a["act"] in ("raise", "bet") for a in pre):
             st["pfr"] = 1
         for a in pre:
             if a.get("raises_before") == 1 and a["act"] in ("call", "raise", "fold"):
-                opener = next((x["seat"] for x in acts.get("preflop", []) if x["act"] == "raise"), None)
                 if opener != k:
                     st["threebet_opp"] = 1
-                    if a["act"] == "raise":
+                    if a["act"] == "raise" and not a.get("incomplete"):   # 짧은 올인은 기회만 (3벳 아님)
                         st["threebet"] = 1
                 break
         folded_pre = seat.get("folded") == "preflop"
