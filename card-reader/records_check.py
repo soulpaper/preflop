@@ -24,8 +24,8 @@ TOP_KEY_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
 _STRUCT = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{}]')
 
 
-FILTER_V = 3      # redacted 의 값 = 필터 판 번호 (명세 12.2, 13.2)
-ACCEPT_MIN = 3    # 리눅스 수신·--recheck 가 받는 가장 낮은 판 (명세 13.2-7)
+FILTER_V = 4      # redacted 의 값 = 필터 판 번호 (명세 12.2, 13.2)
+ACCEPT_MIN = 4    # 리눅스 수신·--recheck 가 받는 가장 낮은 판 (명세 13.2-7)
 
 SEAT_PAT = r"^(hero|opp[1-9][0-9]?|seat_[A-Z]{1,4})$"
 POS_PAT = r"^(UTG|U1|U2|U3|MP|LJ|HJ|CO|BTN|SB|BB)$"
@@ -96,12 +96,12 @@ BADCP = ((0x00, 0x1F), (0x7F, 0x9F), (0x200B, 0x200F), (0x202A, 0x202E), (0x2060
          (0xE000, 0xF8FF), (0xFEFF, 0xFEFF), (0xFFF0, 0xFFFF))
 
 
-def _ty(j, re_="", en="", ref=0, text=0):
-    return {"j": sorted(j.split()), "re": re_, "en": en, "ref": ref, "text": text}
+def _ty(j, re_="", en="", ref=0, text=0, nn=0):
+    return {"j": sorted(j.split()), "re": re_, "en": en, "ref": ref, "text": text, "nn": nn}
 
 
 TYPES = {
-    "NUM": _ty("num"), "BOOL": _ty("bool"), "NUMBOOL": _ty("bool num"),
+    "NUM": _ty("num"), "NUM0": _ty("num", nn=1), "BOOL": _ty("bool"), "NUMBOOL": _ty("bool num"),
     "SEAT": _ty("str", "SEAT", ref=1), "POS_OR_SEAT": _ty("str", "POS_OR_SEAT", ref=1),
     "POS": _ty("str", "POS"), "CARD": _ty("str", "CARD"), "RANK": _ty("str", "RANK"),
     "CARDSTR": _ty("str", "CARDSTR"), "STREET": _ty("str", en="STREET"),
@@ -175,12 +175,13 @@ H_SEAT = _obj("H_SEAT", [("BOOL", "hero allin"), ("POS", "pos"), (E("SLOT"), "sl
                          ("CARD", "shown"), ("NUM", "stack_bb"), ("X", "pid type type_src")],
               {"type_stats": TYPE_STATS, "stats": STATS})
 ISSUE = _obj("ISSUE", [("X", "code")])
+STREET_POT = _obj("STREET_POT", [("NUM0", "flop turn river")])
 TURN = _obj("TURN", [("STREET", "street"), ("SEAT", "seat"), ("NUM", "t0 t1 p")])
 HAND = _obj("HAND", [("HID", "id"), ("SESSION", "session"), ("NUM", "start end frames players pos_players pot"),
                      (E("END_REASON"), "end_reason"), ("SEAT", "dealer"), ("CARD", "hero_cards board"),
                      ("STREET", "streets"), (E("H_CONF"), "confidence"), ("X", "redacted")],
             {"actions": H_ACTIONS, "showdown": SHOWDOWN, "seats": _map("SEAT", H_SEAT), "issues": ISSUE,
-             "turns": TURN})
+             "turns": TURN, "street_pot": STREET_POT})
 
 TEX = _obj("TEX", [("NUM", "n flush_max broadway connected straight_windows wet"), (E("TEX_SUIT"), "suit"),
                    ("BOOL", "paired trips low"), ("RANK", "high"), (E("TEX_LABEL"), "label"),
@@ -298,6 +299,8 @@ def leaf_check(typ, v):
     else:
         kind = "obj"
     if kind not in t["j"]:
+        return bad
+    if kind == "num" and t["nn"] and float(v) < 0:
         return bad
     if kind == "str":
         if t["re"] and not _RES[t["re"]].fullmatch(v):
@@ -544,6 +547,54 @@ def leaf_hit(top, sch, want):
     return found[0] if found else None
 
 
+def _shape_bad(val, node):
+    """컨테이너 노드(객체·맵) 자리의 값 모양이 틀리면 True (명세 개정 5). null 은 기존대로 통과한다.
+    맵은 객체여야 한다. 객체 노드는 객체이거나 객체만 든 배열(배열은 투명)이어야 한다."""
+    if val is None:
+        return False
+    if "m" in node:
+        return not isinstance(val, Obj)
+    if isinstance(val, Obj):
+        return False
+    return not _objs_only(val)
+
+
+def _objs_only(val):
+    """객체와 null 만 든 배열인가 (배열 속 배열도 투명하게 같은 검사)."""
+    return isinstance(val, list) and all(e is None or isinstance(e, Obj) or _objs_only(e) for e in val)
+
+
+def container_hit(top, sch):
+    """줄 전체에서 모양이 틀린 첫 컨테이너 키의 경로(문자열), 없으면 None. 키 정렬 순, 깊이 우선."""
+    def w(o, node, segs, ctx):
+        for k in sorted(o):
+            child, ok = _child(node, k)
+            if not ok or isinstance(child, str):
+                continue
+            sg = segs + [_render(k, ctx)]
+            val = o[k]
+            if _shape_bad(val, child):
+                return ".".join(sg)
+            cctx = _child_ctx(ctx, k)
+            if _is_actmap(child) or (k == "classes" and "k" in child):
+                cctx = "q"
+            r = down(val, child, sg, cctx)
+            if r:
+                return r
+        return None
+
+    def down(val, child, sg, cctx):
+        if isinstance(val, Obj):
+            return w(val, child, sg, cctx)
+        if isinstance(val, list):
+            for e in val:
+                r = down(e, child, sg + ["[]"], "other")
+                if r:
+                    return r
+        return None
+    return w(top, sch, [], "top")
+
+
 def schema_for(kind, top):
     if kind == "hands":
         return SCHEMA_HANDS
@@ -746,6 +797,10 @@ def _check_top(kind, top, accept):
           lambda v, typ, s: type(v) is str and nick_leaf(typ, v) and hit(v) and (found.append(".".join(s)) or True))
     if found:
         return Verdict("block", "nick_value", 0, found[0])
+    # 20. container_type (개정 5)
+    p = container_hit(top, sch)
+    if p is not None:
+        return Verdict("block", "container_type", 0, p)
     return None
 
 
@@ -918,6 +973,14 @@ def filter_record(kind, rec, paths=None, vstats=None):
                         vstats["vpaths"][".".join(sg)] += 1
                     continue
                 res[k] = v[k]
+                continue
+            if ok and _shape_bad(v[k], child):
+                # 컨테이너 자리의 모양이 틀림: 좌석 관련이면 차단, 그 밖은 그 키를 통째로 버린다 (개정 5)
+                if (sg[0] in ("seats", "reads", "showdown")) or sg[:2] == ["outcome", "shown"]:
+                    raise FilterBlock("container_type", ".".join(sg))
+                if vstats is not None:
+                    vstats["values"] += 1
+                    vstats["vpaths"][".".join(sg)] += 1
                 continue
             cctx = _child_ctx(ctx, k)
             if ok and (_is_actmap(child) or (k == "classes" and isinstance(child, dict) and "k" in child)):

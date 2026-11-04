@@ -36,9 +36,9 @@ import records_sync as RS  # noqa: E402
 
 FIXTURES = os.path.join(HERE, "testdata", "records_fixtures.jsonl")
 # sharebox server/testdata/records_fixtures.jsonl 과 바이트 동일해야 한다. 고치면 양쪽 상수와 사본을 같이 고친다.
-FIXTURES_SHA256 = "a83dcb9caa5da156f644f22aff5549ddc5d1abef74f3e6266c1c486cef1606b6"
+FIXTURES_SHA256 = "be5292b5c17a59f8014c255a0ea18855993ead65c1efdcf45ec607e95a613057"
 # 스키마 정규화 덤프의 sha256. sharebox server/records_check_test.go 의 recordsSchemaSHA256 과 같아야 한다.
-RECORDS_SCHEMA_SHA256 = "6a2bfa011cce4b69a2f6e0105c273890b5657c53a8146a91cd4decf7b97288b1"
+RECORDS_SCHEMA_SHA256 = "f632c53a5616d24ed4972b51090de0397a726fe703c00b8bef64f12d5bf5e9fd"
 BIN = os.environ.get("RECORDS_TEST_SHAREBOXD")
 TMP = tempfile.mkdtemp(prefix="records-test-")
 REAL_HOME = os.environ.get("HOME")
@@ -312,7 +312,7 @@ class T19_Deterministic(unittest.TestCase):
         lf = hline(1) + hline(2)
         crlf = lf.replace(b"\n", b"\r\n")
         self.assertEqual(RS.build_body(D1, lf)[0], RS.build_body(D1, crlf)[0])
-        self.assertTrue(all(b'"redacted":3' in l for l in RS.build_body(D1, lf)[0].splitlines()))
+        self.assertTrue(all(b'"redacted":4' in l for l in RS.build_body(D1, lf)[0].splitlines()))
 
     @need_real
     def test_19_real_second_cycle_no_put(self):
@@ -543,7 +543,7 @@ class T25_Pid(unittest.TestCase):
         self.assertEqual(lines[0]["seats"]["hero"]["pid"], None)
         self.assertEqual(lines[1]["seats"]["hero"]["pid"], "p_deadbeef")
         self.assertEqual(lines[0]["seats"]["seat_TC"]["pid"], "p_0123abcd")
-        self.assertTrue(all(l["redacted"] == 3 for l in lines))
+        self.assertTrue(all(l["redacted"] == RC.FILTER_V for l in lines))
         self.assertNotIn(b"p_", RS.build_body(D1, b'{"id":"20261105_120000-0001","seats":{"hero":{"hero":true}}}\n')[0])
 
 
@@ -772,9 +772,10 @@ class T29_Fixtures(unittest.TestCase):
     def test_29_check_line_api(self):
         self.assertEqual(RC.file_kind("2026-02-30.jsonl"), None)
         self.assertEqual(RC.file_kind("decisions_2026-02-28.jsonl"), "decisions")
-        self.assertEqual(RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":3}').cls, "ok")
-        self.assertEqual(RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":4}', (3, 4)).cls, "ok")
-        self.assertEqual(RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":4}').rule, "filter_version")
+        self.assertEqual(RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":4}').cls, "ok")
+        self.assertEqual(RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":5}', (4, 5)).cls, "ok")
+        self.assertEqual(RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":5}').rule, "filter_version")
+        self.assertEqual(RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":3}', (4, 4)).rule, "filter_version")
 
     def test_29_uploader_body_passes_check(self):
         body = RS.build_body(D1, hline(1) + hline(2))[0]
@@ -1006,7 +1007,7 @@ class T30_Pull(PullEnv, unittest.TestCase):
         self.assertEqual(self.inbox_text().count(" blocked "), 1)
 
     def test_30_check_failure_quarantine_metadata_only(self):
-        bad = ('{"id":"20261105_120000-0001","redacted":3,"seats":{"hero":{"name":"%s"}}}\n' % NICK).encode()
+        bad = ('{"id":"20261105_120000-0001","redacted":4,"seats":{"hero":{"name":"%s"}}}\n' % NICK).encode()
         self.fs.set("a", D1, bad)
         self.fs.set("a", D0, good_body(D0))
         self.assertEqual(self.pull(), 1)
@@ -1025,7 +1026,7 @@ class T30_Pull(PullEnv, unittest.TestCase):
         self.fs.set("a", D1, good_body(D1))
         self.pull()
         with open(os.path.join(self.data, "raw", "a", D1), "ab") as f:
-            f.write(b'{"id":"x","redacted":3,"name":"%s"}\n' % NICK.encode())
+            f.write(b'{"id":"x","redacted":4,"name":"%s"}\n' % NICK.encode())
         self.assertEqual(self.pull("--recheck"), 1)
         self.assertFalse(os.path.exists(os.path.join(self.data, "raw", "a", D1)))
 
@@ -1199,9 +1200,9 @@ class T37_PreCheck(unittest.TestCase):
 
     def test_37_shared_check_differs_for_fullwidth(self):
         for name in ("fullwidth_name", "zero_width_name", "fullwidth_nick"):
-            v = RC.check_line("hands", self.LINES[name].rstrip(b"\n").replace(b'"id":"20261105_120000-0001"', b'"id":"20261105_120000-0001","redacted":3'))
+            v = RC.check_line("hands", self.LINES[name].rstrip(b"\n").replace(b'"id":"20261105_120000-0001"', b'"id":"20261105_120000-0001","redacted":4'))
             self.assertEqual((v.cls, v.rule), ("block", "unknown_key"), name)
-        v = RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":3,"advice":{"players":1}}')
+        v = RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":4,"advice":{"players":1}}')
         self.assertEqual(v.rule, "forbidden_key")
 
 
@@ -1222,7 +1223,7 @@ class T38_NickValue(unittest.TestCase):
         with self.assertRaises(RS.Block) as cm:
             RS.build_body(D0, self.dec_reason(val))
         self.assertEqual(cm.exception.rule, "nick_value")
-        line = ('{"id":"%s","type":"decision","redacted":3,"advice":{"reason":"%s"}}' % (DID0, val)).encode()
+        line = ('{"id":"%s","type":"decision","redacted":4,"advice":{"reason":"%s"}}' % (DID0, val)).encode()
         self.assertTrue(RC.check_line("decisions", line).ok())            # 공용 판정은 통과 (업로더가 더 넓게 멈춘다)
 
     def test_38_false_positive_guard(self):
@@ -1294,8 +1295,9 @@ class T41_PullRange(unittest.TestCase):
         for n in ("", "data", "data/raw", "data/raw/a"):
             os.chmod(os.path.join(home, n), 0o700)
         good = RS.build_body(D1, hline(1))[0]
-        old = good.replace(b'"redacted":3', b'"redacted":2')
-        self.assertEqual(RC.ACCEPT_MIN, 3)
+        old = good.replace(b'"redacted":4', b'"redacted":3')
+        self.assertEqual(RC.ACCEPT_MIN, 4)
+        self.assertEqual(RC.FILTER_V, 4)
         wr(os.path.join(home, "data"), "raw/a/" + D1, good)
         wr(os.path.join(home, "data"), "raw/a/2026-11-02.jsonl", old)
         fd = os.open(os.path.join(home, "pull.json"), os.O_WRONLY | os.O_CREAT, 0o600)
@@ -1855,7 +1857,7 @@ class T53_GeneratedValues(unittest.TestCase):
             tb = TD.play_to_flop_bet(tag=None)          # 실제 앱처럼 기본 세션 id (시간 기반)
             log = dl.DecisionLog(d)
             name = ev.hand_name(ev.evaluate([ev.parse_card(c) for c in ("Ah", "Kd", "Ac", "7c", "2d")]))
-            log.record(TD.make_ctx(hand_name=name), TD.make_advice(), state=tb.tr, t=time.time())
+            log.record(TD.make_ctx(hand_name=name, outs=None), TD.make_advice(), state=tb.tr, t=time.time())
             rec = TD.finish_call_to_showdown(tb)
             log.link_hand(rec)
             lines = []
@@ -2305,6 +2307,163 @@ class T58_WindowsIdent(unittest.TestCase):
         os.replace(p + ".new", p)                                    # 더 작은 다른 파일
         with self.assertRaises(RS.FileError):
             up._open_checked(p, (0, 0, st.st_size, st.st_mtime_ns))
+
+
+# 개정 5 (명세 13.7): 컨테이너 형태 강제 (container_type)
+KO_NAME = "홍길동"
+NICK_ARR = "SomeNick77"
+CONTAINER_RULES = frozenset(["container_type", "seats_not_object", "seat_not_object", "reads_key_format",
+                             "shown_key_format", "type_stats_field", "profile_field", "issue_code"])
+
+
+def _container_nodes():
+    """스키마의 모든 컨테이너(객체·맵) 노드: [(스키마 이름, 경로 튜플)]. 뿌리는 뺀다. "*" 는 맵 값."""
+    out = []
+
+    def walk(node, name, path):
+        if isinstance(node, str):
+            return
+        if path:
+            out.append((name, path))
+        if "m" in node:
+            walk(node["v"], name, path + ("*",))
+        else:
+            for k, c in node["k"].items():
+                walk(c, name, path + (k,))
+    for name, sch in (("hand", RC.HAND), ("decision", RC.DECISION), ("resolution", RC.RESOLUTION)):
+        walk(sch, name, ())
+    return out
+
+
+class T59_ContainerType(unittest.TestCase):
+    RAW = {   # 업로더가 그 문자열을 절대 보내지 않아야 하는 재현 사례
+        "actions_str": (D1, '{"id":"%s","actions":"%s"}\n' % (HID0, KO_NAME), "actions"),
+        "actions_arr": (D1, '{"id":"%s","actions":["%s"]}\n' % (HID0, KO_NAME), "actions"),
+        "actions_flop": (D1, '{"id":"%s","actions":{"flop":"%s"}}\n' % (HID0, KO_NAME), "actions.flop"),
+        "turns_str": (D1, '{"id":"%s","turns":"%s"}\n' % (HID0, KO_NAME), "turns"),
+        "turns_arr": (D1, '{"id":"%s","turns":["%s"]}\n' % (HID0, KO_NAME), "turns"),
+        "turns_arr_second": (D1, '{"id":"%s","turns":[{"street":"flop"},"%s"]}\n' % (HID0, KO_NAME), "turns"),
+        "street_pot_str": (D1, '{"id":"%s","street_pot":"%s"}\n' % (HID0, NICK_ARR), "street_pot"),
+        "street_pot_arr": (D1, '{"id":"%s","street_pot":["%s"]}\n' % (HID0, KO_NAME), "street_pot"),
+        "advice_str": (D0, '{"id":"%s","type":"decision","advice":"%s"}\n' % (DID0, KO_NAME), "advice"),
+        "advice_arr": (D0, '{"id":"%s","type":"decision","advice":["%s"]}\n' % (DID0, KO_NAME), "advice"),
+        "gto_actions": (D0, '{"id":"%s","type":"decision","advice":{"gto":{"actions":"%s"}}}\n' % (DID0, KO_NAME),
+                        "advice.gto.actions"),
+        "outcome_str": (D0, '{"id":"%s","type":"resolution","outcome":"%s"}\n' % (DID0, KO_NAME), "outcome"),
+    }
+
+    def test_59_uploader_drops_wrong_shape_and_never_sends_it(self):
+        for name, (file, text, path) in self.RAW.items():
+            with self.subTest(name):
+                st1, st2 = _stats(), _stats()
+                b1 = RS.build_body(file, text.encode(), None, st1)[0]
+                b2 = RS.build_body(file, text.encode(), None, st2)[0]
+                self.assertEqual(hashlib.sha256(b1).digest(), hashlib.sha256(b2).digest())      # 결정적
+                for secret in (KO_NAME, NICK_ARR):
+                    self.assertNotIn(secret.encode(), b1)
+                self.assertEqual(st1["values"], 1)
+                self.assertEqual(dict(st1["vpaths"]), {path: 1})
+                self.assertTrue(RC.check_body(file, b1).ok())
+
+    def test_59_uploader_blocks_seat_related(self):
+        cases = {
+            "seat_profile": (D0, '{"id":"%s","type":"decision","seats":{"hero":{"profile":"%s"}}}\n' % (DID0, KO_NAME)),
+            "seat_stats": (D1, '{"id":"%s","seats":{"hero":{"stats":["%s"]}}}\n' % (HID0, KO_NAME)),
+            "reads_value": (D0, '{"id":"%s","type":"decision","reads":{"hero":"%s"}}\n' % (DID0, KO_NAME)),
+            "reads_classes": (D0, '{"id":"%s","type":"decision","reads":{"hero":{"classes":"%s"}}}\n' % (DID0, KO_NAME)),
+            "showdown_str": (D1, '{"id":"%s","showdown":"%s"}\n' % (HID0, KO_NAME)),
+            "showdown_arr": (D1, '{"id":"%s","showdown":["%s"]}\n' % (HID0, NICK_ARR)),
+        }
+        for name, (file, text) in cases.items():
+            with self.subTest(name):
+                with self.assertRaises(RS.Block) as cm:
+                    RS.build_body(file, text.encode(), None, _stats())
+                self.assertEqual(cm.exception.rule, "container_type")
+                for secret in (KO_NAME, NICK_ARR):
+                    self.assertNotIn(secret, repr(cm.exception.__dict__) + str(cm.exception))
+
+    def test_59_num0_negative_dropped(self):
+        raw = ('{"id":"%s","street_pot":{"flop":-1,"turn":0,"river":5}}\n' % HID0).encode()
+        st = _stats()
+        rec = json.loads(RS.build_body(D1, raw, None, st)[0])
+        self.assertEqual(rec["street_pot"], {"turn": 0, "river": 5})
+        self.assertEqual(dict(st["vpaths"]), {"street_pot.flop": 1})
+
+    def test_59_null_and_empty_stay_ok(self):
+        raw = ('{"id":"%s","actions":null,"showdown":{},"street_pot":null,"turns":[{}],"issues":[]}\n' % HID0).encode()
+        st = _stats()
+        body = RS.build_body(D1, raw, None, st)[0]
+        self.assertEqual(st["values"], 0)
+        self.assertTrue(RC.check_body(D1, body).ok())
+
+    def test_59_every_container_fixture_is_filtered(self):
+        """container_type 계열 거부 픽스처 전부: 업로더는 멈추거나, 그 문자열 없이 검사를 통과하는 줄만 만든다."""
+        n = 0
+        for c, b in fixture_cases():
+            e = c["expect"]
+            if not c["name"].startswith("container_") or e["class"] != "block":
+                continue
+            line = b.split(b"\n")[e["line"] - 1]
+            kind = RC.file_kind(c["file"])
+            try:
+                out, _ = RC.filter_record(kind, RC.parse_line(line.decode("utf-8")), None, _stats())
+            except RC.FilterBlock:
+                n += 1
+                continue
+            data = RS._dump(out).encode("utf-8")
+            for secret in (KO_NAME, NICK_ARR):
+                self.assertNotIn(secret.encode(), data, c["name"])
+            self.assertTrue(RC.check_line(kind, data).ok(), c["name"])
+            n += 1
+        self.assertGreaterEqual(n, 100)
+
+    def test_59_audit_counts_wrong_shape_as_check(self):
+        base = _audit_base("t59a", {D1: ('{"id":"%s","actions":"%s"}\n' % (HID0, KO_NAME)).encode()})
+        code, out, err = _capture(lambda: mk(base, {}, fake=True).audit(as_json=True))
+        self.assertEqual(code, 1, out)
+        j = json.loads(out)
+        self.assertEqual(j["files"][0]["fail"], 1)
+        self.assertEqual(next(r for r in j["paths"] if r["path"] == "actions")["fail"], 1)
+        self.assertNotIn(KO_NAME, out + err)
+        base = _audit_base("t59b", {D1: ('{"id":"%s","seats":{"hero":{"stats":"%s"}}}\n' % (HID0, KO_NAME)).encode()})
+        code, out, err = _capture(lambda: mk(base, {}, fake=True).audit())
+        self.assertEqual(code, 2, out)
+        self.assertIn("container_type", out)
+        self.assertNotIn(KO_NAME, out + err)
+
+    def test_59_audit_filter_v3_needs_recheck(self):
+        base = _audit_base("t59c", {D1: hline(1)})
+        up = mk(base, fake_cfg(), fake=True, require_audit=True)
+        self.assertEqual(_capture(up.audit)[0], 0)
+        p = os.path.join(base, RS.STATE_NAME)
+        st = json.load(open(p))
+        self.assertEqual(st["audit"]["filter_v"], 4)
+        st["audit"]["filter_v"] = 3
+        json.dump(st, open(p, "w"))
+        d = mk(base, fake_cfg(), fake=True, require_audit=True)
+        self.assertEqual(run(d), 1)
+        self.assertEqual(d.files[D1]["result"], "audit_required")
+
+    def test_59_every_schema_container_has_reject_fixture(self):
+        """스키마의 모든 컨테이너 노드에 거부 픽스처가 최소 하나 있어야 한다 (스키마에 컨테이너를 더하면 여기서 잡힌다)."""
+        seen = set()
+        for c, b in fixture_cases():
+            e = c["expect"]
+            if e["class"] != "block" or e["rule"] not in CONTAINER_RULES or "path" not in e:
+                continue
+            top = RC.parse_line(b.split(b"\n")[e["line"] - 1].decode("utf-8"))
+            sch = RC.schema_for(RC.file_kind(c["file"]), top)
+            name = {id(RC.HAND): "hand", id(RC.DECISION): "decision", id(RC.RESOLUTION): "resolution"}.get(id(sch))
+            segs = tuple(x for x in e["path"].split(".") if x != "[]")
+            seen.add((name, segs))
+
+        def covered(name, path):
+            return any(n == name and len(sg) == len(path) and all(p in ("*", s) for p, s in zip(path, sg))
+                       for n, sg in seen)
+        nodes = _container_nodes()
+        self.assertGreaterEqual(len(nodes), 40)
+        missing = [(n, ".".join(p)) for n, p in nodes if not covered(n, p)]
+        self.assertEqual(missing, [], "컨테이너 노드에 거부 픽스처가 없음")
 
 
 _MISSING = object()
