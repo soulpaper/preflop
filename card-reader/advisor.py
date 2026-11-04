@@ -299,6 +299,11 @@ PUSHFOLD_BB = 15          # 이 이하 유효 스택은 푸시/폴드 (jam/jamca
 DEFENCE_ITER = 2000        # BB/SB 방어 인라인 에쿼티 반복 수 (내 차례에만 실행, 약 0.2~0.4초)
 DEPTH_R = ([15, 20, 25, 35], [0.85, 0.90, 0.95, 1.0])   # 얕은 스택은 에쿼티 실현율이 낮다 (포스트플랍 플레이 여지 부족)
 BLIND_R_BASE, BLIND_R_SLOPE, BLIND_R_FLOOR = 0.92, 0.0043, 0.45   # 블라인드 에쿼티 실현율 = 0.92 - 0.0043 × 강도순위 (하한 0.45)
+# 블라인드 수딧 커넥터(갭 0) / 한 칸 갭 실현율 바닥 (상위 카드 T 이하, 하위 카드 4 이상: 54s~T9s, 64s~T8s).  강도순위(랜덤 대비
+# 승률)는 낮아도 플레이성(스트레이트·플러시 드로우)이 좋아 솔버 EQR 은 같은 순위 오프수트보다 훨씬 높다.  예전엔 강도 직선식만 써서
+# BB 76s/65s/54s 가 0.48 (= J6o) 로 K7o(0.67) 보다 낮았다.  내재 배당(IMPLIED)은 따로 더하므로 솔버 EQR(~0.85+) 보다 낮게 둔다.
+BLIND_R_SC = {1: 0.72, 2: 0.66}
+BLIND_R_SC_SB = 0.10       # SB 는 포스트플랍 내내 OOP + 뒤에 BB (스퀴즈) — 바닥을 이만큼 낮춘다 (SB 는 3벳 or 폴드 위주 유지)
 SB_CALL_EXTRA = 0.05       # SB 는 BB 가 뒤에 있어 차트 폴드 → 콜 뒤집기에 여유를 더 둔다
 # 프리플랍 차트 + 수학 (범위 기준 에쿼티가 있을 때)
 MATH_CALL_MARGIN = 0.02    # 차트 폴드 → 콜 로 뒤집으려면 필요 승률 위로 이 만큼 더
@@ -1157,7 +1162,8 @@ def _speculative(hand):
     if hand[2] != "s":
         return None
     i, j = pf.RANKS.index(hand[0]), pf.RANKS.index(hand[1])
-    if hand[0] == "A" or (max(i, j) <= 9 and j - i <= 2):  # 수딧 에이스, 5x 이상 수딧 커넥터/한 칸
+    # 수딧 에이스, 하위 카드 4 이상 수딧 커넥터/한 칸 (54s·64s 포함 — 예전엔 하위 5 이상만이라 54s 가 내재 배당 0 이었다)
+    if hand[0] == "A" or (max(i, j) <= 10 and j - i <= 2):
         return "suited"
     return None
 
@@ -1217,6 +1223,16 @@ def _mw_adjust(state, sit, hand, name, pos, call, eff, limpers, callers):
     return name, None, False
 
 
+def _suited_connector_gap(hand):
+    """수딧 커넥터 1 / 한 칸 갭 2 (상위 카드 T 이하, 하위 카드 4 이상), 아니면 None."""
+    if len(hand) != 3 or hand[2] != "s":
+        return None
+    i, j = pf.RANKS.index(hand[0]), pf.RANKS.index(hand[1])
+    if i < 4 or j > 10:   # 상위 T 이하 (A=0 … T=4), 하위 4 이상 (4=10)
+        return None
+    return j - i if j - i in (1, 2) else None
+
+
 def _realization(hand, strength, pos, allin):
     """에쿼티 실현율: 올인이면 100%, 아니면 핸드 질/포지션에 따라 (포켓페어는 셋 못 맞히면 접게 되어 낮다)."""
     if allin:
@@ -1225,7 +1241,11 @@ def _realization(hand, strength, pos, allin):
         return 0.62
     if pos in ("SB", "BB") and len(hand) == 3:  # 블라인드(OOP)에서 약한 핸드는 에쿼티 실현이 훨씬 낮다 (강도에 따라 선형으로 하락)
         base = max(BLIND_R_FLOOR, BLIND_R_BASE - BLIND_R_SLOPE * strength)
-        return min(base + (0.03 if hand.endswith("s") else 0.0), 0.97)
+        r = min(base + (0.03 if hand.endswith("s") else 0.0), 0.97)
+        sc = _suited_connector_gap(hand)
+        if sc in BLIND_R_SC:
+            r = max(r, BLIND_R_SC[sc] - (BLIND_R_SC_SB if pos == "SB" else 0.0))
+        return r
     base = 0.95 if strength <= 35 else 0.90 if strength <= 85 else 0.80
     if pos in ("SB", "BB"):
         base -= 0.07
@@ -1437,12 +1457,24 @@ def _preflop_core(c, state):
     name, mw_note, spec_call = _mw_adjust(state, sit, hand, name, pos, call, eff, limpers, callers)
     math = None
     eq_in = None
-    if (not c.rb and sit == "vsopen" and pos in ("BB", "SB") and villain and name in ("콜", "폴드") and call > 0
-            and pot_total and not unopened and not c.facing_allin and eff and call <= PRESSURE * eff):
+    eq_note = None
+    vsopen_ok = (sit == "vsopen" and villain and name in ("콜", "폴드") and call > 0 and pot_total and not unopened
+                 and not c.facing_allin and eff and call <= PRESSURE * eff)
+    if vsopen_ok and not c.rb and pos in ("BB", "SB"):
         eq_in = _defence_equity(c, villain, players, eff, callers)   # 범위 에쿼티가 안 들어와도 BB/SB 방어는 팟 오즈로 검증
+    elif vsopen_ok and c.rb and c.opp > 1 + callers and pos != "SB":
+        # 리더의 범위 에쿼티는 아직 돈을 안 넣은 사람(뒤의 블라인드 등, 상위 87% 레인지 — 폴드를 못 읽은 자리 포함)까지 '모두 콜' 한
+        # 것처럼 센다.  그들은 대부분 폴드하고, 레이즈 위험은 필요 승률 가산(MW_BEHIND)으로 따로 본다 → 이중 감점이라 투기 핸드가
+        # 지나치게 폴드됐다 (예: CO 66 vs UTG 오픈, 상대 8명 기준 14% → 폴드).  오프너(+콜러) 레인지 대비 에쿼티로 바꾼다.
+        # SB 는 제외: 뒤 BB 의 스퀴즈가 실제 위험이고 SB 는 3벳 or 폴드 위주라 (KQo SB vs UTG 플랫 같은 콜을 만들지 않게).
+        eq_in = _defence_equity(c, villain, players, eff, callers)
+        if eq_in is not None:
+            eq_note = f"승률은 오프너{f'+콜러 {callers}명' if callers else ''} 기준 (팟에 돈 안 넣은 {c.opp - 1 - callers}명 제외)"
     if eq_in is not None or (c.rb and c.equity is not None and call > 0 and pot_total and not unopened
                              and sit in ("vsopen", "vs3bet", "vs4bet", "jamcall")):
         math = _preflop_math(c, hand, strength, name, pos, players, call, eff, pot_total, callers, eq_in)
+        if eq_note:
+            math["lines"][1] = f"{math['lines'][1]} · {eq_note}"
         state["math"] = math
         v = math["verdict"]
         if v:
@@ -1693,6 +1725,42 @@ def _nut_flush_draw(hero, board):
     return False
 
 
+DRAW_KEYS = ("드로우", "것샷", "양차", "포쁠")
+# 헤즈업 진짜 드로우(플러시·스트레이트 아웃츠 8장+, 오버카드·페어 아웃츠 제외)의 내재 배당: 완성 시 '콜 후 팟 × k' 까지 더 받는다고 본다
+# (뒷스택 이하).  솔버 표(HU_GTO implied=0)는 200BB BvB 데이터의 68% 가 SPR<4 노드라 드로우 내재 배당을 0 으로 맞췄는데, 그러면
+# 턴 플러시 드로우가 4:1 배당(필요 20% ≈ 완성 20%) + 뒷스택 227BB 에도 '+2BB 만 더 받으면 되는데' 폴드했다.
+# k 는 남은 거리 수 기준: 플랍 0.75 (두 거리), 턴 0.5 (리버 벳 한 번).  큰 벳(3/4 팟+)의 OESD 는 여전히 폴드 (솔버 최빈 = 폴드).
+HU_DRAW_OUTS = 8
+HU_DRAW_IMPLIED_K = {"flop": 0.75, "turn": 0.5}
+
+
+def _draw_out_count(outs):
+    """플러시·스트레이트 드로우 아웃츠 장수 (그룹에 카드 목록이 없으면 0)."""
+    s = set()
+    for g in outs.get("groups") or []:
+        if any(k in g[0] for k in DRAW_KEYS) and len(g) > 1 and isinstance(g[1], (list, tuple)):
+            s.update(g[1])
+    return len(s)
+
+
+def _implied_rule(c, outs, T, mw, nut_draw):
+    """드로우 내재 배당 콜 기준 (다음 카드 완성 확률, cap(뒷스택, 콜 후 팟), 아웃츠 장수) — 완성 시 더 받아야 할 금액이 cap 이하면 콜.
+    None = 내재 배당 콜 없음.  멀티웨이: 뒷스택 × 0.35 (너트 드로우 0.5).  헤즈업: 진짜 드로우 8장+ 는 HU_DRAW_IMPLIED_K,
+    그 밖엔 솔버 표 (implied_outs 장 이상만, 뒷스택 × implied)."""
+    if mw:
+        frac = 0.5 if nut_draw else 0.35
+        return outs["next"], (lambda room, pot_after: frac * room), outs["count"]
+    nd = _draw_out_count(outs)
+    k = HU_DRAW_IMPLIED_K.get(c.street)
+    if nd >= HU_DRAW_OUTS and k:
+        hit = ev.hit_probability(nd, 52 - 2 - len(c.board), 1)
+        if hit > 0:
+            return hit, (lambda room, pot_after: min(room, k * pot_after)), nd
+    if outs.get("count", 0) < T["implied_outs"]:
+        return None
+    return outs["next"], (lambda room, pot_after: T["implied"] * room), outs["count"]
+
+
 def _mw_discount(c):
     """멀티웨이 에쿼티 할인율: 상대가 늘수록 랜덤 핸드 가정이 우리 에쿼티를 과대평가한다."""
     sp = c.post
@@ -1916,17 +1984,17 @@ def _facing_bet(c, cls, made, tp_plus, twopair_plus, tex, eq, eq_src, outs, stro
     if adj >= need_eff:
         return _out(CALL, call, None, f"{made}: 에쿼티 ≥ 필요 승률 → 콜", [odds_line, eq_src, spr_line], sure)
     # 드로우 내재 배당 (팟 전체 = 화면 POT, 콜러 돈 포함). 멀티웨이 너트 드로우는 내재 배당 25% 가산
-    has_draw = bool(outs) and any(k in g[0] for g in (outs.get("groups") or []) for k in ("드로우", "것샷", "양차", "포쁠"))
-    if outs and outs.get("count") and (has_draw or strong_draw) and (not hu or outs["count"] >= T["implied_outs"]):
-        hit = outs["next"]
+    has_draw = bool(outs) and any(k in g[0] for g in (outs.get("groups") or []) for k in DRAW_KEYS)
+    rule = _implied_rule(c, outs, T, mw, nut_draw) if outs and outs.get("count") and (has_draw or strong_draw) else None
+    if rule:
+        hit, cap, n_hit = rule
         more = odds.implied_needed(max(0.0, pot - call), call, hit)
         if mw and nut_draw:
             more *= 0.75
         room = stack_after or 0.0
-        line = f"아웃츠 {outs['count']}장 · 다음 카드 {_pct(hit)} · 완성 시 +{_bb(more)} 필요" + \
+        line = f"아웃츠 {n_hit}장 · 다음 카드 {_pct(hit)} · 완성 시 +{_bb(more)} 필요" + \
             (" (너트 드로우 다자 -25%)" if mw and nut_draw else "")
-        imp_frac = T["implied"] if hu else (0.35 if mw and not nut_draw else 0.5)
-        if more <= imp_frac * room and call <= 0.25 * (eff or 0):
+        if more <= cap(room, pot + call) and call <= 0.25 * (eff or 0):
             return _out(CALL, call, None, "드로우 — 내재 배당으로 콜 가능",
                         [line, odds_line, f"{eq_src} · 뒷스택 {_bb(room)}" + (f" · {spr_line}" if spr_line else "")],
                         "medium" if more <= 0.25 * room else "low")
@@ -2138,16 +2206,14 @@ def _max_call(c, pl, p0):
     outs, eff = pl["outs"], pl["eff"]
     if not (outs and outs.get("count") and not pl["river"] and p0 and eff):
         return f_pure, False
-    has_draw = any(k in grp[0] for grp in (outs.get("groups") or []) for k in ("드로우", "것샷", "양차", "포쁠"))
+    has_draw = any(k in grp[0] for grp in (outs.get("groups") or []) for k in DRAW_KEYS)
     if not (has_draw or pl["strong_draw"]):
         return f_pure, False
     mw = c.opp >= 2
-    thr = 0.35 if mw and not pl["nut_draw"] else 0.5
-    if c.opp == 1:  # 헤즈업: _facing_bet 과 같은 내재 배당 기준
-        if outs.get("count", 0) < T["implied_outs"]:
-            return f_pure, False
-        thr = T["implied"]
-    hit = outs.get("next") or 0.0
+    rule = _implied_rule(c, outs, T, mw, pl["nut_draw"])   # _facing_bet 과 같은 내재 배당 기준
+    if not rule:
+        return f_pure, False
+    hit, cap, _ = rule
 
     def gi(f):  # 내재 배당으로 콜 가능하면 >= 0
         x = f * p0
@@ -2155,7 +2221,7 @@ def _max_call(c, pl, p0):
         room = eff - x
         if x > 0.25 * eff or room <= 0:
             return -1.0
-        return thr * room - more
+        return cap(room, p0 + 2 * x) - more
     f_imp = _plan_gain(gi, PLAN_IMPLIED_MAX_F)
     return (f_imp, True) if f_imp > f_pure + 0.02 else (f_pure, False)
 

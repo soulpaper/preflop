@@ -1085,6 +1085,52 @@ r = recommend(dict(PF, street="flop", board=["Kd", "8c", "2h"], hero=["7c", "2d"
                    call=0.0, can_check=False, to_act=True))
 results.append((r["action"] != "체크", "플랍: 체크 버튼 없음 + 콜 0 → '체크 가능이니 폴드 대신 체크' 로 바꾸지 않음", r))
 
+# --- 커넥터 비관 수정 (2026-11-05) ----------------------------------------------------------------
+# 1) 블라인드 실현율: 수딧 커넥터/한 칸 갭은 강도 직선식(76s 0.48 = J6o) 대신 바닥 0.72 / 0.66 (SB 는 -0.10)
+results.append((advisor._realization("76s", 116, "BB", False) >= 0.72 > advisor._realization("J6o", 102, "BB", False),
+                "실현율: BB 76s(0.72) > J6o(0.48) — 플레이성", {"action": "", "size_text": "", "confidence": "", "reason": "",
+                                                           "detail": []}))
+results.append((abs(advisor._realization("86s", 110, "SB", False) - 0.56) < 1e-9 and
+                advisor._realization("53s", 146, "BB", False) < 0.6 and advisor._realization("74s", 141, "BB", False) < 0.6,
+                "실현율: SB 86s 0.56 · 53s/74s 는 대상 아님", {"action": "", "size_text": "", "confidence": "", "reason": "",
+                                                       "detail": []}))
+BB_UTG40 = dict(PF, players=8, hero_pos="BB", villain_pos="UTG", situation="vsopen", stack_bb=40, my_stack=40, call=1.5,
+                pot_total=5.0, can_check=False, ante=1.0, opponents_in_hand=1, closing_action=True, hero_bet=1.0)
+check("BB 76s vs UTG 2.5x 40BB (앤티): 팟 오즈 23% + 내재 배당 → 콜", dict(BB_UTG40, hero=["7h", "6h"]), "콜", 1.5, 0.01)
+check("BB 54s vs UTG 2.5x 40BB: 54s 도 내재 배당 대상(하위 4) → 콜", dict(BB_UTG40, hero=["5h", "4h"]), "콜", 1.5, 0.01,
+      detail_has="내재 배당")
+check("BB 74s vs UTG 2.5x 40BB: 두 칸 갭은 그대로 폴드", dict(BB_UTG40, hero=["7h", "4h"]), "폴드")
+check("BB 76s vs UTG 15BB: 푸시/폴드 구간은 그대로 (콜 없음)", dict(BB_UTG40, hero=["7h", "6h"], stack_bb=15, my_stack=15), "폴드")
+# 2) 범위 기준 에쿼티가 아직 돈을 안 넣은 사람까지 센 경우 (실제 2026-11-04: CO 66 vs UTG, 상대 8명 기준 14% → 폴드)
+CO66 = dict(PF, hero=["6h", "6d"], players=9, hero_pos="CO", villain_pos="UTG", situation="vsopen", stack_bb=43.1,
+            my_stack=43.1, call=2.0, pot_total=4.8, can_check=False, ante=1.0, equity_basis="range", to_act=True)
+check("실제: CO 66 vs UTG, 범위 에쿼티가 8명 기준(14%) → 오프너 기준으로 다시 계산해 콜",
+      dict(CO66, opponents_in_hand=8, equity=0.1385), "콜", 2.0, 0.01, detail_has="오프너 기준")
+check("같은 자리 상대 1명(오프너만) 에쿼티는 그대로 씀", dict(CO66, opponents_in_hand=1, equity=0.45), "콜", 2.0, 0.01)
+r = recommend(dict(CO66, opponents_in_hand=1, equity=0.45))
+results.append((not any("오프너 기준" in d for d in r["detail"]), "상대 1명이면 에쿼티 재계산 표기 없음", r))
+check("SB 는 재계산 제외 (3벳 or 폴드 유지): SB KQo vs UTG 상대 6명", dict(CO66, hero=["Kh", "Qd"], players=7, hero_pos="SB",
+                                                                 call=1.5, pot_total=4.4, opponents_in_hand=6,
+                                                                 equity=0.093, stack_bb=118.7, my_stack=118.7), "폴드")
+# 3) 헤즈업 진짜 드로우 내재 배당 (실제 2026-11-04: 턴 플러시 드로우, 21BB 콜 / 팟 84BB / 뒷스택 227BB → '+2.3BB 필요' 인데 폴드)
+TFD = dict(hero=["9h", "3h"], board=["2d", "6h", "Ah", "Ad"], opponents_in_hand=1, to_act=True, equity_basis="range")
+check("실제: 턴 플러시 드로우 vs 1/3 팟 벳, 뒷스택 227BB → 콜 (내재 배당)",
+      dict(TFD, pot=63.0, pot_total=84.0, call=21.0, stack_bb=248.4, my_stack=248.4, equity=0.2732), "콜", 21, 0.01,
+      reason_has="내재 배당")
+check("턴 플러시 드로우 vs 팟 벳 → 폴드 (리버 한 번으로는 못 받음)",
+      dict(TFD, pot=40.0, pot_total=80.0, call=40.0, stack_bb=248.4, my_stack=248.4, equity=0.24), "폴드")
+check("턴 플러시 드로우 vs 하프팟, 유효 20BB (콜이 스택 25% 초과) → 폴드",
+      dict(TFD, pot=12.0, pot_total=18.0, call=6.0, stack_bb=20, my_stack=20, equity=0.24), "폴드")
+check("플랍 양차 vs 하프팟 100BB (범위 42%) → 콜",
+      dict(hero=["8s", "7s"], board=["9d", "6c", "2h"], opponents_in_hand=1, pot=6, pot_total=9, call=3, stack_bb=100,
+           to_act=True, equity=0.42, equity_basis="range"), "콜", 3, 0.01)
+check("플랍 양차 vs 3/4 팟 100BB → 폴드 (솔버: 큰 벳엔 폴드 최빈)",
+      dict(hero=["8s", "7s"], board=["9d", "6c", "2h"], opponents_in_hand=1, pot=6, pot_total=10.5, call=4.5, stack_bb=100,
+           to_act=True, equity=0.42, equity_basis="range"), "폴드")
+check("거트샷 + 오버카드(드로우 아웃츠 4장)는 헤즈업 내재 배당 대상 아님 → 폴드",
+      dict(hero=["Ac", "Jd"], board=["Ts", "8h", "3c"], opponents_in_hand=1, pot=6, pot_total=9, call=3, stack_bb=100,
+           to_act=True, equity=0.32, equity_basis="range"), "폴드")
+
 # --- 결과 -----------------------------------------------------------------------
 failed = 0
 for ok, name, res in results:
