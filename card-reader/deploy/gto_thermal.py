@@ -20,6 +20,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -42,6 +43,17 @@ DEFAULTS = {
     "OLD_SOLVE": 3000.0,    # 시작 후 이 초(50분)가 지난 솔브는 cool/hold 에서도 normal 선호도
     "FAIL_MAX": 3,          # 온도 읽기 연속 실패 허용 횟수
     "LOG_KEEP_DAYS": 14,
+    # 연속 CPUQuota 내부 루프 (thermal-quota-spec.md). --runtime 으로만 적용, 영구 drop-in 은 건드리지 않음.
+    "QUOTA_ENABLE": 0,      # 1이면 루프 동작. 0이면 systemctl 을 한 번도 부르지 않음(고정 800%)
+    "QUOTA_BASE": 800, "QUOTA_MIN": 600, "QUOTA_MAX": 1000, "QUOTA_STEP": 50,
+    "QUOTA_TARGET": 89.0,   # 60초 평균 목표 (정보·로그용)
+    "QUOTA_UP_A60": 88.0,   # 60초 평균 < 이 값이고
+    "QUOTA_UP_A5": 89.0,    # 5분 평균도 < 이 값이면 +STEP
+    "QUOTA_DOWN_A60": 90.0, # 60초 평균 > 이 값이거나
+    "QUOTA_DOWN_A5": 90.0,  # 5분 평균 > 이 값이면 -STEP
+    "QUOTA_UP_GAP": 120.0,  # 올림 사이 최소 초
+    "QUOTA_DOWN_GAP": 60.0, # 내림 사이 최소 초
+    "QUOTA_EMERG_A60": 91.5,  # 60초 평균이 이 이상이면 간격 무시하고 즉시 -STEP
 }
 
 
@@ -58,6 +70,8 @@ def load_config(env=None, **over):
     cfg.update(over)
     if not cfg["NCPU"]:
         cfg["NCPU"] = os.cpu_count() or 4
+    cfg["QUOTA_MAX"] = max(cfg["QUOTA_MAX"], cfg["QUOTA_MIN"])   # MIN <= MAX 보장
+    cfg["QUOTA_BASE"] = min(max(cfg["QUOTA_BASE"], cfg["QUOTA_MIN"]), cfg["QUOTA_MAX"])
     return cfg
 
 
@@ -166,6 +180,43 @@ class Controller:
         return self.sets[3 if ceiling == 3 else 2]
 
 
+class QuotaLoop:
+    """연속 CPUQuota 순수 로직. 파일·시스템 접근 없음. step(now, level, a60, a5, warm) -> (목표 %, 메모).
+    적용에 성공했을 때만 commit(now, target) 을 부른다."""
+
+    def __init__(self, cfg=None):
+        self.cfg = cfg or load_config()
+        self.cur = None                      # 마지막으로 적용 확인된 %
+        self.last_up = float("-inf")
+        self.last_down = float("-inf")
+
+    def step(self, now, level, a60, a5, warm):
+        c = self.cfg
+        if self.cur is None:
+            return c["QUOTA_BASE"], "시작 BASE"
+        if level <= 1:
+            self.last_up = now               # 복귀 직후 올림 금지
+            return c["QUOTA_BASE"], "cool/hold -> BASE"
+        if a60 is None or not warm:
+            return self.cur, "대기"
+        if a60 >= c["QUOTA_EMERG_A60"]:
+            return max(c["QUOTA_MIN"], self.cur - c["QUOTA_STEP"]), "긴급 내림"
+        if (a60 > c["QUOTA_DOWN_A60"] or a5 > c["QUOTA_DOWN_A5"]) and now - self.last_down >= c["QUOTA_DOWN_GAP"]:
+            return max(c["QUOTA_MIN"], self.cur - c["QUOTA_STEP"]), "내림"
+        if (a60 < c["QUOTA_UP_A60"] and a5 < c["QUOTA_UP_A5"]
+                and now - self.last_up >= c["QUOTA_UP_GAP"] and now - self.last_down >= c["QUOTA_UP_GAP"]):
+            return min(c["QUOTA_MAX"], self.cur + c["QUOTA_STEP"]), "올림"
+        return self.cur, "유지"
+
+    def commit(self, now, target):
+        if self.cur is not None:
+            if target > self.cur:
+                self.last_up = now
+            elif target < self.cur:
+                self.last_down = now
+        self.cur = target
+
+
 # --- 시스템 접근 (main 루프 쪽) -----------------------------------------------------------------
 def find_hwmon(name, root="/sys/class/hwmon"):
     for d in sorted(glob.glob(os.path.join(root, "hwmon*"))):
@@ -187,7 +238,10 @@ def read_num(path, scale):
 class SystemIO:
     """실제 /proc, /sys 접근. 시험에서는 같은 메서드를 가진 가짜로 바꾼다."""
 
-    def __init__(self, temp_file=None, hwmon_root="/sys/class/hwmon"):
+    def __init__(self, temp_file=None, hwmon_root="/sys/class/hwmon", unit="gto-runner.service", cpu_max=None):
+        self.unit = unit
+        self.cpu_max = cpu_max or (f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service"
+                                   f"/app.slice/{unit}/cpu.max")
         self.temp_file = temp_file
         self.cpu_hwmon = find_hwmon("k10temp", hwmon_root)
         self.gpu_hwmon = find_hwmon("amdgpu", hwmon_root)
@@ -220,6 +274,18 @@ class SystemIO:
 
     def setaff(self, tid, cpus):
         os.sched_setaffinity(tid, cpus)
+
+    def set_quota(self, pct):
+        """systemctl --user set-property --runtime 으로 CPUQuota 적용 후 cpu.max 를 읽어 실제 %를 돌려준다. 실패는 None."""
+        try:
+            r = subprocess.run(["systemctl", "--user", "set-property", "--runtime", self.unit, f"CPUQuota={pct}%"],
+                               timeout=15, capture_output=True)
+            if r.returncode != 0:
+                return None
+            q, per = open(self.cpu_max).read().split()[:2]
+            return 0 if q == "max" else int(round(int(q) / int(per) * 100))
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            return None
 
     def ticks(self, pid):
         """utime+stime (clock tick). 읽지 못하면 None."""
@@ -293,7 +359,7 @@ def apply_affinity(io, cpus_by_pid, dry_run=False):
 
 
 class CsvLog:
-    HEADER = "ts,tctl_c,ppt_w,avg30s,avg5m,level,hold,ceiling,solver_pcpu\n"
+    HEADER = "ts,tctl_c,ppt_w,avg30s,avg5m,level,hold,ceiling,solver_pcpu,quota\n"
 
     def __init__(self, state_dir, keep_days=14):
         self.dir, self.keep = state_dir, keep_days
@@ -341,6 +407,32 @@ class Runner:
         self.last_level = None
         self.last_ticks = {}
         self.last_tick_time = None
+        self.qloop = QuotaLoop(self.cfg) if self.cfg["QUOTA_ENABLE"] else None
+
+    def _quota(self, now, d):
+        """CPUQuota 루프 한 주기. 실패해도 cycle 전체를 죽이지 않는다."""
+        if self.qloop is None or self.dry or not hasattr(self.io, "set_quota"):
+            return
+        try:
+            q = self.qloop
+            a60 = self.ctl._avg(now, 60)
+            sm = self.ctl.samples
+            warm = bool(sm) and sm[0][0] <= now - 300 + self.cfg["INTERVAL"]
+            t, _ = q.step(now, d.level, a60, d.avg5, warm)
+            if t == q.cur:
+                return
+            got = self.io.set_quota(t)
+            ts = f"{dt.datetime.fromtimestamp(now):%m-%d %H:%M:%S}"
+            if got == t:
+                old = "-" if q.cur is None else q.cur
+                q.commit(now, t)
+                s60 = "?" if a60 is None else f"{a60:.1f}"
+                s5 = "?" if d.avg5 is None else f"{d.avg5:.1f}"
+                print(f"{ts} quota {old} -> {t}% (60초 {s60}, 5분 {s5}, 단계 {d.name})", flush=True)
+            else:
+                print(f"{ts} quota 설정 실패 (목표 {t}%, 읽은 값 {got})", flush=True)
+        except Exception as e:
+            print("quota 오류:", repr(e), flush=True)
 
     def _pcpu(self, now, pids):
         """솔버 프로세스들의 CPU 사용률 합(%, 코어 1개 = 100). 첫 주기는 빈칸."""
@@ -368,6 +460,7 @@ class Runner:
             print(f"{dt.datetime.fromtimestamp(now):%m-%d %H:%M:%S} 단계 {NAMES.get(self.last_level, '-')} -> {d.name}"
                   f" (온도 {t}, 5분 평균 {a5}, 상한 {NAMES[d.ceiling]}, 솔버 {len(d.cpus_by_pid)}개{', 시험 모드' if self.dry else ''})", flush=True)
             self.last_level = d.level
+        self._quota(now, d)
         if not self.dry:
             apply_affinity(self.io, d.cpus_by_pid)
             os.makedirs(self.solves_dir, exist_ok=True)
@@ -376,7 +469,8 @@ class Runner:
                 f = lambda x, n=2: "" if x is None else f"{x:.{n}f}"
                 pw = self.io.read_power()
                 self.csv.write(now, ",".join([f"{now:.0f}", f(d.temp), f(pw, 1), f(d.avg30), f(d.avg5), str(d.level),
-                                               str(int(d.hold)), str(d.ceiling), self._pcpu(now, [p for p, _ in solves])]))
+                                               str(int(d.hold)), str(d.ceiling), self._pcpu(now, [p for p, _ in solves]),
+                                               "" if self.qloop is None or self.qloop.cur is None else str(self.qloop.cur)]))
         return d
 
     def finish(self, now=None):
@@ -391,6 +485,16 @@ class Runner:
         os.makedirs(self.solves_dir, exist_ok=True)
         write_atomic(self.thermal, thermal_payload(ceiling, False, None, None, now))
         print(f"종료: 선호도를 상한({NAMES[ceiling]})으로 복원, hold=false", flush=True)
+        if self.qloop is not None and hasattr(self.io, "set_quota"):
+            base = self.cfg["QUOTA_BASE"]
+            try:
+                got = self.io.set_quota(base)
+            except Exception as e:
+                got = repr(e)
+            if got == base:
+                print(f"종료: quota {base}% 복원", flush=True)
+            else:
+                print(f"경고: quota {base}% 복원 실패 (읽은 값 {got})", flush=True)
 
 
 def main(argv=None):

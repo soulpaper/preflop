@@ -237,7 +237,7 @@ try:
 
     # 러너 쪽 CSV
     rows = open(os.path.join(state, "thermal.csv")).read().strip().split("\n")
-    test("CSV 헤더와 행(9열)", rows[0] == gt.CsvLog.HEADER.strip() and len(rows) == 9 and all(len(x.split(",")) == 9 for x in rows), f"{len(rows)}")
+    test("CSV 헤더와 행(9열 + quota)", rows[0] == gt.CsvLog.HEADER.strip() and len(rows) == 9 and all(len(x.split(",")) == 10 for x in rows), f"{len(rows)}")
 
     # CSV 순환·보관
     sd = os.path.join(TMP, "rot")
@@ -266,6 +266,190 @@ try:
     open(tf, "w").write("")
     test("온도 파일이 비면 None", sio.read_temp() is None)
     test("is_solver: 자기 자신(python)과 없는 pid 는 거부", not sio.is_solver(os.getpid()) and not sio.is_solver(2 ** 22 + 5) and not sio.is_solver("x"))
+finally:
+    shutil.rmtree(TMP, ignore_errors=True)
+
+# --- 연속 CPUQuota 루프 (가짜 IO 만. 실제 systemctl/cgroup 은 부르지 않는다) ---
+TMP = tempfile.mkdtemp(prefix="gto-quota-test-")
+
+
+class FakeQuotaIO(FakeIO):
+    def __init__(self, temps, solvers=None):
+        super().__init__(temps, solvers or {})
+        self.quota_calls = []
+        self.cpu_max = None      # cpu.max 흉내: 마지막으로 성공한 %
+        self.fail = False
+
+    def set_quota(self, pct):
+        self.quota_calls.append(pct)
+        if self.fail:
+            return None
+        self.cpu_max = pct
+        return self.cpu_max
+
+
+def qrun(temps, enable, dry=False, solvers=None, ceiling_low=False, state_dir=None, start=2000000.0, **over):
+    """온도열을 10초 간격으로 Runner 에 먹인다. (runner, io, decisions, stdout) 반환."""
+    d_ = tempfile.mkdtemp(prefix="gto-quota-test-", dir=TMP)
+    json.dump({"low": ceiling_low}, open(os.path.join(d_, "control.json"), "w"))
+    json.dump({"workers": [{"solver_pid": p, "t0": start} for p in (solvers or {})]}, open(os.path.join(d_, "progress.json"), "w"))
+    qio = FakeQuotaIO(temps, solvers)
+    cfg = gt.load_config({}, NCPU=12, QUOTA_ENABLE=int(enable), **over)
+    rn = gt.Runner(d_, qio, cfg, state_dir, dry_run=dry)
+    buf, ds = _io.StringIO(), []
+    with redirect_stdout(buf):
+        for i in range(len(temps)):
+            ds.append(rn.cycle(start + i * 10))
+    return rn, qio, ds, buf.getvalue()
+
+
+def changes(calls):
+    return [c for i, c in enumerate(calls) if i == 0 or c != calls[i - 1]]
+
+
+try:
+    # 1. ENABLE=0
+    sd1 = os.path.join(TMP, "q1")
+    rn, qio, ds, out = qrun([86] * 40, False, state_dir=sd1)
+    rows = open(os.path.join(sd1, "thermal.csv")).read().strip().split("\n")
+    test("quota 1: ENABLE=0 이면 set_quota 0회, CSV 마지막 열 빈칸", qio.quota_calls == [] and rn.qloop is None and all(r.split(",")[-1] == "" for r in rows[1:]) and "quota" not in out)
+
+    # 2. 첫 주기 BASE
+    rn, qio, ds, out = qrun([88.5], True)
+    test("quota 2: 첫 주기에 BASE 800 설정", qio.quota_calls == [800] and rn.qloop.cur == 800 and "quota - -> 800%" in out, out)
+
+    # 3. warm 전
+    rn, qio, ds, out = qrun([80] * 29, True)    # 280초: 아직 5분 평균 미충족
+    test("quota 3: warm 전에는 온도가 낮아도 800 유지", set(qio.quota_calls) == {800} and rn.qloop.cur == 800, str(qio.quota_calls[-3:]))
+
+    # 4. 86도: 120초마다 +50, 1000에서 멈춤
+    rn, qio, ds, out = qrun([86] * 90, True)
+    test("quota 4: 86도면 +50 씩 올라 1000 에서 멈춤", changes(qio.quota_calls) == [800, 850, 900, 950, 1000] and rn.qloop.cur == 1000, str(changes(qio.quota_calls)))
+    ups = [l.split()[1] for l in out.splitlines() if "quota 8" in l or "quota 9" in l]
+    t_ = [int(x[:2]) * 3600 + int(x[3:5]) * 60 + int(x[6:]) for x in ups]
+    test("quota 4: 올림 간격 120초", len(t_) == 4 and all(b - a == 120 for a, b in zip(t_, t_[1:])), str(ups))
+
+    # 5. 90.5도: 60초마다 -50, 600에서 멈춤
+    rn, qio, ds, out = qrun([90.5] * 90, True)
+    test("quota 5: 90.5도면 -50 씩 내려 600 에서 멈춤", changes(qio.quota_calls) == [800, 750, 700, 650, 600] and rn.qloop.cur == 600, str(changes(qio.quota_calls)))
+    dn = [l.split()[1] for l in out.splitlines() if "-> 7" in l or "-> 6" in l]
+    t_ = [int(x[:2]) * 3600 + int(x[3:5]) * 60 + int(x[6:]) for x in dn]
+    test("quota 5: 내림 간격 60초", len(t_) == 4 and all(b - a == 60 for a, b in zip(t_, t_[1:])), str(dn))
+
+    # 순수 로직 (QuotaLoop)
+    QC = gt.load_config({}, NCPU=12, QUOTA_ENABLE=1)
+    ql = gt.QuotaLoop(QC)
+    tg, _ = ql.step(1000, 2, 80, 80, True)
+    ql.commit(1000, tg)
+    test("quota 순수: 처음엔 BASE", tg == 800 and ql.cur == 800)
+    ql.commit(1100, 750)
+    tg, _ = ql.step(1210, 2, 80, 80, True)
+    test("quota 6: 내림 뒤 120초 안에는 올리지 않음", tg == 750)
+    tg, _ = ql.step(1220, 2, 80, 80, True)
+    test("quota 6: 120초 뒤에는 올림", tg == 800)
+    ql = gt.QuotaLoop(QC)
+    ql.commit(0, 800)
+    ql.commit(1000, 750)
+    tg, _ = ql.step(1010, 2, 91.5, 91.0, True)
+    test("quota 7: 60초 평균 91.5 이상이면 DOWN_GAP 안이라도 즉시 내림", tg == 700, str(tg))
+    tg, _ = ql.step(1010, 2, 91.0, 91.0, True)
+    test("quota 7: 91.0 이면 DOWN_GAP 안에서는 그대로", tg == 750, str(tg))
+    ql = gt.QuotaLoop(QC)
+    ql.commit(0, 800)
+    ok = all(ql.step(500 + i * 10, 2, a, b, True)[0] == 800 for i, (a, b) in enumerate([(88, 88), (89, 89.5), (90, 90), (88.5, 90), (90, 88)]))
+    test("quota 8: 데드밴드(88~90)에서는 변화 없음", ok)
+    ql = gt.QuotaLoop(QC)
+    ql.commit(0, 800)
+    ql.commit(100, 850)
+    tg, _ = ql.step(200, 1, 80, 80, True)
+    test("quota 9: cool 이면 BASE", tg == 800)
+    ql.commit(200, 800)
+    tg0, _ = ql.step(300, 2, 80, 80, True)
+    tg1, _ = ql.step(319, 2, 80, 80, True)
+    tg2, _ = ql.step(320, 2, 80, 80, True)
+    test("quota 9: normal 복귀 직후 120초 동안 올림 없음", tg0 == 800 and tg1 == 800 and tg2 == 850, f"{tg0} {tg1} {tg2}")
+    tgh, _ = ql.step(400, 0, None, None, False)
+    test("quota 9: hold 도 BASE", tgh == 800)
+    ql = gt.QuotaLoop(QC)
+    ql.cur = 700
+    test("quota 순수: a60 없음/warm 아님이면 cur", ql.step(1, 2, None, None, True)[0] == 700 and ql.step(1, 2, 95, 95, False)[0] == 700)
+
+    # 10. set_quota 실패
+    d_ = tempfile.mkdtemp(prefix="gto-quota-test-", dir=TMP)
+    qio = FakeQuotaIO([86] * 5)
+    qio.fail = True
+    rn = gt.Runner(d_, qio, gt.load_config({}, NCPU=12, QUOTA_ENABLE=1), None, dry_run=False)
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        for i in range(3):
+            rn.cycle(3000000.0 + i * 10)
+        qio.fail = False
+        rn.cycle(3000030.0)
+    test("quota 10: 실패하면 cur 그대로, 실패 이벤트, 다음 주기 같은 목표로 재시도",
+         qio.quota_calls == [800, 800, 800, 800] and buf.getvalue().count("quota 설정 실패 (목표 800%") == 3 and rn.qloop.cur == 800, buf.getvalue())
+
+    # 11. finish
+    rn, qio, ds, out = qrun([86] * 40, True, QUOTA_BASE=800)
+    rn.qloop.cur = 700
+    buf = _io.StringIO()
+    with redirect_stdout(buf):
+        rn.finish(2000500.0)
+    test("quota 11: finish() 가 BASE 복원", qio.quota_calls[-1] == 800 and "quota 800% 복원" in buf.getvalue(), buf.getvalue())
+    rn, qio, ds, out = qrun([86] * 40, True, dry=True)
+    with redirect_stdout(_io.StringIO()):
+        rn.finish(2000500.0)
+    test("quota 11: dry-run 에서는 set_quota 호출 없음", qio.quota_calls == [])
+
+    # 12. CSV
+    sd12 = os.path.join(TMP, "q12")
+    rn, qio, ds, out = qrun([86] * 40, True, state_dir=sd12)
+    rows = open(os.path.join(sd12, "thermal.csv")).read().strip().split("\n")
+    test("quota 12: CSV 헤더 9열 + quota, 행 열 수 일치, 값 기록",
+         rows[0].split(",")[:9] == gt.CsvLog.HEADER.strip().split(",")[:9] and rows[0].endswith(",quota")
+         and all(len(r.split(",")) == 10 for r in rows) and rows[1].split(",")[-1] == "800" and rows[-1].split(",")[-1] == "850", rows[-1])
+
+    # 13. env / 정리
+    c13 = gt.load_config({"GTO_THERMAL_QUOTA_MAX": "900", "GTO_THERMAL_QUOTA_ENABLE": "1"})
+    test("quota 13: env 덮어쓰기(MAX=900, int)", c13["QUOTA_MAX"] == 900 and isinstance(c13["QUOTA_MAX"], int) and c13["QUOTA_ENABLE"] == 1 and c13["QUOTA_BASE"] == 800)
+    c13 = gt.load_config({"GTO_THERMAL_QUOTA_MAX": "700"})
+    test("quota 13: BASE 가 범위 밖이면 자름", c13["QUOTA_BASE"] == 700)
+    c13 = gt.load_config({"GTO_THERMAL_QUOTA_MIN": "900"})
+    test("quota 13: MIN > MAX 면 MAX 를 올림", c13["QUOTA_MAX"] >= c13["QUOTA_MIN"] == 900 and c13["QUOTA_BASE"] == 900)
+    test("quota 13: 기본값 ENABLE=0", gt.load_config({})["QUOTA_ENABLE"] == 0)
+
+    # 14. 회귀: ENABLE 에 상관없이 Decision 동일
+    prof = [89] * 40 + [94] * 10 + [96] * 12 + [92] * 20 + [85] * 40 + [None] * 4 + [88] * 30
+    sol = {9001: [9001], 9002: [9002]}
+    _, _, d_on, _ = qrun(prof, True, solvers=sol)
+    _, _, d_off, _ = qrun(prof, False, solvers=sol)
+    sig = lambda ds: [(d.level, d.hold, d.cpus_by_pid, d.changed, d.note) for d in ds]
+    test("quota 14: ENABLE=1/0 의 Decision(단계·hold·affinity) 동일", sig(d_on) == sig(d_off) and any(d.hold for d in d_on) and len({d.level for d in d_on}) >= 3)
+
+    # SystemIO.set_quota: systemctl 대신 가짜 subprocess.run
+    import subprocess as _sp
+    cm = os.path.join(TMP, "cpu.max")
+    sio = gt.SystemIO(None, hwmon_root=os.path.join(TMP, "nohwmon"), unit="x.service", cpu_max=cm)
+    real_run, seen = _sp.run, []
+    try:
+        _sp.run = lambda cmd, **kw: (seen.append(cmd), _sp.CompletedProcess(cmd, 0))[1]
+        open(cm, "w").write("850000 100000\n")
+        r1 = sio.set_quota(850)
+        open(cm, "w").write("max 100000\n")
+        r2 = sio.set_quota(850)
+        _sp.run = lambda cmd, **kw: _sp.CompletedProcess(cmd, 1)
+        r3 = sio.set_quota(850)
+        def boom(cmd, **kw):
+            raise _sp.TimeoutExpired(cmd, 15)
+        _sp.run = boom
+        r4 = sio.set_quota(850)
+        _sp.run = lambda cmd, **kw: _sp.CompletedProcess(cmd, 0)
+        os.remove(cm)
+        r5 = sio.set_quota(850)
+    finally:
+        _sp.run = real_run
+    test("quota SystemIO: --runtime 명령, cpu.max 해석(max=0), 실패는 None",
+         seen[0] == ["systemctl", "--user", "set-property", "--runtime", "x.service", "CPUQuota=850%"] and (r1, r2, r3, r4, r5) == (850, 0, None, None, None), str((seen, r1, r2, r3, r4, r5)))
+    test("quota SystemIO: 기본 cpu.max 경로", "gto-runner.service/cpu.max" in gt.SystemIO(None).cpu_max and f"user-{os.getuid()}.slice" in gt.SystemIO(None).cpu_max)
 finally:
     shutil.rmtree(TMP, ignore_errors=True)
 
