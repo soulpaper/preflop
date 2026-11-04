@@ -1,15 +1,17 @@
-"""상대별 통계 저장소.
+"""상대별 통계 저장소 (메모리 전용) + 핸드 기록 JSONL.
 
-    store = profiles.Store()                       # BASE/profiles.db + BASE/hands/YYYY-MM-DD.jsonl
-    store.observe(record)                          # handlog.Tracker 가 낸 핸드 기록
+    store = profiles.Store()                       # 메모리 SQLite + BASE/hands/YYYY-MM-DD.jsonl
+    store.observe(record, names=tracker.names_for(record["id"]))   # handlog.Tracker 가 낸 핸드 기록 (+ 메모리의 닉네임)
     store.stats("홍길동")                          # {'hands', 'vpip', 'pfr', 'threebet', 'fold_to_bet', 'af', 'wtsd', 'shown', 'reliable', ...}
     store.get_for_table({"seat_UR": ("홍길동", False), "seat_BL": ("User84", True)}, session=tracker.session)
 
-  - 잘리지 않은 닉네임: SQLite (exe 옆 profiles.db) 에 누적.
+  - 닉네임은 디스크에 쓰지 않는다 (2026-11-05 결정). 통계 DB 는 메모리 SQLite(':memory:')라 앱을 끄면 사라지고,
+    예전 profiles.db 파일은 더 열지도 만들지도 않는다 (지우는 도구: scrub_names.py). 핸드 기록 JSONL 에는 좌석 키·포지션·
+    상대 타입만 (닉네임 관련 칸 name/truncated/placeholder/linked_name 은 쓰기 직전에 한 번 더 지운다).
+  - 잘리지 않은 닉네임: 메모리 DB 에 (앱 실행 동안) 누적.
   - 잘린 닉네임('User84…'): DB 에 절대 쓰지 않음. 메모리에서 (세션, 좌석 키, 잘린 이름) 으로만 누적하고,
     그 좌석 이름이 바뀌거나 새 세션(다시 보정/새 테이블)의 기록이 오면 버린다.
   - confidence='low' 기록은 통계에 넣지 않고 JSONL 에만 (표시해서) 남긴다.
-  - JSONL: 잘리지 않은 이름은 그대로(로컬 전용), 잘린 이름은 'seat-local:<좌석 키>' 자리표시로.
   - 글자 지문: names.NameReader 의 resolver/on_confirm 으로 연결하면 OCR 이 조금 다르게 읽어도 같은 사람으로 묶음.
 
   - 게임 '유저 정보' 팝업 통계 (userinfo.py): import_site_stats(name, stats, tab) 로 (이름, 게임 탭) 별 저장.
@@ -40,6 +42,7 @@ SHOWN_KEEP = 20            # 이름별로 보관할 공개 핸드 수
 FP_KEEP = 4                # 이름별 글자 지문 수
 FP_MATCH = 0.75            # 지문이 이 이상 닮으면 같은 닉네임 (names.FP_SAME 보다 조금 엄격)
 
+NAME_FIELDS = ("name", "truncated", "placeholder", "linked_name")   # 파일에 쓰지 않는 좌석 칸 (닉네임 관련)
 COUNTERS = ("hands", "vpip", "pfr", "threebet", "threebet_opp", "faced_bet", "fold_to_bet", "agg", "calls",
             "saw_flop", "showdown")
 
@@ -111,8 +114,35 @@ def summarize(c, shown=(), site=None):
     return out
 
 
+def strip_names(rec):
+    """기록 사본에서 좌석의 닉네임 관련 칸(NAME_FIELDS)을 지움 (파일에 쓰기 직전). 원본은 그대로."""
+    out = json.loads(json.dumps(rec, ensure_ascii=False, default=str))
+    for seat in (out.get("seats") or {}).values():
+        if isinstance(seat, dict):
+            for f in NAME_FIELDS:
+                seat.pop(f, None)
+    return out
+
+
+def append_line(path, line):
+    """JSONL 한 줄 덧붙이기. 앞서 쓰다 죽어 파일이 줄바꿈 없이 끝났으면 먼저 줄을 바꿔서, 새 기록이 반쪽 줄에 붙어
+    둘 다 못 읽게 되지 않게 한다 (읽는 쪽은 JSON 이 아닌 줄을 건너뜀)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            if f.tell():
+                f.seek(-1, 2)
+                if f.read(1) != b"\n":
+                    line = "\n" + line
+    except OSError:
+        pass   # 아직 없는 파일
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line)
+
+
 class Store:
     def __init__(self, path=None, hands_dir=None, write_jsonl=True):
+        """path: 예전 호환용 (무시 — 통계 DB 는 항상 메모리). hands_dir 가 없으면 path 의 폴더(없으면 BASE)/hands."""
         self.path = Path(path) if path else BASE / "profiles.db"
         self.hands_dir = Path(hands_dir) if hands_dir else self.path.parent / "hands"
         self.write_jsonl = write_jsonl
@@ -125,7 +155,7 @@ class Store:
         self.seat_names = {}           # (session, seat_key) -> 잘린 이름 (이름이 바뀌면 그 좌석 기억 버림)
         self.links = {}                # (session, seat_key) -> 팝업으로 확인된 전체 이름 (잘린 이름 접두사 일치, 세션 한정)
         self._fp_cache = None
-        self.db = sqlite3.connect(str(self.path), check_same_thread=False, timeout=5)
+        self.db = sqlite3.connect(":memory:", check_same_thread=False)  # 닉네임이 들어가므로 디스크에 쓰지 않음
         self.db.executescript(SCHEMA)
         self.db.commit()
 
@@ -167,10 +197,20 @@ class Store:
             self.seat_names[key] = new
 
     # --- 기록 ------------------------------------------------------------------------------------
-    def observe(self, rec):
-        """핸드 기록 하나를 통계(신뢰할 때만)와 JSONL 에 반영. 통계에 넣었으면 True."""
+    def observe(self, rec, names=None):
+        """핸드 기록 하나를 통계(신뢰할 때만, 메모리)와 JSONL(닉네임 없이)에 반영. 통계에 넣었으면 True.
+        names: {seat: (name, truncated)} — 메모리에서만 쓰는 닉네임 (handlog.Tracker.names_for). 기록에 name 이 있으면 그것도 씀."""
         try:
             with self.lock:
+                if names and isinstance(rec, dict) and isinstance(rec.get("seats"), dict):
+                    seats = {}
+                    for k, seat in rec["seats"].items():
+                        seat = dict(seat)
+                        nm = names.get(k)
+                        if nm and nm[0] and not seat.get("name"):
+                            seat["name"], seat["truncated"] = nm[0], bool(nm[1])
+                        seats[k] = seat
+                    rec = dict(rec, seats=seats)
                 return self._observe(rec)
         except Exception as exc:
             self._fail(exc)
@@ -224,15 +264,10 @@ class Store:
     def _jsonl(self, rec):
         if not self.write_jsonl:
             return
-        out = json.loads(json.dumps(rec, ensure_ascii=False, default=str))
-        for k, seat in out.get("seats", {}).items():
-            if seat.get("truncated"):
-                seat["name"] = None
-                seat["placeholder"] = f"seat-local:{k}"
+        out = strip_names(rec)
         day = time.strftime("%Y-%m-%d", time.localtime(float(rec.get("start") or time.time())))
         self.hands_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.hands_dir / f"{day}.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps(out, ensure_ascii=False) + "\n")
+        append_line(self.hands_dir / f"{day}.jsonl", json.dumps(out, ensure_ascii=False) + "\n")
 
     # --- 조회 ------------------------------------------------------------------------------------
     def stats(self, name, truncated=False, seat=None, session=None, tab=None):

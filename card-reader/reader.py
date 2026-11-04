@@ -151,6 +151,9 @@ CARD_FACE = "#f5f5f2"
 RED_SUIT, BLACK_SUIT = "#d93a44", "#1b1e23"
 CHIP = "#232931"
 CHIP_HOVER = "#2c333d"
+# 상대 타입 배지 (게임 유저 정보 팝업의 타입): 바탕색, 글자는 어두운 색
+TYPE_COLORS = {"LAG": "#f87171", "LP": "#fbbf24", "TAG": "#60a5fa", "TP": "#34d399"}
+TYPE_KO = {"LAG": "루즈-어그레시브", "LP": "루즈-패시브", "TAG": "타이트-어그레시브", "TP": "타이트-패시브"}
 
 F_UI = "Malgun Gothic"
 F_NUM = "Segoe UI"
@@ -164,6 +167,9 @@ FS_ADV_CAP, FS_ADV_REASON, FS_ADV_PLAN, FS_ADV_DETAIL, FS_ADV_STATUS = 12, 16, 1
 
 # 용어 설명: (용어, 한 줄 요약 — 화면에 항상 표시, 자세한 설명 — 마우스를 올리면)
 EXPLAIN = {
+    "opp_type": ("상대 타입 확인", "안내한 캐릭터를 누르면 게임이 매긴 그 사람의 타입을 읽음",
+                 "게임의 유저 정보(캐릭터를 누르면 뜨는 창)에 있는 타입(루즈/타이트 · 어그레시브/패시브)을 읽어 이 테이블 동안 "
+                 "그 자리에 기억. 앱은 아무것도 누르지 않음. 내가 쉬는 동안에만, 한 자리씩 안내"),
     "advice": ("추천", "지금 상황을 종합한 행동", "지금 카드·팟·스택·포지션·남은 인원을 종합한 행동"),
     "equity": ("에쿼티(승률)", "끝까지 갔을 때 이길 확률", "지금 카드로 끝까지 갔을 때 이길 확률"),
     "pot_odds": ("팟 오즈", "콜에 필요한 최소 승률 — 내 승률이 더 높으면 콜",
@@ -176,7 +182,8 @@ EXPLAIN = {
     "m": ("M-ratio", "블라인드·앤티를 몇 바퀴 버티나 (토너먼트)",
           "블라인드·앤티를 몇 바퀴 버틸 수 있는지 (토너먼트 생존 지표)"),
     "opp": ("상대 예상", "상대가 이번 핸드에서 한 액션으로 가능한 패를 추정",
-            "상대의 프리플랍·포스트플랍 액션과 (믿을 만하면) 누적 성향으로 가능한 핸드 범위를 추정. 내 차례에만 계산"),
+            "상대의 프리플랍·포스트플랍 액션과 (확인했으면) 게임 유저 정보의 상대 타입으로 가능한 핸드 범위를 추정. 내 차례에만 계산. "
+            "내가 쉬는 동안에는 타입을 확인할 캐릭터를 안내 (직접 눌러야 함)"),
     "preflop": ("프리플랍 가이드", "내 자리·상황에서 이 핸드로 할 행동", "내 자리·상황에서 이 핸드로 할 행동"),
 }
 
@@ -1463,6 +1470,7 @@ class App:
         self.store = self.name_reader = self.tracker = self.recorder = None
         self.declog = None  # 내 차례 결정 기록 (decisionlog.DecisionLog)
         self.popup = None          # 게임 '유저 정보' 팝업 읽기 (userinfo.PopupWatcher)
+        self.seat_types = None     # 좌석별 상대 타입 (seattypes.SeatTypes, 메모리 전용)
         self.pending_toast = None  # 상태 스레드 → Tk 스레드 알림
         self.handread = self.rangeq = None
         self.showdown = self.shown_watch = self.shown_match = None  # 쇼다운 공개 카드 읽기 (showdown.py)
@@ -2379,14 +2387,18 @@ class App:
             names_m, handlog_m, profiles_m = (_optional(n) for n in ("names", "handlog", "profiles"))
             self.handread, self.rangeq = _optional("handread"), _optional("rangeq")
             if names_m and handlog_m and profiles_m:
-                self.store = profiles_m.Store(BASE / "profiles.db")
+                # 통계는 메모리에만 (닉네임을 디스크에 쓰지 않음 — profiles.db 는 더 만들지 않는다). 핸드 JSONL 은 BASE/hands
+                self.store = profiles_m.Store(hands_dir=BASE / "hands")
                 self.name_reader = names_m.NameReader(resolver=self.store.resolve_name,
                                                       on_confirm=self.store.learn_fingerprint)
                 dl_m = _optional("decisionlog")
                 self.declog = dl_m.DecisionLog(BASE, on_error=lambda *a: self.log_once("decisionlog")) if dl_m else None
+                st_m = _optional("seattypes")
+                self.seat_types = st_m.SeatTypes() if st_m else None
 
                 def on_hand(rec, store=self.store):
-                    store.observe(rec)
+                    tr = self.tracker
+                    store.observe(rec, names=tr.names_for(rec.get("id")) if tr is not None else None)
                     if self.declog is not None:  # 내 결정 기록에 실제 행동·결과를 이어 붙임
                         self.declog.link_hand(rec)
                 self.tracker = handlog_m.Tracker(on_hand=on_hand)
@@ -2402,13 +2414,17 @@ class App:
             self.store = self.name_reader = self.tracker = None
 
     def track_new_session(self, calib):
-        """새 [자동 지정] / 테이블 창이 바뀜: 진행 중 핸드를 닫고 세션·이름 기억을 새로."""
+        """새 [자동 지정] / 테이블 창이 바뀜: 진행 중 핸드를 닫고 세션·이름·좌석 타입 기억을 새로 (pid 소금도 새로)."""
         self.track = {}
         if self.tracker is not None:
             self.tracker.new_session()
             self.store.new_session(self.tracker.session)
         if self.name_reader is not None:
             self.name_reader.reset()
+        if self.seat_types is not None:
+            self.seat_types.reset()
+        if self.popup is not None:
+            self.popup.reset()
         if self.recorder is not None and self.recorder.enabled:
             self.recorder.set_calib(calib)
 
@@ -2467,12 +2483,32 @@ class App:
         if self.tracker is None or not isinstance(st, dict) or "seats" not in st:
             return
         names = self.name_reader.read(img, calib, st) if self.name_reader else {}
+        types = self.seat_types
+        log_names, log_types = names, None
+        if types is not None:
+            dropped = types.observe(names, st, now)
+            if dropped == ["*"]:  # 테이블 이동/합치기: 핸드 기록 세션(pid 소금)도 새로
+                self.tracker.new_session()
+                self.store.new_session(self.tracker.session)
+            if dropped and self.popup is not None:
+                self.popup.reset()   # 같은 사람이 다시 앉아도 팝업을 다시 받아들이게
+            log_names, log_types = types.full_names(names), types.for_log()
         shown = self.read_shown(img, calib, st, hero, board)
-        if self.tracker.update(st, hero, board, names, now, shown=shown):
+        if self.tracker.update(st, hero, board, log_names, now, shown=shown, types=log_types):
             self.hands_done += 1   # 핸드가 끝남 → 카드 잠금을 푸는 새 핸드 신호
         profiles = self.store.get_for_table(names, session=self.tracker.session,
                                             tab=self.cfg.get("game_tab")) if self.store else {}
         live = self.tracker.live()
+        prompt, seat_type = None, {}
+        if types is not None:
+            for s_ in st.get("seats") or []:   # 팝업 타입·통계를 좌석 프로필에 합침 (style 포함)
+                k = s_.get("key")
+                if k and k != "hero":
+                    p = types.profile(k, profiles.get(k))
+                    if p is not None:
+                        profiles[k] = p
+                    seat_type[k] = {"known": types.known(k), "style": types.style(k)}
+            prompt = types.prompt(st, live, now)
         reads = self.track.get("reads")
         if reads and reads["hero"] != tuple(hero):  # 새 핸드
             reads = None
@@ -2484,7 +2520,8 @@ class App:
                 hist = summarize_hand(self.tracker.hand)
         except Exception:
             self.log_once("summarize_hand")
-        self.track = {"names": names, "profiles": profiles, "live": live, "reads": reads, "t": now, "hist": hist}
+        self.track = {"names": names, "profiles": profiles, "live": live, "reads": reads, "t": now, "hist": hist,
+                      "prompt": prompt, "types": seat_type}
 
     def read_shown(self, img, calib, st, hero, board):
         """쇼다운 공개 카드 {seat_key: ['9c', '7c'] 또는 None} → 핸드 기록 (상대 예상 채점용). 쇼다운일 수 있을 때만
@@ -2509,35 +2546,39 @@ class App:
         """남은 상대가 바뀌었거나 새 액션이 있으면 상대 예상을 다시 계산 (아니면 그대로)."""
         in_hand = sorted(x["key"] for x in st["seats"] if x.get("in_hand") and x["key"] != "hero" and x["key"] in live)
         ante = bool((odds.parse_amount((self.cfg.get("inputs") or {}).get("ante")) or 0) > 0)
-        key = (tuple(hero), tuple(board), tuple(in_hand), repr([live[k] for k in in_hand]), ante, self.looseness())
+        styles = tuple((profiles.get(k) or {}).get("style") for k in in_hand)   # 타입을 새로 읽으면 다시 계산
+        key = (tuple(hero), tuple(board), tuple(in_hand), repr([live[k] for k in in_hand]), ante, self.looseness(), styles)
         if in_hand and (reads is None or reads["key"] != key):
             reads = self.make_reads(st, hero, board, live, profiles, in_hand, key)
         return reads
 
     def read_popup(self, img):
-        """사용자가 연 게임의 '유저 정보' 팝업을 읽어 상대 통계로 저장 (직접 클릭하지 않음).
+        """사용자가 연 게임의 '유저 정보' 팝업을 읽어 그 좌석의 상대 타입으로 기억 (메모리만, 직접 클릭하지 않음).
         팝업은 지금 하는 게임 종류 탭으로 열리므로 그 탭을 현재 게임 종류로 기억한다."""
         popup = getattr(self, "popup", None)
-        if popup is None:
+        types = getattr(self, "seat_types", None)
+        if popup is None or types is None:
             return
         info = popup.update(img)
         if not info or info.get("vpip") is None:
             return
         if info.get("tab"):
             self.cfg["game_tab"] = info["tab"]
-        if not info.get("name_reliable"):
-            self.pending_toast = "상대 정보: 닉네임을 확실히 못 읽어 저장하지 않았습니다"
+        key = types.apply_popup(info, (self.track or {}).get("names") or {}, time.time())
+        if key is None:
+            self.pending_toast = "상대 정보: 어느 자리인지 몰라 저장하지 않았습니다 (안내한 캐릭터를 눌러 주세요)"
             return
-        session = self.tracker.session if self.tracker is not None else None
-        self.store.import_site_stats(info["name"], info, info.get("tab") or "홀덤", session=session)
-        self.pending_toast = (f"{info['name']} 저장 · {info.get('style_ko') or ''} "
-                              f"VPIP {info['vpip']} / PFR {info.get('pfr')} ({info.get('tab') or '홀덤'})")
+        pos = next((s.get("pos") for s in (self.table_state or {}).get("seats") or [] if s.get("key") == key), None)
+        where = f"{pos} 자리" if pos else "상대"
+        self.pending_toast = f"{where} 타입: {info.get('style_ko') or '모름'} (VPIP {info['vpip']} / PFR {info.get('pfr')})"
 
     def make_reads(self, st, hero, board, live, profiles, in_hand, key):
         """handread.estimate: 남은 상대 각자의 범위·요약 (주 상대 먼저)."""
         players = _number(st.get("pos_players")) or _number(st.get("players")) or 9
         stack = _number((st.get("preflop") or {}).get("stack_bb")) or 100
-        seats = {k: live[k] for k in in_hand}
+        # 상대 타입(팝업 style)·통계는 seats[k]['profile'] 로도 넘김 (handread 가 포스트플랍에 style 을 씀)
+        seats = {k: (dict(live[k], profile=dict(profiles[k])) if isinstance(profiles.get(k), dict) else live[k])
+                 for k in in_hand}
         order = sorted(seats, key=lambda k: (-self.aggression(seats[k]), k))
         kw = {}
         try:  # 상대 범위 모듈이 앤티·느슨함을 받으면 넘긴다 (rangeq.villain_range 의 ante)
@@ -3584,6 +3625,7 @@ class App:
                self.result_stale(), self.heavy_allowed(), self.err_note, self.state_key, tuple(sorted(self.manual)),
                bool(self.cfg.get("auto_numbers")), repr(self.ocr_values), self.rec_on, self.rec_elapsed(),
                self.reads_sig(), repr((self.track or {}).get("names")), repr(self.cfg.get("section_layout")),
+               repr((self.track or {}).get("prompt")), repr((self.track or {}).get("types")),
                repr(self.tourney), repr(self.cfg.get("tourney")), self.cfg.get("ui_bias"))
         if key == self.last_render and not force:
             return
@@ -3885,7 +3927,9 @@ class App:
         plan = [("top", self.sec_top, None), ("cards", self.sec_cards, None),
                 ("equity", lambda c: self.sec_equity(c, st), None)]
         blocks = self.opp_blocks()  # 상대 예상: 상대마다 한 블록 (최대 3, 주 상대 먼저), 섹션은 하나
-        plan.append(("opp", (lambda c: self.sec_opp_all(c, blocks)) if blocks else None, COLLAPSED_TEXT["opp"]))
+        prompt = (self.track or {}).get("prompt")  # 쉬는 동안: 어느 캐릭터를 눌러 타입을 볼지 안내
+        plan.append(("opp", (lambda c: self.sec_opp_all(c, blocks, prompt)) if blocks or prompt else None,
+                     COLLAPSED_TEXT["opp"]))
         notes = []
         guide, guide_text = None, COLLAPSED_TEXT["guide"]
         if res and not res["board"]:
@@ -4252,7 +4296,8 @@ class App:
         return self.draw_summary(c, y) - self.s(10)
 
     def opp_blocks(self):
-        """[(이름, 포지션, 성향 한 줄, 요약 줄들, 가능성 높은 핸드 [(코드, %)])] 최대 3명, 주 상대(마지막 공격자) 먼저. 내 차례에 계산된 것만."""
+        """[(이름, 포지션, 성향 한 줄, 요약 줄들, 가능성 높은 핸드 [(코드, %)], 타입 {known, style})] 최대 3명,
+        주 상대(마지막 공격자) 먼저. 내 차례에 계산된 것만. 이름은 화면에만 (파일에 안 씀)."""
         reads = self.reads_now()
         if not reads or self.view.get("message") or (self.table_state or {}).get("hero_folded"):
             return []
@@ -4273,14 +4318,20 @@ class App:
             if p.get("reliable"):
                 pline = " / ".join(f"{n} {p[key]:.0f}" for n, key in (("VPIP", "vpip"), ("PFR", "pfr")) if p.get(key) is not None)
                 pline = (pline + " · " if pline else "") + f"{p.get('hands', 0)}핸드"
-            out.append((label, pos, pline, lines, (reads.get("top") or {}).get(k) or []))
+            tinfo = (self.track.get("types") or {}).get(k) or {"known": False, "style": p.get("style")}
+            out.append((label, pos, pline, lines, (reads.get("top") or {}).get(k) or [], tinfo))
             if len(out) == 3:
                 break
         return out
 
-    def sec_opp_all(self, c, blocks):
-        """상대 예상: 상대마다 한 블록 (최대 3명)을 한 섹션 안에 쌓는다 (자리는 하나)."""
+    def sec_opp_all(self, c, blocks, prompt=None):
+        """상대 예상: 상대마다 한 블록 (최대 3명)을 한 섹션 안에 쌓는다 (자리는 하나).
+        prompt: 내가 쉬는 동안 '어느 캐릭터를 눌러 타입을 확인할지' 안내 (seattypes.SeatTypes.prompt) — 크게, 맨 위."""
         y = self.s(8)
+        if prompt:
+            y = self.draw_type_prompt(c, y, prompt)
+            if blocks:
+                y += self.s(GAP)
         for idx, blk in enumerate(blocks):
             if idx:
                 c.create_line(self.s(self.P), y + self.s(GAP) / 2, self.s(self.W) - self.s(self.P),
@@ -4289,9 +4340,42 @@ class App:
             y = self.sec_opp(c, idx, blk, y)
         return y
 
+    def draw_type_prompt(self, c, y, prompt):
+        """'CO 자리 캐릭터를 눌러 주세요' 안내 상자 (큰 글씨). 앱은 클릭하지 않는다 — 사용자가 직접 누름."""
+        s, W, P = self.s, self.s(self.W), self.s(self.P)
+        y = self.section_title(c, y, W, P, "상대 타입 확인", "opp_type")
+        top = y
+        pad = s(12)
+        t = self.text(c, P + pad, y + pad, prompt.get("text") or "", FS_HAND + 6, "bold", WARN, width=W - 2 * (P + pad))
+        b = c.bbox(t)
+        t2 = self.text(c, P + pad, b[3] + s(4), prompt.get("sub") or "", FS_BODY + 2, "bold", TEXT,
+                       width=W - 2 * (P + pad))
+        bottom = c.bbox(t2)[3] + pad
+        bg = round_rect(c, P, top, W - P, bottom, s(10), fill=PANEL, outline=WARN, width=max(1, int(s(2))))
+        c.tag_lower(bg, t)
+        return bottom + s(6)
+
+    def type_badge_size(self, tinfo):
+        style = (tinfo or {}).get("style")
+        text = TYPE_KO.get(style) or "타입 모름"
+        pt = FS_BODY + 1
+        return text, pt, self.measure(text, pt, "bold") + self.s(18), self.measure("가", pt, "bold") + self.s(8)
+
+    def draw_type_badge(self, c, x, y, tinfo):
+        """상대 타입 배지 (색 바탕 '루즈-패시브', 모르면 회색 '타입 모름') → 배지 아래 y."""
+        s = self.s
+        style = (tinfo or {}).get("style")
+        text, pt, w, h = self.type_badge_size(tinfo)
+        fill, fg = (TYPE_COLORS[style], BG) if style in TYPE_COLORS else (CHIP, MUTED)
+        round_rect(c, x, y, x + w, y + h, s(8), fill=fill, outline="")
+        self.text(c, x + w / 2, y + h / 2 + s(0.5), text, pt, "bold", fg, anchor="center")
+        return y + h
+
     def sec_opp(self, c, idx, blk, y):
         s, W, P = self.s, self.s(self.W), self.s(self.P)
-        label, pos, pline, lines, top = (tuple(blk) + ([],))[:5]
+        blk = list(blk) + [None] * (6 - len(blk))
+        label, pos, pline, lines, top, tinfo = blk[:6]
+        top = top or []
         if idx == 0:  # 첫 블록에만 섹션 제목
             stale = self.reads_now() and tuple(self.reads_now()["board"]) != tuple(
                 c_ for c_ in self.view.get("board", []) if ev.is_card(c_))
@@ -4299,11 +4383,20 @@ class App:
                                    right_color=WARN)
         t = self.text(c, P, y, label, FS_BODY + 1, "bold", TEXT, width=W - 2 * P - s(70))
         b = c.bbox(t)
+        x_end = b[2]
         if pos:
             w = self.measure(pos, FS_SMALL, "bold") + s(14)
             round_rect(c, b[2] + s(8), b[1] + s(2), b[2] + s(8) + w, b[3] - s(1), s(6), fill=CHIP, outline="")
             self.text(c, b[2] + s(8) + w / 2, (b[1] + b[3]) / 2 + s(0.5), pos, FS_SMALL, "bold", ACCENT, anchor="center")
+            x_end = b[2] + s(8) + w
         y = b[3] + s(2)
+        # 상대 타입 배지: 이름·포지션 줄 오른쪽에 (자리가 없으면 다음 줄)
+        _, _, bw, bh = self.type_badge_size(tinfo)
+        if x_end + s(10) + bw <= W - P:
+            by = (b[1] + b[3]) / 2 - bh / 2
+            y = max(y, self.draw_type_badge(c, x_end + s(10), by, tinfo) + s(2))
+        else:
+            y = self.draw_type_badge(c, P, y + s(2), tinfo) + s(4)
         if pline:
             t = self.text(c, P, y, pline, FS_NOTE, "bold", ACCENT, width=W - 2 * P)
             y = c.bbox(t)[3] + s(2)

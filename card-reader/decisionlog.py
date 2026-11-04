@@ -18,7 +18,9 @@ DECISION_FIELDS
   hero[2], board[], tex{...board_texture}, hero_pos, villain_pos, situation, hero_ip, aggressor, flop_line, villain_raised, ref3_villain_pos, pre_raises
   players, opponents, stack_bb, my_stack, pot, pot_total, call, call_pct_pot, spr, can_check, facing_allin, ante
   bettor{seat,pos,street,act,to,pct} (이번 스트리트 마지막 상대 벳/레이즈), n_aggr (이번 스트리트 벳/레이즈 수)
-  seats{키: {pos, name|None, placeholder, hero, folded(street), acts{street:[{act,to,pct,allin}]}, profile{...}}}
+  seats{키: {pos, hero, folded(street), pid, type, type_src, acts{street:[{act,to,pct,allin}]}, profile{...}}}
+      닉네임은 쓰지 않는다 (좌석 키·포지션·세션 가명 pid·상대 타입만). pid 는 handlog.Tracker.seat_pid (세션 소금 HMAC). type = 게임 유저 정보 팝업의 LAG/LP/TAG/TP (모르면 None),
+      type_src = 'popup' (profiles[k] 의 style / type_src 에서)
       pct = 그 액션으로 낸 칩 / 액션 직전 팟 (BB 단위 팟을 액션 기록에서 다시 계산한 값; 앤티·OCR 팟과 다를 수 있음)
   equity, equity_basis, outs, hand_name, reads{키: {width, summary, classes, line}}
   advice{action(영문 fold/check/call/bet/raise/allin/wait), action_ko, size_bb, size_text, confidence, reason,
@@ -48,7 +50,7 @@ ACTION_EN = {"폴드": "fold", "체크": "check", "콜": "call", "벳": "bet", "
 CATEGORY = {"fold": "fold", "check": "check", "call": "call", "bet": "aggr", "raise": "aggr", "allin": "aggr"}
 MEM_HANDS = 64
 MEM_KEYS = 512
-PROFILE_KEYS = ("vpip", "pfr", "af", "fold_to_bet", "threebet", "wtsd", "hands", "source")
+PROFILE_KEYS = ("vpip", "pfr", "af", "fold_to_bet", "threebet", "wtsd", "hands", "source", "style", "type_src")
 CTX_DIRECT = ("players", "hero_pos", "villain_pos", "situation", "hero_ip", "aggressor", "flop_line", "villain_raised",
               "ref3_villain_pos", "pre_raises",
               "stack_bb", "my_stack", "pot", "pot_total", "call", "can_check", "facing_allin", "ante", "outs",
@@ -191,25 +193,31 @@ def annotate(actions, pos=None):
 
 
 def _norm_state(state):
-    """Tracker / _Hand / 기록 dict -> {hand_id, street, actions, seats{key:{pos,name,truncated,folded}}} 또는 None."""
+    """Tracker / _Hand / 기록 dict -> {hand_id, street, actions, seats{key:{pos,folded,pid}}} 또는 None (닉네임은 안 꺼냄).
+    pid 는 Tracker 를 받았을 때(seat_pid) 또는 기록 dict 의 pid 만."""
     if state is None:
         return None
     h = state
+    pid_of = getattr(state, "seat_pid", None)
     if hasattr(state, "hand") and not hasattr(state, "seats"):
         h = state.hand
     if h is None:
         return None
     if isinstance(h, dict):
-        seats = {k: {"pos": v.get("pos"), "name": v.get("name"), "truncated": bool(v.get("truncated")),
-                     "folded": v.get("folded")} for k, v in (h.get("seats") or {}).items()}
+        seats = {k: {"pos": v.get("pos"), "folded": v.get("folded"), "pid": v.get("pid")}
+                 for k, v in (h.get("seats") or {}).items()}
         st = h.get("streets")
         return {"hand_id": h.get("id") or h.get("hand_id"), "street": STREETS.index(st) if st in STREETS else None,
                 "actions": h.get("actions") or {}, "seats": seats}
     seats = {}
     for k, s in h.seats.items():
-        name = s.names.most_common(1)[0][0] if s.names else (None, False)
-        seats[k] = {"pos": s.pos.most_common(1)[0][0] if s.pos else None, "name": name[0],
-                    "truncated": any(t for (n, t) in s.names if n == name[0]),
+        pid = None
+        if callable(pid_of) and not getattr(s, "hero", False):
+            try:
+                pid = pid_of(s)
+            except Exception:
+                pid = None
+        seats[k] = {"pos": s.pos.most_common(1)[0][0] if s.pos else None, "pid": pid,
                     "folded": STREETS[s.fold_street] if s.folded and s.fold_street is not None else None}
     return {"hand_id": h.id, "street": h.street, "actions": {s: [dict(a) for a in h.actions.get(s, [])] for s in STREETS},
             "seats": seats}
@@ -408,10 +416,10 @@ class DecisionLog:
             for k, s in stn["seats"].items():
                 e = {"pos": s["pos"], "hero": k == "hero", "folded": s["folded"]}
                 if k != "hero":
-                    if s["truncated"] or not s["name"]:
-                        e["name"], e["placeholder"] = None, f"seat-local:{k}"
-                    else:
-                        e["name"] = s["name"]
+                    e["pid"] = s.get("pid")
+                    p = (profiles or {}).get(k) or {}
+                    e["type"] = p.get("style") if isinstance(p, dict) else None
+                    e["type_src"] = p.get("type_src") if isinstance(p, dict) and e["type"] else None
                 e["acts"] = {st: [{x: y for x, y in r.items() if x != "seat"} for r in rows if r["seat"] == k]
                              for st, rows in acts.items() if any(r["seat"] == k for r in rows)}
                 pr = _profile_summary((profiles or {}).get(k))

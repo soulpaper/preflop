@@ -1,5 +1,6 @@
 """handlog.Tracker / profiles.Store 단위 테스트 (가짜 tablestate 스냅샷 순서). 실행: python test_handlog.py"""
 import json
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -331,13 +332,15 @@ def test_new_hand_detection():
                      ["Ah"], ["Xx"], {"a": None}, 2.0) == []
 
 
-def test_truncated_names_session():
+def test_no_names_on_disk_session_stats_in_memory():
+    # 닉네임은 기록·JSONL·DB 파일 어디에도 없다. 통계는 메모리에서만 (세션·좌석 단위 잘린 이름 규칙은 그대로)
     tmp = Path(tempfile.mkdtemp())
     try:
         store = profiles.Store(tmp / "p.db", hands_dir=tmp / "hands")
         names = {k: (f"P_{k}", False) for k in KEYS}
         names["seat_TC"] = ("User84", True)          # 잘린 닉네임
-        tr = handlog.Tracker("sessA", on_hand=store.observe)
+        tr = handlog.Tracker("sessA")
+        tr.on_hand = lambda r: store.observe(r, names=tr.names_for(r["id"]))
         store.new_session("sessA")
         tb = Table(tr, names=names)
         tb.step()
@@ -346,20 +349,25 @@ def test_truncated_names_session():
         finish(tb)
         rec = tb.out[0]
         assert rec["confidence"] == "ok", rec["issues"]
-        db = sqlite3.connect(str(tmp / "p.db"))
-        rows = {r[0]: r[1:] for r in db.execute("SELECT name, hands, vpip, pfr FROM players")}
-        assert "User84" not in rows and not any("User84" in n for n in rows), rows
-        assert rows["P_seat_BL"] == (1, 0, 0), rows
+        assert not (tmp / "p.db").exists(), "profiles.db 를 만들지 않음 (통계 DB 는 메모리)"
+        for k, seat in rec["seats"].items():
+            assert not set(seat) & set(profiles.NAME_FIELDS), (k, seat)
+        assert "P_seat" not in json.dumps(rec, ensure_ascii=False) and "User84" not in json.dumps(rec, ensure_ascii=False)
+        # 메모리 통계는 그대로 쌓임
+        assert store.stats("P_seat_BL")["hands"] == 1
         s = store.stats("User84", True, seat="seat_TC", session="sessA")
         assert s["hands"] == 1 and s["vpip"] == 100.0 and s["pfr"] == 100.0 and not s["reliable"], s
         table = store.get_for_table(names, session="sessA")
         assert table["seat_TC"]["hands"] == 1 and table["seat_BL"]["hands"] == 1
         assert store.stats("User84", True, seat="seat_BL", session="sessA")["hands"] == 0, "다른 좌석과 섞이지 않음"
-        # JSONL: 잘린 이름은 자리표시, 전체 이름은 그대로
-        line = json.loads(next((tmp / "hands").glob("*.jsonl")).read_text(encoding="utf-8").splitlines()[0])
-        assert line["seats"]["seat_TC"]["name"] is None and line["seats"]["seat_TC"]["placeholder"] == "seat-local:seat_TC"
-        assert line["seats"]["seat_BL"]["name"] == "P_seat_BL"
-        assert "User84" not in json.dumps(line, ensure_ascii=False)
+        # JSONL: 닉네임 없음, 좌석 키·포지션·pid·타입 칸만
+        text = next((tmp / "hands").glob("*.jsonl")).read_text(encoding="utf-8")
+        assert "P_seat" not in text and "User84" not in text, text[:300]
+        line = json.loads(text.splitlines()[0])
+        assert set(line["seats"]["seat_BL"]) >= {"pos", "pid", "type", "type_src"}
+        assert line["seats"]["seat_TC"]["pid"] is None, "잘린 이름은 pid 없음"
+        assert re.fullmatch(r"p_[0-9a-f]{8}", line["seats"]["seat_BL"]["pid"]), line["seats"]["seat_BL"]
+        assert "pid" not in line["seats"]["hero"] or line["seats"]["hero"]["pid"] is None
         # 좌석 이름이 바뀌면 그 좌석 기억 버림
         names["seat_TC"] = ("User85", True)
         tb.step()
@@ -367,21 +375,68 @@ def test_truncated_names_session():
         tb.step(fold=["UTG", "MP", "CO", "BTN", "SB"])
         finish(tb)
         assert store.stats("User84", True, seat="seat_TC", session="sessA")["hands"] == 0
-        # 새 세션(다시 보정)이면 모두 버림, DB 는 그대로
-        before = db.execute("SELECT SUM(hands) FROM players").fetchone()[0]
         store.new_session("sessB")
         assert store.stats("User85", True, seat="seat_TC", session="sessA")["hands"] == 0
-        assert db.execute("SELECT SUM(hands) FROM players").fetchone()[0] == before
-        assert not any("User8" in r[0] for r in db.execute("SELECT name FROM players"))
-        # 같은 기록 두 번은 한 번만
-        assert store.observe(rec) is False
-        # low confidence 는 통계에 안 들어감
-        low = dict(rec, id="x-low", confidence="low")
-        assert store.observe(low) is False
-        db.close()
+        assert list(tmp.iterdir()) == [tmp / "hands"], list(tmp.iterdir())
         store.close()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_pid_session_pseudonym():
+    # 같은 세션: 자리를 옮겨도 같은 pid, 다른 사람은 다른 pid. 새 세션: 같은 사람도 다른 pid (소금이 새로)
+    tr = handlog.Tracker("pidA")
+    names = {k: (f"P_{k}", False) for k in KEYS}
+    tb = Table(tr, names=names)
+    tb.step()
+    tb.step(fold=["UTG", "MP", "CO", "BTN", "SB"])
+    # 다음 핸드: 같은 사람이 다른 자리로 (seat_BL 사람이 seat_UL 로)
+    tb.names = {k: (f"P_{k}", False) for k in KEYS}
+    tb.names["seat_UL"] = ("P_seat_BL", False)
+    tb.names["seat_BL"] = ("Someone", False)
+    rec1 = finish(tb)
+    pids1 = {k: s["pid"] for k, s in rec1["seats"].items() if k != "hero"}
+    assert all(re.fullmatch(r"p_[0-9a-f]{8}", p) for p in pids1.values()), pids1
+    assert len(set(pids1.values())) == len(pids1), "다른 사람은 다른 pid"
+    tb.step()
+    tb.step(fold=["UTG", "MP", "CO", "BTN", "SB"])
+    rec2 = finish(tb)
+    assert rec2["seats"]["seat_UL"]["pid"] == pids1["seat_BL"], (rec2["seats"]["seat_UL"], pids1)
+    # 닉네임 정규화 (공백·대소문자)
+    assert handlog.make_pid(b"k", "Ab C") == handlog.make_pid(b"k", "abc") and handlog.make_pid(b"k", "") is None
+    # 이름이 엇갈리면(한 핸드에 두 이름) pid 없음
+    tb.step()
+    tb.names["seat_BR"] = ("Other", False)
+    tb.step()
+    tb.step(fold=["UTG", "MP", "CO", "BTN", "SB"])
+    rec3 = finish(tb)
+    assert rec3["seats"]["seat_BR"]["pid"] is None, rec3["seats"]["seat_BR"]
+    # 새 세션
+    tr.new_session("pidB")
+    tb.names = {k: (f"P_{k}", False) for k in KEYS}
+    tb.step()
+    tb.step(fold=["UTG", "MP", "CO", "BTN", "SB"])
+    rec4 = finish(tb)
+    assert rec4["session"] == "pidB"
+    assert rec4["seats"]["seat_BL"]["pid"] != pids1["seat_BL"], "세션이 다르면 연결되지 않음"
+    assert "P_seat" not in json.dumps([rec1, rec2, rec3, rec4], ensure_ascii=False)
+    assert tr.names_for(rec4["id"])["seat_BL"] == ("P_seat_BL", False), "메모리에서만 닉네임"
+
+
+def test_types_recorded_per_seat():
+    # 앱이 넘긴 좌석 타입(팝업)이 기록에 seat['type'] / type_src / type_stats 로 남음
+    tr = handlog.Tracker("ty")
+    tb = Table(tr)
+    types = {"seat_BL": {"type": "LP", "type_src": "popup", "type_stats": {"vpip": 48.0, "pfr": 6.0}}}
+    s = tb.snap()
+    tb.t += 1
+    tr.update(s, tb.hero, [], tb.names, tb.t, types=types)
+    tb.step(fold=["UTG", "MP", "CO", "BTN", "SB"])
+    rec = finish(tb)
+    bl = rec["seats"]["seat_BL"]
+    assert bl["type"] == "LP" and bl["type_src"] == "popup" and bl["type_stats"]["vpip"] == 48.0, bl
+    assert rec["seats"]["seat_UL"]["type"] is None and rec["seats"]["seat_UL"]["type_src"] is None
+    assert "type" not in rec["seats"]["hero"]
 
 
 def test_timing():
@@ -441,11 +496,13 @@ def test_preflop_end_with_two_left_not_inferred():
 
 
 def test_truncated_if_ever_seen_truncated():
-    # 점('…')을 놓친 프레임이 더 많아도 한 번이라도 잘린 이름으로 읽혔으면 잘린 이름 → DB 에 안 씀
+    # 점('…')을 놓친 프레임이 더 많아도 한 번이라도 잘린 이름으로 읽혔으면 pid 를 붙이지 않음 (다른 사람과 겹칠 수 있음)
     tmp = Path(tempfile.mkdtemp())
     try:
-        store = profiles.Store(tmp / "p.db", hands_dir=tmp / "hands")
-        tb = Table(handlog.Tracker("r3", on_hand=store.observe))
+        store = profiles.Store(hands_dir=tmp / "hands")
+        tr = handlog.Tracker("r3")
+        tr.on_hand = lambda r: store.observe(r, names=tr.names_for(r["id"]))
+        tb = Table(tr)
         store.new_session("r3")
         tb.names["seat_TC"] = ("User84", True)
         tb.step()
@@ -454,10 +511,9 @@ def test_truncated_if_ever_seen_truncated():
         tb.step()
         tb.step(fold=["BTN", "SB", "BB"])
         rec = finish(tb)
-        assert rec["seats"]["seat_TC"]["truncated"] is True
-        db = sqlite3.connect(str(tmp / "p.db"))
-        assert not db.execute("SELECT 1 FROM players WHERE name LIKE 'User84%'").fetchone()
-        db.close()
+        assert rec["seats"]["seat_TC"]["pid"] is None and "truncated" not in rec["seats"]["seat_TC"]
+        assert tr.names_for(rec["id"])["seat_TC"] == ("User84", True)
+        assert store.stats("User84")["hands"] == 0, "잘린 이름은 (메모리) 전체 이름 통계에도 안 들어감"
         store.close()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -796,6 +852,29 @@ def test_to_handread_postflop_sizes():
     assert out["C"]["bet_role"] == {"flop": "cbet"}
     plain = handlog.to_handread(acts, _POS, sizes=False)
     assert plain["C"]["flop"] == ["bet", "call"], plain["C"]
+
+
+def test_jsonl_append_after_crash():
+    # 쓰다 죽어 줄바꿈 없이 끝난 핸드 기록 파일: 다음 기록은 새 줄에 써서 읽을 수 있어야 함
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        store = profiles.Store(hands_dir=tmp / "hands")
+        rec = {"id": "c1", "session": "S", "confidence": "ok", "start": 1000.0, "end": 1001.0, "board": [], "seats": {}}
+        store.observe(rec)
+        f = next((tmp / "hands").glob("*.jsonl"))
+        with open(f, "a", encoding="utf-8") as fh:
+            fh.write('{"id": "c2", "session": "S", "sea')            # 반쪽 줄
+        store.observe(dict(rec, id="c3"))
+        good = []
+        for ln in f.read_text(encoding="utf-8").splitlines():
+            try:
+                good.append(json.loads(ln)["id"])
+            except ValueError:
+                pass
+        assert good == ["c1", "c3"], f.read_text(encoding="utf-8")
+        store.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

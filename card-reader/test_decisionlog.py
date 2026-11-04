@@ -1,5 +1,6 @@
 """decisionlog 단위 테스트 (진짜 handlog.Tracker 로 만든 핸드 사용). 실행: python test_decisionlog.py"""
 import json
+import re
 import shutil
 import tempfile
 import threading
@@ -97,7 +98,8 @@ def test_record_fields():
         tb = play_to_flop_bet()
         log = dl.DecisionLog(d)
         profs = {"seat_BL": {"vpip": 28.0, "pfr": 20.0, "af": 2.1, "fold_to_bet": 40.0, "hands": 55, "source": "observed",
-                             "shown": [["As", "Ks"]], "counts": {"hands": 55}}}
+                             "shown": [["As", "Ks"]], "counts": {"hands": 55}, "style": "LAG", "type_src": "popup",
+                             "linked_name": "P_seat_BL"}}
         reads = {"order": ["seat_BL"], "lines": {"seat_BL": ["UTG: 예상 상위 15%", "보드 기준: 탑페어 30%"]},
                  "width": {"seat_BL": 15.2}, "ranges": {"seat_BL": {"AhKh": 0.5}}}
         did = log.record(make_ctx(players_left=40, my_rank=12, stage="bubble"), make_advice(), reads=reads, state=tb.tr,
@@ -114,13 +116,16 @@ def test_record_fields():
         assert r["bettor"]["pos"] == "UTG" and r["bettor"]["act"] == "bet" and r["bettor"]["pct"] == 0.38, r["bettor"]
         assert r["n_aggr"] == 1 and r["hero_acts_before"] == 0
         s = r["seats"]["seat_BL"]
-        assert s["pos"] == "UTG" and s["name"] == "P_seat_BL"
+        assert s["pos"] == "UTG" and "name" not in s and "placeholder" not in s
+        assert s["type"] == "LAG" and s["type_src"] == "popup" and re.fullmatch(r"p_[0-9a-f]{8}", s["pid"]), s
+        assert r["seats"]["seat_UL"]["type"] is None and r["seats"]["seat_UL"]["type_src"] is None
+        assert "P_seat" not in json.dumps(ds, ensure_ascii=False), "닉네임이 파일에 쓰임"
         assert s["acts"]["preflop"][0]["act"] == "raise" and s["acts"]["preflop"][0]["to"] == 2.5
         assert s["acts"]["flop"] == [{"act": "bet", "to": 3.0, "pct": 0.38}], s["acts"]["flop"]
         assert s["profile"] == {"vpip": 28.0, "pfr": 20.0, "af": 2.1, "fold_to_bet": 40.0, "hands": 55,
-                                "source": "observed"}
+                                "source": "observed", "style": "LAG", "type_src": "popup"}
         assert r["seats"]["seat_UR"]["folded"] == "flop" and r["seats"]["hero"]["hero"] is True
-        assert "name" not in r["seats"]["hero"]
+        assert "name" not in r["seats"]["hero"] and "pid" not in r["seats"]["hero"]
         assert r["reads"]["seat_BL"]["width"] == 15.2 and "예상 상위 15%" in r["reads"]["seat_BL"]["line"]
         a = r["advice"]
         assert a["action"] == "call" and a["action_ko"] == "콜" and a["confidence"] == "medium"
@@ -153,11 +158,11 @@ def test_truncated_names():
         log = dl.DecisionLog(d)
         log.record(make_ctx(), make_advice(), state=tb.tr, t=1.0)
         text = "".join(f.read_text(encoding="utf-8") for f in (Path(d) / "hands").glob("decisions_*.jsonl"))
-        assert "User84" not in text, "잘린 닉네임이 파일에 쓰임"
+        assert "User84" not in text and "홍길동" not in text, "닉네임이 파일에 쓰임"
         r = lines(d)[0]
         s = r["seats"]["seat_BL"]
-        assert s.get("name") is None and s["placeholder"] == "seat-local:seat_BL"
-        assert r["seats"]["seat_UL"]["name"] == "홍길동" and "홍길동" in text
+        assert "name" not in s and "placeholder" not in s and s["pid"] is None, s   # 잘린 이름: pid 없음
+        assert re.fullmatch(r"p_[0-9a-f]{8}", r["seats"]["seat_UL"]["pid"]), r["seats"]["seat_UL"]
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

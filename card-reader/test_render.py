@@ -198,6 +198,39 @@ def layout_state(app, kind):
     app.root.update()
 
 
+def type_cases(app):
+    """상대 타입 배지 ('루즈-패시브' / '타입 모름') 와 쉬는 동안의 '캐릭터를 눌러 주세요' 안내가 그려짐."""
+    fails = []
+    saved = app.track, app.table_state
+    try:
+        layout_state(app, "flop")
+        reads = dict(app.track["reads"])
+        app.track = {"reads": reads, "names": {}, "profiles": {"seat_TC": {"style": "LP"}}, "live": {},
+                     "types": {"seat_TC": {"known": True, "style": "LP"}, "seat_BL": {"known": False, "style": None}},
+                     "prompt": None}
+        app.render(force=True)
+        app.root.update()
+        txt = canvas_text(app)
+        ok = "루즈-패시브" in txt and "타입 모름" in txt and "캐릭터를 눌러" not in txt
+        print("ok  " if ok else "FAIL", "상대 타입 배지 (내 차례)")
+        if not ok:
+            fails.append("type badge")
+        layout_state(app, "rest")
+        app.track = {"reads": None, "names": {}, "profiles": {}, "live": {}, "types": {},
+                     "prompt": {"seat": "seat_UR", "pos": "CO", "slot": "UR", "text": "CO 자리 캐릭터를 눌러 주세요",
+                                "sub": "(타입 확인 · 오른쪽 위)"}}
+        app.render(force=True)
+        app.root.update()
+        txt = canvas_text(app)
+        ok = "CO 자리 캐릭터를 눌러 주세요" in txt and "(타입 확인 · 오른쪽 위)" in txt
+        print("ok  " if ok else "FAIL", "타입 확인 안내 (폴드 뒤)")
+        if not ok:
+            fails.append("type prompt")
+    finally:
+        app.track, app.table_state = saved
+    return fails
+
+
 def layout_check(app, label, min_scale):
     """한 화면: 잘림 없음 / (자리 유지가 끝난 뒤) 빈자리 없음 / 접힌 섹션은 열 맨 아래 / 열 높이 비율 / 배율."""
     for recs in app.sticky.values():   # 자리 유지 시간이 지난 것으로
@@ -316,6 +349,7 @@ def main():
         fails += len(postflop_cases(app))
         fails += len(icm_case(app))
         fails += len(layout_cases(app))
+        fails += len(type_cases(app))
     except Exception as e:
         import traceback
         traceback.print_exc()

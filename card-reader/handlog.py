@@ -2,8 +2,9 @@
 
     tracker = handlog.Tracker(session="20261029_0102")
     for each frame (~1 s):
-        done = tracker.update(state, hero_cards, board, names, t, pot=None, shown=None)
+        done = tracker.update(state, hero_cards, board, names, t, pot=None, shown=None, types=None)
         # shown: 쇼다운 공개 카드 {seat_key: ['9c', '7c']} (showdown.Watcher). 진행 중 핸드에 넣음, None 이면 그 좌석 값을 지움
+        # types: 좌석별 상대 타입 {seat_key: {"type": "LP", "type_src": "popup", "type_stats": {...}}} (seattypes.SeatTypes)
         for rec in done: store.observe(rec)          # 끝난 핸드 기록 (dict)
     tracker.flush(t)                                 # 앱 종료 / 다시 보정 때
 
@@ -26,10 +27,22 @@
     액션을 지어내지 않음)
 믿을 수 없는 핸드는 confidence='low' + issues (profiles.Store 는 통계에 안 넣고 JSONL 에만 표시해 저장)
 
+닉네임은 기록에 넣지 않는다 (디스크에 남기지 않음). 좌석 기록에는 자리 키·포지션, 상대 '타입'(게임 유저 정보 팝업의
+LAG/LP/TAG/TP, seat['type'] + seat['type_src']='popup'), 세션 가명 seat['pid'] 만.
+  pid = "p_" + HMAC-SHA256(세션 소금, 정규화한 닉네임) 앞 8글자 (16진수). 소금은 Tracker 세션마다(앱 시작/새 [자동 지정]/
+  테이블 이동) 새로 만든 난수이고 메모리에만 있음 → 같은 세션 안에서는 자리를 옮겨도 같은 pid, 세션이 다르면 연결 불가,
+  닉네임을 되살릴 수 없음. 이 핸드에서 잘리지 않은 같은 닉네임이 PID_MIN_FRAMES 프레임 이상, 다른 닉네임 없이 읽혔을 때만
+  (잘린 이름·한 번이라도 잘려 읽힌 이름·엇갈린 이름이면 None). 앱은 팝업으로 확인한 좌석의 잘린 이름을 전체 이름으로 바꿔 넘긴다.
+이번 프레임들에서 읽은 닉네임은 메모리에만 두고 names_for(hand_id) 로 (앱 실행 중에만) 꺼내 쓸 수 있다.
+
 절대 예외를 밖으로 내지 않는다 (update/flush 는 실패하면 [] 반환, 진행 중 핸드는 low 로 표시).
 """
+import hashlib
+import hmac
+import os
 import time
-from collections import Counter
+import unicodedata
+from collections import Counter, OrderedDict
 
 STREETS = ("preflop", "flop", "turn", "river")
 BOARD_STREET = {0: 0, 3: 1, 4: 2, 5: 3}
@@ -39,6 +52,8 @@ SB_AMOUNT, BB_AMOUNT = 0.5, 1.0
 GAP_FATAL = 8.0            # 핸드 중 프레임 간격이 이보다 길면 놓친 액션이 있을 수 있음 → low
 STALE_HAND = 90.0          # 이만큼 새 프레임이 없으면 진행 중 핸드를 닫음
 TURN_GAP = 3.5             # 같은 자리의 차례 고리가 이 간격 안에 다시 보이면 같은 차례
+PID_MIN_FRAMES = 2         # pid 를 붙이려면 같은 (잘리지 않은) 닉네임이 이 프레임 수 이상
+NAMES_KEEP = 16           # names_for() 로 기억해 두는 최근 핸드 수 (메모리 전용)
 RING_GRACE = 2             # 고리가 다음 사람으로 넘어간 뒤 이 프레임 수 안에 액션이 안 읽히면 ring_no_action
 PRE_RANK = ("UTG", "U1", "U2", "U3", "MP", "LJ", "HJ", "CO", "BTN", "SB", "BB")
 # 이 문제가 하나라도 있으면 confidence='low' (통계에 안 넣음). 나머지(inferred_call, positions_unknown,
@@ -50,6 +65,19 @@ def _is_card(c):
     return isinstance(c, str) and len(c) == 2 and c[0] in "23456789TJQKA" and c[1] in "shdc"
 
 
+def norm_name(name):
+    """pid 용 닉네임 정규화: 유니코드 NFC, 공백 제거, 소문자."""
+    return "".join(unicodedata.normalize("NFC", str(name or "")).split()).lower()
+
+
+def make_pid(salt, name):
+    """세션 가명: 'p_' + HMAC-SHA256(salt, 정규화 닉네임) 16진 앞 8글자. 이름이 비면 None."""
+    n = norm_name(name)
+    if not n or not salt:
+        return None
+    return "p_" + hmac.new(salt, n.encode("utf-8"), hashlib.sha256).hexdigest()[:8]
+
+
 def _num(v):
     try:
         return None if v is None else float(v)
@@ -59,7 +87,7 @@ def _num(v):
 
 class _Seat:
     __slots__ = ("key", "slot", "pos", "names", "folded", "fold_street", "allin", "inv", "posted", "stale",
-                 "bubble", "hero", "acted")
+                 "bubble", "hero", "acted", "type")
 
     def __init__(self, key):
         self.key = key
@@ -75,6 +103,7 @@ class _Seat:
         self.bubble = None      # 직전 프레임 말풍선
         self.hero = key == "hero"
         self.acted = False      # 이번 스트리트에 행동함
+        self.type = None        # 상대 타입 {"type", "type_src", "type_stats"} (이 핸드에서 마지막으로 본 값)
 
 
 class _Hand:
@@ -127,18 +156,37 @@ class Tracker:
         self._board_empty = 0
         self._dealer_new = (None, 0)
         self._hero_new = (None, 0)
+        self._names = OrderedDict()   # hand_id -> {seat: (name, truncated)} — 메모리 전용, 파일에 안 씀
+        self._salt = os.urandom(16)   # pid 소금: 세션마다 새로, 메모리에만 (절대 파일에 쓰지 않음)
+
+    def seat_pid(self, seat):
+        """_Seat 의 세션 가명 (닉네임이 안정적으로 읽혔을 때만, 아니면 None)."""
+        full = Counter()
+        for (n, tr), c in seat.names.items():
+            if n and not tr:
+                full[norm_name(n)] += c
+        if len(full) != 1:
+            return None   # 못 읽음 / 잘린 이름뿐 / 서로 다른 이름이 섞임
+        n, c = full.most_common(1)[0]
+        if any(tr and norm_name(m) and n.startswith(norm_name(m)) for (m, tr) in seat.names):
+            return None   # 같은 이름이 잘려('…') 읽힌 적 있음 = 점을 놓친 잘린 이름일 수 있음 (다른 사람과 겹칠 수 있음)
+        return make_pid(self._salt, n) if c >= PID_MIN_FRAMES else None
+
+    def names_for(self, hand_id):
+        """끝난 핸드의 좌석별 닉네임 {seat: (name, truncated)} (메모리에만 있음, 최근 NAMES_KEEP 핸드). 없으면 {}."""
+        return dict(self._names.get(hand_id) or {})
 
     def _suspect(self):
         """새 핸드일 수 있는 신호가 1프레임 보임 → 이 프레임의 액션은 처리하지 않음."""
         return bool(self._board_empty or self._dealer_new[1] or self._hero_new[1])
 
     # --- 공개 API ------------------------------------------------------------------------------------
-    def update(self, state, hero_cards=None, board=None, names=None, t=None, pot=None, shown=None):
+    def update(self, state, hero_cards=None, board=None, names=None, t=None, pot=None, shown=None, types=None):
         """프레임 하나 → 이번에 끝난 핸드 기록 리스트 (대개 빈 리스트)."""
         t0 = time.perf_counter()
         t = time.time() if t is None else float(t)
         try:
-            out = self._update(state, hero_cards or [], board or [], names or {}, t, pot, shown)
+            out = self._update(state, hero_cards or [], board or [], names or {}, t, pot, shown, types or {})
         except Exception as exc:  # 어떤 경우에도 앱을 멈추지 않음
             self.errors += 1
             self.last_error = repr(exc)
@@ -199,6 +247,7 @@ class Tracker:
         """새 보정/새 테이블: 진행 중 핸드를 닫고 세션 id 를 바꿈 (잘린 닉네임 기억은 세션 단위)."""
         out = self.flush(t, "new_session")
         self.session = session or time.strftime("%Y%m%d_%H%M%S")
+        self._salt = os.urandom(16)   # 새 세션: 이전 세션 pid 와 연결되지 않게
         return out
 
     def _emit(self, recs):
@@ -212,7 +261,7 @@ class Tracker:
                 self.last_error = repr(exc)
 
     # --- 프레임 처리 ------------------------------------------------------------------------------------
-    def _update(self, state, hero_cards, board, names, t, pot, shown):
+    def _update(self, state, hero_cards, board, names, t, pot, shown, types):
         out = []
         if self.hand is not None and self.last_t is not None and t - self.last_t > STALE_HAND:
             out += self._finish(self.last_t, "stale")
@@ -281,6 +330,9 @@ class Tracker:
             nm = names.get(k)
             if nm and nm[0]:
                 seat.names[(nm[0], bool(nm[1]))] += 1
+            ty = types.get(k)
+            if isinstance(ty, dict) and ty.get("type_src"):
+                seat.type = ty
         h.late = late
         for kind in ("sb", "bb"):
             k = (state.get("blind_seats") or {}).get(kind)
@@ -692,16 +744,26 @@ class Tracker:
             "notes": h.notes,
             "turns": h.turns,
         }
+        names = {}
         for k, seat in h.seats.items():
-            name = seat.names.most_common(1)[0][0] if seat.names else (None, False)
-            # 같은 이름이 한 번이라도 잘린 이름('…')으로 읽혔으면 잘린 이름 (점을 놓친 프레임이 더 많아도 DB 에 쓰지 않게)
-            truncated = any(t for (n, t) in seat.names if n == name[0])
+            if seat.names:  # 닉네임은 메모리에만 (names_for). 같은 이름이 한 번이라도 잘려 읽혔으면 잘린 이름
+                name = seat.names.most_common(1)[0][0][0]
+                names[k] = (name, any(t for (n, t) in seat.names if n == name))
+            ty = seat.type or {}
             rec["seats"][k] = {
-                "name": name[0], "truncated": truncated, "hero": seat.hero,
+                "hero": seat.hero, "pid": None if seat.hero else self.seat_pid(seat),
                 "pos": seat.pos.most_common(1)[0][0] if seat.pos else None, "slot": seat.slot,
                 "folded": STREETS[seat.fold_street] if seat.folded and seat.fold_street is not None else None,
                 "allin": seat.allin, "shown": h.shown.get(k),
             }
+            if not seat.hero:
+                rec["seats"][k]["type"] = ty.get("type")          # 'LAG'/'LP'/'TAG'/'TP' 또는 None (모름)
+                rec["seats"][k]["type_src"] = ty.get("type_src")  # 'popup' (게임 유저 정보 팝업) 또는 None
+                if ty.get("type_stats"):
+                    rec["seats"][k]["type_stats"] = dict(ty["type_stats"])
+        self._names[h.id] = names
+        while len(self._names) > NAMES_KEEP:
+            self._names.popitem(last=False)
         derive(rec)
         codes = {i["code"] for i in h.issues}
         rec["confidence"] = "low" if codes & FATAL else "ok"

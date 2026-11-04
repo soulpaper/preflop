@@ -2,7 +2,7 @@
 
     python replay.py recordings/20261029_010203            # 핸드 기록 요약 출력
     python replay.py recordings/20261029_010203 --json     # 기록 JSON 그대로
-    python replay.py <folder> --store test_profiles.db     # 통계 저장소에 넣어 보고 마지막에 통계 출력
+    python replay.py <folder> --store out_dir              # 통계 저장소(메모리)에 넣어 보고 마지막에 통계 출력 (JSONL 은 out_dir/replay_hands)
     python replay.py <folder> --frames                     # 프레임별 상태 한 줄씩 (디버그)
 
 calib.json 이 없으면 첫 프레임으로 layout.calibrate. 카드(내 카드/보드)는 frames.jsonl 의 meta 가 있으면 그것을,
@@ -92,7 +92,9 @@ def run(folder, store=None, show_frames=False, as_json=False, limit=None):
     tr = tablestate.TableReader()
     nr = names_mod.NameReader(resolver=store.resolve_name if store else None,
                               on_confirm=store.learn_fingerprint if store else None)
-    tracker = handlog.Tracker(session=folder.name, on_hand=store.observe if store else None)
+    tracker = handlog.Tracker(session=folder.name)
+    if store:
+        tracker.on_hand = lambda rec: store.observe(rec, names=tracker.names_for(rec.get("id")))
     if store:
         store.new_session(tracker.session)
     records, ms = [], []
@@ -146,10 +148,9 @@ def format_record(rec):
     lines = [f"== {rec['id']} [{rec['confidence']}] {rec['streets']} board={' '.join(rec['board'] or [])} "
              f"hero={rec['hero_cards']} frames={rec['frames']} end={rec['end_reason']}"]
     for k, s in rec["seats"].items():
-        nm = names_mod.display(s["name"], s["truncated"]) if s["name"] else "?"
         st = s.get("stats", {})
         flags = [f for f in ("vpip", "pfr", "threebet", "showdown") if st.get(f)]
-        lines.append(f"   {k:9s} {s['pos'] or '-':4s} {nm:12s} {' '.join(flags)}")
+        lines.append(f"   {k:9s} {s['pos'] or '-':4s} {s.get('type') or '?':4s} {' '.join(flags)}")
     for street, acts in rec["actions"].items():
         lines.append(f"   {street:7s} " + ", ".join(
             f"{a['seat'].replace('seat_', '')} {a['act']}{' ' + format(a['to'], 'g') if 'to' in a else ''}"
@@ -163,7 +164,7 @@ def format_record(rec):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("folder")
-    ap.add_argument("--store", help="통계를 넣어 볼 SQLite 파일 (기본: 넣지 않음 — 실제 profiles.db 를 건드리지 않게)")
+    ap.add_argument("--store", help="통계를 메모리 저장소에 넣어 보고, 핸드 JSONL 을 이 폴더의 replay_hands 에 씀 (기본: 안 함)")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--frames", action="store_true")
     ap.add_argument("--limit", type=int)
@@ -175,7 +176,7 @@ def main(argv=None):
     store = None
     if a.store:
         import profiles
-        store = profiles.Store(a.store, hands_dir=Path(a.store).resolve().parent / "replay_hands")
+        store = profiles.Store(hands_dir=Path(a.store).resolve() / "replay_hands")
     run(a.folder, store, a.frames, a.json, a.limit)
 
 
