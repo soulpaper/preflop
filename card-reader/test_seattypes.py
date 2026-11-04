@@ -60,6 +60,27 @@ def test_popup_assign_and_profile():
     assert st.profile("seat_BL", None) is None
 
 
+def test_profile_fallback_keeps_site_stats():
+    import profiles
+    calls = []
+    st = sty.SeatTypes(log=lambda *a, **k: calls.append(a))
+    st.observe(NAMES, state(), 1.0)
+    st.apply_popup(popup("Charlie", "LAG", 55, 30), NAMES, 2.0)
+    orig = profiles.summarize
+
+    def boom(*a, **k):
+        raise RuntimeError("forced")
+    profiles.summarize = boom
+    try:
+        p = st.profile("seat_UR", {"counts": {"hands": 5}, "shown": []})
+    finally:
+        profiles.summarize = orig
+    assert p["vpip"] == 55 and p["pfr"] == 30 and p["ats"] == 10 and p["threebet"] == 2 and p["tab"] == "토너먼트", p
+    assert p["style"] == "LAG" and p["type_src"] == "popup" and p["site_fallback"] is True and p["counts"] == {"hands": 5}
+    assert len(calls) == 1, calls
+    assert "site_fallback" not in st.profile("seat_UR", None), "정상 경로에는 표시 없음"
+
+
 def test_popup_falls_back_to_prompted_seat():
     st = sty.SeatTypes()
     names = {k: v for k, v in NAMES.items() if k != "seat_BR"}   # BTN 이름을 못 읽음

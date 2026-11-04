@@ -2394,7 +2394,7 @@ class App:
                 dl_m = _optional("decisionlog")
                 self.declog = dl_m.DecisionLog(BASE, on_error=lambda *a: self.log_once("decisionlog")) if dl_m else None
                 st_m = _optional("seattypes")
-                self.seat_types = st_m.SeatTypes() if st_m else None
+                self.seat_types = st_m.SeatTypes(log=self.log_once) if st_m else None
 
                 def on_hand(rec, store=self.store):
                     tr = self.tracker

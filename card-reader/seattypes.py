@@ -82,7 +82,9 @@ class _Seat:
 
 
 class SeatTypes:
-    def __init__(self):
+    def __init__(self, log=None):
+        # log(title, ctx=None): 예외 기록용 콜백 (앱은 log_once 를 넘김). 기본은 아무것도 안 함.
+        self.log = log or (lambda *a, **k: None)
         self.reset()
 
     def reset(self):
@@ -253,8 +255,22 @@ class SeatTypes:
             out["type_src"] = rec.src
             return out
         except Exception:
+            try:
+                self.log("seattypes.profile", {"key": key})
+            except Exception:
+                pass
+            # summarize 를 건너뛰어도 팝업(사이트) 통계는 버리지 않는다: 같은 키로 직접 복사
             out = dict(base or {})
+            st = rec.stats or {}
+            for x in STAT_KEYS:
+                if st.get(x) is not None:
+                    out[x] = st.get(x)
+            if any(st.get(x) is not None for x in STAT_KEYS):
+                out["tab"] = st.get("tab")
+                out["source"], out["reliable"] = "site", True
+                out["site"] = {**{x: st.get(x) for x in STAT_KEYS}, "style": rec.style, "tab": st.get("tab")}
             out["style"], out["type_src"] = rec.style, rec.src
+            out["site_fallback"] = True
             return out
 
     # --- 안내 ----------------------------------------------------------------------------------------
