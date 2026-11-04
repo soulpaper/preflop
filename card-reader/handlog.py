@@ -163,8 +163,9 @@ class Tracker:
 
     def live(self):
         """진행 중 핸드의 좌석별 액션 (handread.estimate 의 seats 입력 모양) → {seat_key: {...}} 또는 {}.
-        preflop: blind open limp call 3bet call_3bet 4bet jam call_jam check fold,
-        포스트플랍: check bet call raise checkraise allin fold."""
+        preflop: blind open limp call 3bet call_3bet 4bet jam call_jam check fold (to_handread 가 읽기 오류를 정리),
+        포스트플랍: check bet call raise checkraise allin fold (금액을 알면 {"a": "bet", "size": 팟 대비}).
+        올인/올인콜 좌석에는 'stack_bb' (실제 올인 금액)."""
         try:
             h = self.hand
             return to_handread(h.actions, {k: (s.pos.most_common(1)[0][0] if s.pos else None)
@@ -745,11 +746,155 @@ def derive(rec):
     return rec
 
 
-def to_handread(actions, pos):
-    """액션 목록({street: [action]}) + {seat: pos} → handread.estimate 의 seats 모양."""
+# --- 기록 → 상대 리딩 입력 정리 ---------------------------------------------------------------------
+# 화면에서 읽은 금액은 가끔 틀린다. 상대 리딩(handread)에 넘기기 전에 프리플랍 액션을 정리한다 (기록 자체는 그대로 둔다).
+#   같은 금액을 두 번 읽음: 같은 좌석이 '그 사이 아무도 (완전한) 레이즈를 안 했는데' 다시 레이즈/콜 → 하나로 합침
+#     (예: 오픈 1.3 → 2.0, 올인 114.7 → 115, 림프 0.6 → 1.0). 레이즈한 사람이 그 뒤 작은 올인에 '콜'한 것도 새 결정이 아님.
+#   최소 레이즈에 못 미치는 올인(2.0 오픈에 2.1 올인)은 레이즈 횟수에 안 센다 → 뒤 사람이 3벳/3벳콜로 잘못 잡히지 않게.
+#   올인 아닌데 직전 레이즈 폭의 MIN_RAISE_FRAC 도 안 올린 '레이즈'(2.0 → 2.1)는 같은 콜 금액을 다시 읽은 것 → 콜.
+#   올인 레이즈에 콜 = 올인콜 (콜한 사람이 올인이 아니어도: 스택이 더 큰 사람이 받아 준 것).
+#   말이 안 되는 금액(올인 아닌데 지금 최대 벳의 MAX_JUMP 배 초과, 또는 MAX_BB 초과: 700/1400BB 레이즈)은 '금액 모름'으로.
+#   올인/올인콜 상대의 스택 = 실제 올인 금액 (내 스택이 아니라) → seat['stack_bb'].
+MIN_RAISE_FRAC = 0.5
+MAX_JUMP = 20.0
+MAX_BB = 1000.0
+
+
+def clean_preflop(actions):
+    """프리플랍 액션 정리 사본 → (액션 리스트, 고친 개수). 각 액션의 raises_before 를 (완전한) 레이즈 수로 다시 매기고,
+    작은 올인은 'incomplete', 올인 레이즈에 받은 콜은 'vs_allin', 이상한 금액은 'to' 를 지우고 'size_bad' 로 표시."""
+    out, fixed = [], 0
+    rb, level, last_inc, last_allin = 0, BB_AMOUNT, BB_AMOUNT, False
+    last_vol = {}      # 좌석 → (그 액션 뒤의 레이즈 수, out 인덱스)
+    for a0 in actions or []:
+        if not isinstance(a0, dict):
+            continue
+        a = dict(a0)
+        k, act, to, allin = a.get("seat"), a.get("act"), _num(a.get("to")), bool(a.get("allin"))
+        if act == "post":
+            if to is not None and to <= MAX_BB:
+                level = max(level, to)
+            out.append(a)
+            continue
+        if act in ("raise", "call") and to is not None and (
+                to > MAX_BB or (not allin and to > MAX_JUMP * max(level, BB_AMOUNT))):
+            a.pop("to", None)
+            a["size_bad"], to = True, None
+            fixed += 1
+        if act == "raise" and to is not None and not allin and (
+                to <= level + EPS or to - level < MIN_RAISE_FRAC * last_inc):
+            a["act"] = act = "call"      # 레이즈가 될 수 없는 폭 = 콜 금액을 다시 읽음
+            fixed += 1
+        prev = last_vol.get(k)
+        if act in ("raise", "call") and prev is not None and prev[0] == rb:
+            p = out[prev[1]]
+            if p.get("act") == act or (act == "call" and p.get("act") == "raise"):
+                # 같은 액션을 다시 읽음 (또는 레이즈한 사람이 작은 올인에 '콜' = 새 결정 아님) → 앞 액션에 합친다
+                if act == p.get("act"):
+                    pto = _num(p.get("to"))
+                    if to is not None:
+                        p["to"] = round(max(to, pto) if pto is not None else to, 2)
+                    if allin:
+                        p["allin"] = True
+                    if act == "raise" and not p.get("incomplete") and p.get("to") is not None:
+                        level = max(level, p["to"])
+                        base = p.get("_level_before")
+                        if base is not None:
+                            last_inc = max(last_inc, p["to"] - base)
+                        last_allin = bool(p.get("allin"))
+                fixed += 1
+                continue
+            if act == "raise" and p.get("act") == "call":
+                p["_drop"] = True            # 림프로 읽은 게 실은 레이즈 금액이 올라가는 중이었다
+                fixed += 1
+        a["raises_before"] = rb
+        if act == "raise":
+            inc = (to - level) if to is not None else None
+            if allin and inc is not None and inc < last_inc - EPS:
+                a["incomplete"] = True       # 최소 레이즈 미만 올인: 레이즈로 안 센다
+                level = max(level, to)
+                fixed += 1
+                last_vol[k] = (rb, len(out))
+            else:
+                a["_level_before"] = level
+                rb += 1
+                if inc is not None and inc > 0:
+                    last_inc = max(last_inc, inc)
+                    level = to
+                last_allin = allin
+                last_vol[k] = (rb, len(out))
+        elif act == "call":
+            if rb >= 1 and last_allin and not allin:
+                a["vs_allin"] = True
+            last_vol[k] = (rb, len(out))
+        out.append(a)
+    res = []
+    for a in out:
+        if a.pop("_drop", False):
+            continue
+        a.pop("_level_before", None)
+        res.append(a)
+    return res, fixed
+
+
+def _pre_stacks(pre):
+    """정리된 프리플랍 액션 → {좌석: 올인/올인콜 금액(BB)} (금액을 아는 것만)."""
+    out, level = {}, 0.0
+    for a in pre:
+        to = _num(a.get("to"))
+        if a.get("act") == "raise" and to is not None:
+            level = max(level, to)
+            if a.get("allin"):
+                out[a["seat"]] = to
+        elif a.get("act") == "call" and (a.get("allin") or a.get("vs_allin")):
+            amt = to if to is not None else (level or None)
+            if amt:
+                out[a["seat"]] = amt
+    return out
+
+
+def bet_sizes(actions, pre=None):
+    """{(street, 액션 인덱스): 팟 대비 크기} (포스트플랍 bet/raise/call). 벳/레이즈 = 올린 만큼 / (콜한 뒤의 팟), 콜 = 받은 벳의 크기.
+    'to' = 그 스트리트에서 그 좌석이 넣은 총액(BB). 금액을 모르거나 말이 안 되면(올인 아닌데 팟의 MAX_JUMP 배 초과) 크기 없음.
+    pre: 정리된 프리플랍 (없으면 clean_preflop). 앤티는 금액을 몰라 팟에서 빠진다 (벳 크기가 약간 크게 나올 수 있음)."""
+    pre = clean_preflop(actions.get("preflop"))[0] if pre is None else pre
+    pot, out = 0.0, {}
+    for st in STREETS:
+        put, level, last = {}, 0.0, None
+        for i, a in enumerate(pre if st == "preflop" else (actions.get(st) or [])):
+            k, act, to = a.get("seat"), a.get("act"), _num(a.get("to"))
+            if to is not None and (to > MAX_BB or (st != "preflop" and not a.get("allin")
+                                                  and to > MAX_JUMP * max(pot, level, BB_AMOUNT))):
+                to = None
+            now = pot + sum(put.values())
+            if act in ("bet", "raise"):
+                if to is not None and to > level:
+                    base = now + max(0.0, level - put.get(k, 0.0))
+                    last = (to - level) / base if base > 0 else None
+                    put[k], level = to, to
+                else:
+                    last = None
+                if st != "preflop":
+                    out[(st, i)] = last
+            elif act == "call":
+                if st != "preflop":
+                    out[(st, i)] = last
+                put[k] = max(put.get(k, 0.0), to if to is not None else level)
+            elif act == "post" and to is not None:
+                put[k] = max(put.get(k, 0.0), to)
+                level = max(level, to)
+        pot += sum(put.values())
+    return out
+
+
+def to_handread(actions, pos, clean=True, sizes=True):
+    """액션 목록({street: [action]}) + {seat: pos} → handread.estimate 의 seats 모양.
+    clean: 프리플랍 정리(clean_preflop) + 올인/올인콜 좌석에 실제 올인 금액 'stack_bb'.
+    sizes: 포스트플랍 벳/콜/레이즈/올인에 기록 금액으로 계산한 팟 대비 크기를 붙인다 ({"a": "bet", "size": 0.66}, 금액 모르면 문자열)."""
     out = {k: {"pos": p, "preflop": [], "flop": [], "turn": [], "river": []} for k, p in pos.items()}
+    pre = clean_preflop(actions.get("preflop"))[0] if clean else list(actions.get("preflop", []))
     opener = None
-    for a in actions.get("preflop", []):
+    for a in pre:
         k, act, rb = a["seat"], a["act"], a.get("raises_before") or 0
         if k not in out:
             continue
@@ -757,23 +902,28 @@ def to_handread(actions, pos):
             word = "blind"
         elif act == "raise":
             word = "jam" if a.get("allin") else ("open", "3bet", "4bet")[min(rb, 2)]
-            if rb == 0:
+            if rb == 0 and not a.get("incomplete"):
                 opener = pos.get(k)
         elif act == "call":
-            word = "call_jam" if a.get("allin") and rb >= 1 else ("limp", "call", "call_3bet")[min(rb, 2)]
+            word = "call_jam" if (a.get("allin") or a.get("vs_allin")) and rb >= 1 else ("limp", "call", "call_3bet")[min(rb, 2)]
         elif act in ("check", "fold"):
             word = act
         else:
             continue
         out[k]["preflop"].append(word)
+    if clean:
+        for k, amt in _pre_stacks(pre).items():
+            if k in out and out[k]["preflop"] and out[k]["preflop"][-1] in ("jam", "call_jam"):
+                out[k]["stack_bb"] = round(amt, 1)
+    size_of = bet_sizes(actions, pre) if sizes else {}
     # 주도권: 프리플랍 마지막 레이저 = 어그레서. 스트리트의 첫 벳이 (이전 스트리트 어그레서의 벳 = cbet / 어그레서 없이 콜러가 리드 = lead /
     # 어그레서가 앞 스트리트를 체크로 넘기고 벳 = delay / 체크로 넘어온 스트리트에 콜러가 벳 = probe)
-    pre_raises = [a["seat"] for a in actions.get("preflop", []) if a["act"] == "raise" and a["seat"] in out]
+    pre_raises = [a["seat"] for a in pre if a["act"] == "raise" and a["seat"] in out and not a.get("incomplete")]
     aggr = pre_raises[-1] if pre_raises else None
     prev_street_aggr = aggr
     for street in STREETS[1:]:
         street_aggr, first_bet = None, True
-        for a in actions.get(street, []):
+        for i, a in enumerate(actions.get(street, [])):
             k, act = a["seat"], a["act"]
             if k not in out or act not in ("check", "bet", "call", "raise", "fold"):
                 continue
@@ -790,7 +940,9 @@ def to_handread(actions, pos):
             word = "allin" if a.get("allin") and act in ("bet", "raise") else act
             if act == "raise" and "check" in seq:
                 word = "checkraise"
-            seq.append(word)
+            sz = size_of.get((street, i))
+            seq.append({"a": word, "size": round(sz, 3)} if sz and word in ("bet", "call", "raise", "allin", "checkraise")
+                       else word)
         prev_street_aggr = street_aggr
     for k in out:
         if opener and out[k]["pos"] != opener:

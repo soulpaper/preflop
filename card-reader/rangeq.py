@@ -43,6 +43,9 @@ NARROW_KEEP = {"bet": 0.60, "raise": 0.35, "allin": 0.25, "call": 0.75}
 # 오픈에 콜(콜드콜) 범위의 최소 폭 (%): GTO 차트의 SB 콜 범위는 3% 남짓(거의 3벳 아니면 폴드)이라 프로필 없는 상대가
 # 림프 팟 아이솔레이션에 블라인드로 콜하면 '상위 3%' 로 시작해 리버엔 '상위 2%' 로 좁혀졌다 (실제 풀은 훨씬 넓게 콜)
 CALL_OPEN_FLOOR = 8.0
+# 콜 범위의 '3벳(4벳)할 만한 패' 가중치: 예전엔 0 (콜했으면 프리미엄 아님)이었지만 실제로는 슬로플레이·플랫이 섞인다
+# (쇼다운 채점 2026-11-05: 오픈에 콜한 상대의 실제 패가 대부분 범위 밖 = 0% 로 나왔다). 3벳 빈도보다는 낮게.
+CALL_TRAP = 0.3
 
 
 # --- 콤보 테이블 -------------------------------------------------------------------
@@ -195,6 +198,9 @@ def villain_range(action, pos, players, stack_bb, profile=None, *, opener=None, 
     opener: call_open / 3bet 의 '오픈한 사람' 포지션 (모르면 오픈 가능한 앞 포지션들의 중간),
             call_3bet / 4bet 의 '3벳한 사람' 포지션 (모르면 내 뒤 첫 포지션).
     ante:   토너먼트 앤티가 있으면 True — 오픈 폭과 vs 오픈(콜/3벳) 폭을 preflop 의 앤티 보정대로 넓힌다 (기본 False).
+    콜 범위(call_open / call_3bet)에서 3벳/4벳 차트의 패는 0 이 아니라 CALL_TRAP(슬로플레이·플랫).
+    차트 밖 패의 최소 가중치(꼬리)는 여기서 넣지 않는다 — 상대 리딩(handread._with_floor)만 넣고, 차트 범위로 에쿼티를
+    계산하는 advisor 의 방어 계산은 차트 그대로 쓴다.
     """
     act = (action or "").lower().strip() or None
     act = ALIASES.get(act, act)
@@ -231,11 +237,11 @@ def villain_range(action, pos, players, stack_bb, profile=None, *, opener=None, 
             base = chart[1][1] if chart else pf.top_pct(24) - pf.top_pct(6)
             exclude = chart[0][1] if chart else pf.top_pct(6)
             chart_pct = pf.range_pct(base)
-            floor = max(chart_pct, CALL_OPEN_FLOOR)
+            min_pct = max(chart_pct, CALL_OPEN_FLOOR)
             if w and vpip is not None and pfr is not None:
-                target = (1 - w) * floor + w * max(2.0, vpip - pfr)
-            elif floor > chart_pct + 1e-9:
-                target = floor
+                target = (1 - w) * min_pct + w * max(2.0, vpip - pfr)
+            elif min_pct > chart_pct + 1e-9:
+                target = min_pct
     elif act in ("call_3bet", "4bet"):
         chart = None
         o = opener
@@ -249,6 +255,7 @@ def villain_range(action, pos, players, stack_bb, profile=None, *, opener=None, 
             base = chart[0][1] if chart else pf.top_pct(3)
         else:
             base = chart[1][1] if chart else pf.top_pct(10) - pf.top_pct(2)
+            exclude = chart[0][1] if chart else pf.top_pct(2)
     elif act == "limp":
         base = pf.top_pct(45) - pf.top_pct(8)
         chart_pct = pf.range_pct(base)
@@ -268,6 +275,9 @@ def villain_range(action, pos, players, stack_bb, profile=None, *, opener=None, 
     out = _resize(base, target, exclude) if target is not None else {h: 1.0 for h in base}
     for h, x in extras.items():
         out.setdefault(h, x)
+    if act in ("call_open", "call_3bet"):
+        for h in exclude:
+            out[h] = max(out.get(h, 0.0), CALL_TRAP)
     # 집합 순서(해시 시드에 따라 실행마다 다름) 대신 강도 순서로 고정 — 같은 시드면 같은 표본이 나오게 (결정적)
     return {h: out[h] for h in sorted(out, key=RANK_IDX.__getitem__)}
 

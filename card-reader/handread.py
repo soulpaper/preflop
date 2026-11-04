@@ -6,7 +6,8 @@
 
 입력
   seats   {seat_key: {"pos": "CO", "preflop": [...], "flop": [...], "turn": [...], "river": [...],
-                      "opener": "UTG"(선택: 오픈/3벳한 사람 포지션), "profile": {...}(선택)}}
+                      "opener": "UTG"(선택: 오픈/3벳한 사람 포지션), "profile": {...}(선택),
+                      "stack_bb": 12.0(선택: 올인/올인콜한 금액 — jam/call_jam 범위를 이 깊이로)}}
           액션은 문자열 또는 {"a": "bet", "size": 0.66} (size = 팟 대비 비율, 모르면 생략).
           프리플랍: open limp call 3bet call_3bet 4bet jam call_jam check blind
           포스트플랍: check bet call raise checkraise allin fold   (call 의 size 는 '받은 벳' 크기)
@@ -32,8 +33,12 @@
   프리플랍: rangeq.villain_range (프로필이 신뢰되면 rangeq 가 폭을 섞어 줌).
   포스트플랍: 스트리트별로 그 시점 보드에서 각 콤보를 5단계(N 넛급 / W 투페어 / T 탑페어+ / M 중간·약한 / A 에어, 드로우는
   에어에 부분 가중)로 분류하고 액션별 배율표를 곱한다.
-    작은 벳 병합 · 큰 벳/레이즈 양극화(중간 페어 크게 감소) · 체크레이즈 강+양극화 ·
-    콜 응축(중간·드로우 유지, 최강 약간 감소, 에어 크게 감소) · 체크 캡(최강 일부 감소, 슬로플레이 잔존)
+    작은 벳 병합 · 벳은 밸류 위주지만 중간 페어도 섞임(큰 벳일수록 덜) · 레이즈 양극화(중간 페어 크게 감소) ·
+    체크레이즈 강+양극화 · 콜 응축(중간·드로우 유지, 최강 약간 감소, 에어 크게 감소) ·
+    체크 캡(최강·탑페어 감소, 슬로플레이 잔존)
+  프리플랍 범위는 169 핸드 모두 최소 가중치 PRE_FLOOR (차트 밖 패도 0 이 아님, 차트 밖 질량은 PRE_TAIL_MAX 까지),
+  콜 범위의 3벳급 패는 rangeq.CALL_TRAP.
+  올인/올인콜 상대는 좌석의 stack_bb(실제 올인 금액, handlog.to_handread 가 채움)와 내 스택 중 작은 쪽으로 범위를 만든다.
   주도권: 벳은 누가 했나로 나뉜다 — cbet(주도권 있음: 넓게) / lead(콜하고 먼저 벳: 맞은 패 위주) /
     delay(어그레서가 체크 후 늦게 벳) / probe(체크로 넘어온 뒤 콜러가 벳) — 후자 둘은 이번 스트리트에 좋아진 패를 더 올린다.
     액션 이름으로 직접 'lead' 등을 주거나, 좌석에 "bet_role": {"flop": "lead", ...} 를 주면 그 스트리트 첫 벳에 적용(없으면 일반 벳).
@@ -59,17 +64,23 @@ _STREETS = (("flop", 3, "플랍"), ("turn", 4, "턴"), ("river", 5, "리버"))
 # --- 액션별 배율표 [N, W, T, M, A] -------------------------------------------------------
 #   N 스트레이트 이상/셋·트립스, W 투페어, T 탑페어+(오버페어 포함), M 중간·약한 페어, A 에어(드로우는 A 와 DRAW 사이를 보간)
 #   DRAW = 순수 드로우 콤보의 배율, 페어+드로우는 max(버킷 배율, DRAW*0.95) 쪽으로 끌어올린다.
+#   쇼다운 채점(score_reads, 2026-11-05, 포스트플랍 98지점)으로 보정: 실제로는
+#     체크한 상대의 탑페어+ 13% (예측 25%), 중간·약한 페어 48% (예측 30%) → check 의 T 0.85 → 0.50
+#     벳/레이즈한 상대의 탑페어+ 19% (예측 29%), 중간·약한 페어 31% (예측 13%) → bet 의 M 을 올리고(med 0.50→0.70,
+#     big 0.18→0.35) T 를 내림(small 1.0→0.85, med 1.0→0.80). 표본이 작고(그룹당 15~35) 쇼다운 편향(폴드시킨 블러프는
+#     안 보임)이 있어 벳 행은 관측 쪽으로 일부만 옮겼다 (바꾼 뒤: 체크 탑페어+ 14% vs 실제 13%, 벳 탑페어+ 25% vs 19%,
+#     벳 중간 페어 17% vs 31%). cbet/lead/delay/probe 행은 이 bet 행에서 나온다.
 MULT = {
-    "bet_small":  ([1.00, 1.00, 1.00, 0.75, 0.40], 0.80),
-    "bet_med":    ([1.00, 1.00, 1.00, 0.50, 0.30], 0.90),
-    "bet_big":    ([1.00, 0.90, 0.80, 0.18, 0.25], 0.85),
+    "bet_small":  ([1.00, 1.00, 0.85, 0.75, 0.40], 0.80),
+    "bet_med":    ([1.00, 1.00, 0.80, 0.70, 0.30], 0.90),
+    "bet_big":    ([1.00, 0.90, 0.80, 0.35, 0.25], 0.85),
     "raise":      ([1.00, 0.85, 0.45, 0.08, 0.10], 0.60),
     "checkraise": ([1.00, 0.85, 0.40, 0.06, 0.10], 0.70),
     "allin":      ([1.00, 0.80, 0.45, 0.07, 0.10], 0.45),
     "call_small": ([0.55, 0.80, 1.00, 1.00, 0.20], 0.95),
     "call_med":   ([0.70, 0.85, 0.95, 1.00, 0.15], 0.95),
     "call_big":   ([0.75, 0.90, 0.90, 0.65, 0.08], 0.85),
-    "check":      ([0.40, 0.65, 0.85, 1.00, 1.00], 1.00),
+    "check":      ([0.40, 0.65, 0.50, 1.00, 1.00], 1.00),
 }
 # --- 주도권(이니셔티브)별 벳 --------------------------------------------------------------
 #   같은 크기의 벳도 '누가 벳했나'에 따라 범위가 다르다. 크기별 기본 행(bet_*)에 역할 보정 [N, W, T, M, A] 과 드로우 배율을 곱해
@@ -85,10 +96,17 @@ ROLE_ADJ = {
     "probe": ([1.10, 1.10, 1.10, 1.00, 0.60], 0.95),
 }
 IMPROVE = {"delay": 1.35, "probe": 1.35}   # 직전 스트리트 보드보다 이번 스트리트에 좋아진 콤보의 추가 배율
-for _r, (_adj, _dadj) in ROLE_ADJ.items():
-    for _sz in ("small", "med", "big"):
-        _b, _d = MULT["bet_" + _sz]
-        MULT[f"{_r}_{_sz}"] = ([x * y for x, y in zip(_b, _adj)], min(1.0, _d * _dadj))
+
+
+def _build_role_rows():
+    """bet_* 기본 행 x ROLE_ADJ → MULT 의 cbet_/lead_/delay_/probe_ 행 (기본 행을 바꾸면 다시 부른다)."""
+    for r, (adj, dadj) in ROLE_ADJ.items():
+        for sz in ("small", "med", "big"):
+            b, d = MULT["bet_" + sz]
+            MULT[f"{r}_{sz}"] = ([x * y for x, y in zip(b, adj)], min(1.0, d * dadj))
+
+
+_build_role_rows()
 _AGGR = ("bet_small", "bet_med", "bet_big", "raise", "checkraise", "allin") + tuple(
     f"{r}_{s}" for r in ROLE_ADJ for s in ("small", "med", "big"))
 _CALL = ("call_small", "call_med", "call_big")
@@ -106,15 +124,15 @@ _ROLE_NOTE = {
 _SIZE_KO = {"small": "작은 ", "med": "", "big": "큰 "}
 KIND_NOTE = {
     "bet_small": "얇은 밸류와 약한 패가 섞인 넓은 범위",
-    "bet_med": "밸류 위주, 일부 드로우·블러프",
-    "bet_big": "강한 패 또는 드로우 위주",
+    "bet_med": "밸류에 중간 페어도 꽤 섞임, 일부 드로우·블러프",
+    "bet_big": "강한 패·드로우 위주 (중간 페어도 일부)",
     "raise": "아주 강한 패 또는 블러프로 양극화",
     "checkraise": "강한 패 위주 (양극화)",
     "allin": "강한 패 또는 블러프",
     "call_small": "중간 패·드로우 위주",
     "call_med": "중간 패·드로우 위주 (최상위 패는 레이즈했을 수도)",
     "call_big": "강한 패·드로우 위주 (약한 페어는 줄어듦)",
-    "check": "캡된 범위 (최강 패는 줄어듦)",
+    "check": "캡된 범위 (최강 패·탑페어는 줄고 중간 페어·약한 패 위주)",
 }
 for _r in ROLE_ADJ:
     for _sz, _pre in _SIZE_KO.items():
@@ -364,7 +382,31 @@ def _combo_class_pre(code):
 
 
 # --- 프리플랍 레인지 ----------------------------------------------------------------------
+# 차트 밖 패의 최소 가중치 (169 핸드 모두). 차트 범위는 '보통 이렇게 한다'일 뿐이라, 0 으로 두면 실수·루즈한 상대·읽기 오류 때
+# 실제 패가 범위에서 아예 빠진다 (쇼다운 채점 2026-11-05: 실제 패가 범위 밖 = 0% 가 절반).
+# 값: 채점(score_reads)의 앞 세션으로 0.03~0.15 를 비교 — 콤보 로그손실은 0.07 이후 거의 안 좋아지고 분류 Brier 는 계속
+# 나빠져서 0.07 (차트 폭 15% 범위면 질량의 약 28% 가 차트 밖). 뒤 세션(보류)에서도 같은 방향.
+# PRE_TAIL_MAX: 차트 밖 질량의 상한. 좁은 범위(3벳 5%, 4벳 3%)는 같은 최소값이면 꼬리가 절반 넘게 되어 '3벳 = 아무 패'가 된다 →
+# 꼬리를 40% 로 묶는다 (채점: 0.3~0.5 와 없음이 비슷 — 포커 상식 쪽으로).
+PRE_FLOOR = 0.07
+PRE_TAIL_MAX = 0.4
+JAM_EFFECTIVE = True    # 올인 금액이 내 스택보다 크면 내 스택(유효 스택)으로 — False 면 올인 금액 그대로
 _PRE_CACHE = {}
+
+
+def _with_floor(rng):
+    """차트 범위 → 169 핸드 모두 최소 PRE_FLOOR. PRE_TAIL_MAX 가 있으면 차트 밖 질량이 그 비율을 넘지 않게 최소값을 줄인다
+    (좁은 3벳/4벳 범위가 꼬리에 묻히지 않게)."""
+    f = PRE_FLOOR
+    if not f or f <= 0:
+        return rng
+    if PRE_TAIL_MAX:
+        inside = sum(w * pf.combos(h) for h, w in rng.items() if w > 0)
+        gap = sum(max(0.0, 1.0 - rng.get(h, 0.0) / f) * pf.combos(h) for h in rq.G if rng.get(h, 0.0) < f)
+        if gap > 0 and inside > 0:
+            # 꼬리 질량 ≈ f * gap,  f*gap / (inside + f*gap) <= PRE_TAIL_MAX
+            f = min(f, PRE_TAIL_MAX / (1.0 - PRE_TAIL_MAX) * inside / gap)
+    return {h: max(rng.get(h, 0.0), f) for h in rq.G}
 
 
 def _num(v):
@@ -398,7 +440,7 @@ def _pre_range(action, pos, players, stack_bb, profile, opener, ante=False):
     prof_key = None
     if profile and rq.profile_reliable(profile):
         prof_key = tuple(_num(profile.get(k)) for k in ("hands", "vpip", "pfr", "threebet"))
-    key = (action, pos, players, stack_bb, opener, prof_key, bool(ante))
+    key = (action, pos, players, stack_bb, opener, prof_key, bool(ante), PRE_FLOOR, PRE_TAIL_MAX)
     got = _PRE_CACHE.get(key)
     if got is not None:
         return got
@@ -408,9 +450,10 @@ def _pre_range(action, pos, players, stack_bb, profile, opener, ante=False):
             rng = {h: 1.0 for h in pf.top_pct(max(3.0, min(100.0, vpip)))}
         else:
             rng = rq.villain_range("call_open", pos, players, stack_bb, profile, opener=opener, ante=bool(ante))
-        res = (rng, False)
+        res = (_with_floor(rng), False)
     else:
-        res = (rq.villain_range(action, pos, players, stack_bb, profile, opener=opener, ante=bool(ante)), True)
+        res = (_with_floor(rq.villain_range(action, pos, players, stack_bb, profile, opener=opener, ante=bool(ante))),
+               True)
     if len(_PRE_CACHE) > 500:
         _PRE_CACHE.clear()
     _PRE_CACHE[key] = res
@@ -526,10 +569,10 @@ def _tokens(codes):
 
 
 def _summary(mass, live):
-    """mass: 코드→가중치 합, live: 코드→살아있는 콤보 수."""
+    """mass: 코드→가중치 합, live: 코드→살아있는 콤보 수 → (표기 'TT+, AJs+ 외 12%', 표기한 핸드의 모델 확률 %, 표기한 코드 집합)."""
     total = sum(mass.values())
     if total <= 0:
-        return ""
+        return "", None, set()
     dens = {c: mass[c] / live[c] for c in mass if live.get(c)}
     peak = max(dens.values())
     chosen = {c for c, d in dens.items() if d >= 0.4 * peak}
@@ -538,10 +581,23 @@ def _summary(mass, live):
     if len(toks) > 7:
         keep = sorted(range(len(toks)), key=lambda i: -sum(mass[c] for c in toks[i][1]))[:7]
         toks = [toks[i] for i in sorted(keep)]
-    covered = sum(mass[c] for _, cs in toks for c in cs)
+    named = {c for _, cs in toks for c in cs}
+    covered = sum(mass.get(c, 0.0) for c in named)
     rest = max(0.0, 100.0 * (1 - covered / total))
     text = ", ".join(t for t, _ in toks)
-    return text + (f" 외 {rest:.0f}%" if rest >= 0.5 else "")
+    return text + (f" 외 {rest:.0f}%" if rest >= 0.5 else ""), round(100.0 - rest, 1), named
+
+
+# 화면의 '표기한 핸드 중 하나일 확률' = 모델 확률 x SUMMARY_CAL. 쇼다운 채점(score_reads 의 '요약 표기 포함' vs '주장')에서
+# 표기한 핸드는 모델이 말한 확률보다 덜 맞았다 (예전 모델: 주장 83% / 실제 43%; 지금 모델, 앞 세션: 주장 62% / 실제 51% → 0.8).
+# 모델 확률을 그대로 보여 주면 과신을 부추기므로 실측 비율만큼 깎아 5% 단위로 보여 준다. 데이터가 쌓이면 score_reads 로 다시 잰다.
+SUMMARY_CAL = 0.8
+
+
+def _summary_hit(model_pct):
+    if model_pct is None:
+        return None
+    return int(5 * round(model_pct * SUMMARY_CAL / 5))
 
 
 # --- 한 좌석 추정 ---------------------------------------------------------------------------
@@ -556,6 +612,10 @@ def _estimate_one(seat, board, players, dead, profile, stack_bb, ante=False):
     action, recognized = _pre_action(pre_raw), True
     players = players or 9
     prof = profile if profile else seat.get("profile")
+    own = _num(seat.get("stack_bb"))
+    if action in ("jam", "call_jam") and own and own > 0:
+        # 올인/올인콜 범위는 실제 올인 금액(유효 스택)으로: 상대가 나보다 짧으면 그 금액, 길면 나와의 유효 스택(내 스택)
+        stack_bb = min(own, stack_bb) if (JAM_EFFECTIVE and stack_bb) else own
     rng, recognized = _pre_range(action, pos, players, stack_bb, prof, seat.get("opener"), ante)
     blocked = set(board) | set(dead)
 
@@ -641,11 +701,15 @@ def _estimate_one(seat, board, players, dead, profile, stack_bb, ante=False):
     confidence = "high" if info >= 3.0 else "medium" if info >= 1.5 else "low"
 
     width = _eff_width(weights)
+    summ, summ_pct, summ_codes = _summary(mass, live)
     out = {
         "range": {ev.card_str(h) + ev.card_str(l): w / total for (h, l), w in zip(combos, weights)},
         "width_pct": round(width, 1),
         "preflop_width_pct": round(pre_width, 1),
-        "summary": _summary(mass, live),
+        "summary": summ,
+        "summary_codes": sorted(summ_codes),
+        "summary_pct": summ_pct,
+        "summary_hit_pct": _summary_hit(summ_pct),
         "classes": classes,
         "top_hands": top_hands,
         "confidence": confidence,
@@ -720,6 +784,10 @@ def describe(result):
     """결과 → UI 에 보여줄 2~4줄 한국어."""
     lines = []
     summ = result.get("summary") or ""
+    hit = result.get("summary_hit_pct")
+    if summ and hit is not None and result.get("summary_pct") is not None:
+        # 표기한 핸드 + '그중 하나일 확률'(실측 보정). 예전 'TT+, AJs+ 외 12%' 는 88% 를 덮는다고 읽혔지만 실제로는 43% 만 맞았다
+        summ = summ.rsplit(" 외 ", 1)[0] + (f" 중 하나일 확률 약 {hit}%" if hit < 100 else "")
     lines.append(f"{result.get('label', '?')}: 예상 상위 {result.get('width_pct', 0):.0f}%"
                  + (f" ({summ})" if summ else ""))
     classes = result.get("classes") or {}

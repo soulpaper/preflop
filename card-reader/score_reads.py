@@ -8,10 +8,9 @@
 
 무엇을 재나 (공개된 상대 좌석 x 그 상대가 실제로 액션한 스트리트마다)
   범위를 다시 만든다: 기록된 액션을 handlog.to_handread → handread.estimate 로 재생 (지금 모델 기준).
-    live    앱이 하는 그대로 (to_handread 는 벳 크기를 안 넘기므로 모든 벳/콜이 '보통 크기')
-    fixed   입력을 고쳐 본 것: 기록된 금액('to')으로 계산한 벳 크기(팟 대비) + 프리플랍 레이즈 정리(같은 레이즈 두 번 읽음·
-            최소 레이즈 미만 올인은 레이즈로 안 셈·올인에 콜 = 올인콜) + 올인 상대는 실제 올인 금액을 스택으로
-            → 모델은 그대로 두고 앱이 넘기는 입력만 좋아지면 얼마나 나아지나
+    live    앱이 하는 그대로 (handlog.to_handread: 프리플랍 정리(같은 레이즈 두 번 읽음·최소 레이즈 미만 올인·올인에 콜 =
+            올인콜·말이 안 되는 금액) + 올인/올인콜 상대는 실제 올인 금액을 스택으로 + 기록 금액으로 계산한 벳 크기(팟 대비))
+    raw     예전 입력 (정리·크기·올인 스택 없음, 모든 벳/콜이 '보통 크기') — 지금 모델에서 입력 정리의 몫을 본다
     pre     프리플랍 액션만 반영 (포스트플랍 배율표가 도움이 되는지 보는 기준선)
     uniform 남은 카드에서 무작위 (완전 무지 기준선)
   점수
@@ -21,9 +20,11 @@
     분류           실제 핸드 분류(셋/투페어/탑페어+/드로우/노페어 …)에 준 확률, 예측 순위(1=최다), Brier(7분류)
     top5           실제 핸드코드가 앱이 보여주는 '가능성 높은 핸드' 5개 안에 있었나
     0확률          실제 콤보가 범위에서 아예 빠졌나 (가중치 컷)
+    요약 표기      재생 결과의 표기 핸드(summary_codes)에 실제 핸드가 들었나 vs 화면 확률(summary_hit_pct, 실측 보정) /
+                   모델 확률(summary_pct) → handread.SUMMARY_CAL 을 다시 잴 때 쓴다
   기록된 리딩(decisions_*.jsonl 의 reads: 결정 순간 사용자가 본 줄)도 따로 채점:
-    표시된 상위 3분류 안에 실제 분류가 있었나 / 1순위였나 / 요약 표기(예: 'TT+, AJs+ 외 12%')에 실제 핸드가 들었나
-    (표기는 범위의 100-12=88% 를 덮는다고 주장하므로 실제 포함률과 비교)
+    표시된 상위 3분류 안에 실제 분류가 있었나 / 1순위였나 / 요약 표기에 실제 핸드가 들었나
+    (예전 표기 'TT+, AJs+ 외 12%' 는 88% 를, 지금 표기 'TT+, AJs+ 중 하나일 확률 약 50%' 는 50% 를 주장 → 실제 포함률과 비교)
 
 한계: 쇼다운까지 간 핸드만 보인다(폴드시킨 블러프는 안 보임 → 공격 액션의 '에어'는 실제보다 적게 보인다).
 앤티는 금액을 몰라 팟에서 빠짐(벳 크기가 약간 크게 계산될 수 있음). 표본이 작다.
@@ -46,7 +47,7 @@ STREETS = ("preflop", "flop", "turn", "river")
 STREET_KO = {"preflop": "프리플랍", "flop": "플랍", "turn": "턴", "river": "리버"}
 NEED = {"preflop": 0, "flop": 3, "turn": 4, "river": 5}
 EPS = 0.01                     # 범위 확률을 균등과 섞는 비율 (0 확률 → 무한 로그손실 방지)
-VARIANTS = ("live", "fixed", "pre", "uniform")
+VARIANTS = ("live", "raw", "pre", "uniform")
 POST_WORDS = ("check", "bet", "call", "raise", "fold")
 FAMILY = {"check": "체크", "call": "콜", "aggr": "벳/레이즈"}
 OUT_NAME = "read_scores.json"
@@ -102,35 +103,6 @@ def _num(v):
 
 
 # --- 핸드 기록 → 재생 입력 ---------------------------------------------------------------------
-def bet_sizes(rec):
-    """{(street, 액션 인덱스): 팟 대비 크기} — 벳/레이즈 = 올린 만큼 / (콜한 뒤의 팟), 콜 = 받은 벳의 크기.
-    'to' = 그 스트리트에서 그 좌석이 넣은 총액(BB). 금액을 모르면 그 액션은 크기 없음."""
-    acts = rec.get("actions") or {}
-    pot, out = 0.0, {}
-    for st in STREETS:
-        put, level, last = defaultdict(float), 0.0, None
-        for i, a in enumerate(acts.get(st) or []):
-            k, act, to = a.get("seat"), a.get("act"), _num(a.get("to"))
-            now = pot + sum(put.values())
-            if act in ("bet", "raise"):
-                if to is not None and to > level:
-                    base = now + max(0.0, level - put[k])
-                    last = (to - level) / base if base > 0 else None
-                    out[(st, i)] = last
-                    put[k], level = to, to
-                else:
-                    out[(st, i)] = None
-                    last = None
-            elif act == "call":
-                out[(st, i)] = last
-                put[k] = max(put[k], to if to is not None else level)
-            elif act == "post" and to is not None:
-                put[k] = max(put[k], to)
-                level = max(level, to)
-        pot += sum(put.values())
-    return out
-
-
 def phantom_streets(rec):
     """스트리트 시작 때 액션할 수 있는 사람(폴드·올인 아님)이 2명 미만 → 그 스트리트의 '체크'는 실제 선택이 아님."""
     acts = rec.get("actions") or {}
@@ -159,93 +131,17 @@ def seat_positions(rec):
 
 
 def replay_seats(rec):
-    """앱과 같은 입력 (to_handread)."""
+    """앱과 같은 입력 (handlog.to_handread: 프리플랍 정리 + 올인 금액 스택 + 포스트플랍 벳 크기)."""
     return handlog.to_handread(rec.get("actions") or {}, seat_positions(rec))
 
 
-def clean_preflop(actions):
-    """프리플랍 액션 정리 사본 + 고친 개수: (1) 같은 좌석이 다른 사람 레이즈 없이 연달아 '레이즈' = 칩 금액을 두 번 읽은 것 → 하나로
-    (2) 최소 레이즈에 못 미치는 올인(예: 2.0 오픈에 2.1 올인)은 레이즈 횟수에 안 센다 → 뒤 사람의 raises_before 를 다시 센다
-
-    (3) 올인 레이즈에 콜 = 올인콜 (to_handread 는 콜한 사람이 올인일 때만 call_jam 으로 본다)."""
-    out, rb, level, last_inc = [], 0, 1.0, 1.0
-    last_raiser, last_idx, fixed = None, None, 0
-    for a in actions or []:
-        a = dict(a)
-        act, to = a.get("act"), _num(a.get("to"))
-        if act == "raise":
-            if a.get("seat") == last_raiser and last_idx is not None:
-                prev = out[last_idx]
-                if to is not None and (_num(prev.get("to")) or 0) < to:
-                    prev["to"] = to
-                prev["allin"] = bool(prev.get("allin") or a.get("allin"))
-                level = max(level, to or level)
-                fixed += 1
-                continue
-            inc = (to - level) if (to is not None and to > level) else None
-            complete = not (a.get("allin") and inc is not None and inc < last_inc)
-            a["raises_before"] = rb
-            if complete:
-                rb += 1
-                if inc is not None:
-                    last_inc = max(last_inc, inc)
-                last_raiser, last_idx = a.get("seat"), len(out)
-            else:
-                fixed += 1
-            if to is not None:
-                level = max(level, to)
-        elif act != "post":
-            a["raises_before"] = rb
-            if act == "call" and last_idx is not None and out[last_idx].get("allin") and not a.get("allin"):
-                a["allin"] = True
-                fixed += 1
-        out.append(a)
-    return out, fixed
+def raw_seats(rec):
+    """예전 앱 입력 (정리·크기·올인 스택 없음) — 입력 정리가 얼마나 도움이 되는지 보는 비교용."""
+    return handlog.to_handread(rec.get("actions") or {}, seat_positions(rec), clean=False, sizes=False)
 
 
-def fixed_record(rec):
-    """입력을 고친 기록 사본 (프리플랍 레이즈 정리) + 고친 개수."""
-    acts = dict(rec.get("actions") or {})
-    acts["preflop"], fixed = clean_preflop(acts.get("preflop"))
-    r2 = dict(rec)
-    r2["actions"] = acts
-    return r2, fixed
-
-
-def eff_stack(rec, seat, stack):
-    """올인/올인콜 상대의 프리플랍 범위는 내 스택이 아니라 실제 올인 금액(더 작으면)으로."""
-    amt = None
-    for a in (rec.get("actions") or {}).get("preflop") or []:
-        if a.get("seat") != seat:
-            continue
-        to = _num(a.get("to"))
-        if to and (a.get("allin") or a.get("act") == "call"):
-            amt = to if amt is None else max(amt, to)
-    words = hr._norm_pre((replay_seats(rec).get(seat) or {}).get("preflop"))
-    if amt and words and words[-1] in ("jam", "call_jam"):
-        return min(stack, amt) if stack else amt
-    return stack
-
-
-def add_sizes(rec, seats):
-    """to_handread 결과에 벳 크기를 붙인 사본 (포스트플랍 bet/call/raise/allin 단어를 {"a", "size"} 로)."""
-    sizes = bet_sizes(rec)
-    acts = rec.get("actions") or {}
-    out = {}
-    for k, seat in seats.items():
-        s2 = dict(seat)
-        for st in STREETS[1:]:
-            words = list(seat.get(st) or [])
-            idx = [i for i, a in enumerate(acts.get(st) or []) if a.get("seat") == k and a.get("act") in POST_WORDS]
-            if len(idx) == len(words):
-                new = []
-                for w, i in zip(words, idx):
-                    sz = sizes.get((st, i))
-                    new.append({"a": w, "size": sz} if sz and w in ("bet", "call", "allin", "raise") else w)
-                words = new
-            s2[st] = words
-        out[k] = s2
-    return out
+def input_fixes(rec):
+    return handlog.clean_preflop((rec.get("actions") or {}).get("preflop"))[1]
 
 
 def truncate(seat, street):
@@ -323,12 +219,22 @@ def score_result(res, key, code, y, n_live):
     out = {"p": p_raw, "ll": -math.log(p), "pit": higher + 0.5 * equal if p_raw > 0 else 1.0,
            "zero": p_raw <= 0, "top5": code in [c for c, _ in res.get("top_hands") or []],
            "width": res.get("width_pct")}
+    named = res.get("summary_codes")
+    if named is None:   # 예전 결과: 표기 문자열에서
+        named, model = parse_summary(res.get("summary"))
+        shown = model
+    else:
+        model, shown = res.get("summary_pct"), res.get("summary_hit_pct")
+    out["sum_in"] = code in named if named else None
+    out["sum_claim"] = (shown / 100.0) if (named and shown is not None) else None    # 화면에 보인 확률
+    out["sum_model"] = (model / 100.0) if (named and model is not None) else None   # 모델 확률(보정 전)
     out.update(_class_metrics(probs, y))
     return out
 
 
 def score_uniform(board, dead, y, n_live):
-    out = {"p": 1.0 / n_live, "ll": math.log(n_live), "pit": 0.5, "zero": False, "top5": False, "width": None}
+    out = {"p": 1.0 / n_live, "ll": math.log(n_live), "pit": 0.5, "zero": False, "top5": False, "width": None,
+           "sum_in": None, "sum_claim": None, "sum_model": None}
     out.update(_class_metrics(uniform_classes(board, dead), y))
     return out
 
@@ -388,6 +294,21 @@ def _expand_token(tok):
     return out
 
 
+def parse_summary(body):
+    """요약 표기 → (핸드코드 집합, 표기가 덮는다고 주장하는 비중 %).
+    예전 'TT+, AJs+ 외 12%' (= 88% 주장) / 지금 화면 'TT+, AJs+ 중 하나일 확률 약 50%'."""
+    body = (body or "").strip()
+    hit = re.search(r"\s중 하나일 확률 약 (\d+(?:\.\d+)?)%$", body)
+    rest = None if hit else re.search(r"\s외 (\d+(?:\.\d+)?)%$", body)
+    covered = float(hit.group(1)) if hit else 100.0 - float(rest.group(1)) if rest else 100.0
+    if hit or rest:
+        body = body[:(hit or rest).start()]
+    codes = set()
+    for t in body.split(","):
+        codes |= _expand_token(t)
+    return codes, covered
+
+
 def parse_logged(line):
     """'BTN 오픈: 예상 상위 7% (66, A9s-A7s 외 8%) | 보드 기준: 탑페어+ 40% · 드로우 30%' →
     {codes, covered(%), classes{이름: %}, board(bool), truncated}."""
@@ -397,14 +318,7 @@ def parse_logged(line):
     head, _, tail = line.partition(" | ")
     m = re.search(r"예상 상위 [\d.]+% \((.*)\)\s*$", head)
     if m:
-        body = m.group(1)
-        rest = re.search(r"\s외 (\d+(?:\.\d+)?)%$", body)
-        covered = 100.0 - float(rest.group(1)) if rest else 100.0
-        if rest:
-            body = body[:rest.start()]
-        for t in body.split(","):
-            out["codes"] |= _expand_token(t)
-        out["covered"] = covered
+        out["codes"], out["covered"] = parse_summary(m.group(1))
     elif "예상 상위" in head:
         out["truncated"] = True
     if "기준:" in tail:
@@ -503,8 +417,8 @@ def score_hands(hands, decs, ok_only=False):
         board = hr._board_cards(rec.get("board") or [])
         dead = [c for c in hr._cards(rec.get("hero_cards") or []) if c not in board]
         live_seats = replay_seats(rec)
-        frec, nfix = fixed_record(rec)
-        fixed_seats = add_sizes(frec, replay_seats(frec))
+        raw = raw_seats(rec)
+        nfix = input_fixes(rec)
         phantom = phantom_streets(rec)
         stack, ante, profiles = _context(rec, decs_by_hand, sess_defaults)
         players = int(_num(rec.get("pos_players")) or _num(rec.get("players")) or 9)
@@ -518,7 +432,7 @@ def score_hands(hands, decs, ok_only=False):
                 skipped["duplicate"] += 1
                 continue
             seen.add(dkey)
-            if k not in live_seats or not live_seats[k].get("preflop"):
+            if k not in live_seats or not live_seats[k].get("preflop") or k not in raw:
                 skipped["no_actions"] += 1
                 continue
             key, hi, lo = combo_key(*cs)
@@ -526,7 +440,6 @@ def score_hands(hands, decs, ok_only=False):
             prof = profiles.get(k)
             ptype = profile_type(prof)
             prof_arg = {k: prof} if prof else None
-            fstack = eff_stack(frec, k, stack)
             for st in STREETS:
                 n = NEED[st]
                 if st != "preflop":
@@ -542,17 +455,17 @@ def score_hands(hands, decs, ok_only=False):
                 names, y = actual_class(b, hi, lo)
                 ests = {}
                 for var, seat, stk in (("live", truncate(live_seats[k], st), stack),
-                                       ("fixed", truncate(fixed_seats.get(k) or live_seats[k], st), fstack),
+                                       ("raw", truncate(raw[k], st), stack),
                                        ("pre", pre_only(live_seats[k]), stack)):
                     ests[var] = hr.estimate({k: seat}, b, players, dead=dead, profiles=prof_arg, stack_bb=stk,
                                             ante=ante)[k]
-                kind = _kind_label(live_seats[k], st) if st == "preflop" else _kind_label(fixed_seats.get(k) or {}, st)
+                kind = _kind_label(live_seats[k], st)
                 row = OrderedDict(hand=rec.get("id"), seat=k, street=st, actual=code, actual_class=names[y],
-                                  kind=kind, kind_fixed=_kind_label(fixed_seats.get(k) or {}, st),
+                                  kind=kind, kind_raw=_kind_label(raw[k], st),
                                   family=_family(kind), profile=ptype, conf=rec.get("confidence"),
-                                  label=ests["live"].get("label"), label_fixed=ests["fixed"].get("label"),
-                                  stack=stack, stack_fixed=fstack, input_fixes=nfix)
-                for var in ("live", "fixed", "pre"):
+                                  label=ests["live"].get("label"), label_raw=ests["raw"].get("label"),
+                                  stack=stack, stack_jam=live_seats[k].get("stack_bb"), input_fixes=nfix)
+                for var in ("live", "raw", "pre"):
                     row[var] = score_result(ests[var], key, code, y, n_live)
                 row["uniform"] = score_uniform(b, dead, y, n_live)
                 row["class_names"] = names
@@ -594,10 +507,13 @@ def agg(rows):
             "cls_ll": _mean([r["cls_ll"] for r in rs]),
             "top5": _mean([float(r["top5"]) for r in rs]),
             "zero": _mean([float(r["zero"]) for r in rs]),
+            "sum_in": _mean([None if r.get("sum_in") is None else float(r["sum_in"]) for r in rs]),
+            "sum_claim": _mean([r.get("sum_claim") if r.get("sum_in") is not None else None for r in rs]),
+            "sum_model": _mean([r.get("sum_model") if r.get("sum_in") is not None else None for r in rs]),
         }
     if rows:
         u = out["uniform"]["ll"]
-        for var in ("live", "fixed", "pre"):
+        for var in ("live", "raw", "pre"):
             out[var]["bits_vs_uniform"] = (u - out[var]["ll"]) / math.log(2)
     return out
 
@@ -638,8 +554,8 @@ def summarize(rows, lrows, skipped):
         group(post, lambda r: (r["street"], r["family"])).items()))
     s["by_preflop_action"] = OrderedDict((k, agg(v)) for k, v in sorted(
         group([r for r in rows if r["street"] == "preflop"], lambda r: r["kind"]).items()))
-    s["by_preflop_action_fixed"] = OrderedDict((k, agg(v)) for k, v in sorted(
-        group([r for r in rows if r["street"] == "preflop"], lambda r: r["kind_fixed"]).items()))
+    s["by_preflop_action_raw"] = OrderedDict((k, agg(v)) for k, v in sorted(
+        group([r for r in rows if r["street"] == "preflop"], lambda r: r["kind_raw"]).items()))
     s["by_profile"] = OrderedDict((k, agg(v)) for k, v in sorted(group(rows, lambda r: r["profile"]).items()))
     s["by_confidence"] = OrderedDict((k, agg(v)) for k, v in sorted(group(rows, lambda r: r["conf"]).items()))
     s["calibration_by_family"] = OrderedDict(
@@ -671,12 +587,14 @@ def _f(x, d=2):
 
 
 def _line(name, a):
-    lv, fx, pr, un = a["live"], a["fixed"], a["pre"], a["uniform"]
+    lv, fx, pr, un = a["live"], a["raw"], a["pre"], a["uniform"]
     return (f"  {name:<16} n={a['n']:>3} | 정보이득 live {_f(lv.get('bits_vs_uniform'), 1)}bit"
-            f" (fixed {_f(fx.get('bits_vs_uniform'), 1)}, pre {_f(pr.get('bits_vs_uniform'), 1)})"
+            f" (raw {_f(fx.get('bits_vs_uniform'), 1)}, pre {_f(pr.get('bits_vs_uniform'), 1)})"
             f" | PIT {_f(lv['pit'])} | 실제분류 확률 {_pct(lv['cls_p'])} (pre {_pct(pr['cls_p'])}, 무작위 {_pct(un['cls_p'])})"
             f" 1순위 {_pct(lv['cls_top1'])} | Brier {_f(lv['brier'])}/{_f(pr['brier'])}/{_f(un['brier'])}"
-            f" | top5 {_pct(lv['top5'])} | 0확률 {_pct(lv['zero'])}")
+            f" | top5 {_pct(lv['top5'])} | 0확률 {_pct(lv['zero'])}"
+            f" | 요약 표기에 실제 핸드 {_pct(lv.get('sum_in'))} (화면 {_pct(lv.get('sum_claim'))},"
+            f" 모델 {_pct(lv.get('sum_model'))})")
 
 
 def report(s, out=None):
@@ -693,10 +611,10 @@ def report(s, out=None):
     w("\n[프리플랍 액션별]\n")
     for k, a in s["by_preflop_action"].items():
         w(_line(k, a) + "\n")
-    w("\n[프리플랍 액션별 — 입력 정리 후(fixed) 분류 기준]\n")
-    for k, a in s["by_preflop_action_fixed"].items():
+    w("\n[프리플랍 액션별 — 정리 전 입력(raw) 분류 기준]\n")
+    for k, a in s["by_preflop_action_raw"].items():
         w(_line(k, a) + "\n")
-    w("\n[포스트플랍 마지막 액션별 (크기=기록 금액 기준, _?=금액 모름)]\n")
+    w("\n[포스트플랍 마지막 액션별 (크기=기록 금액 기준, _?=금액 모름 → 보통 크기로 계산)]\n")
     for k, a in s["by_kind"].items():
         w(_line(str(k), a) + "\n")
     w("\n[프로필별]\n")

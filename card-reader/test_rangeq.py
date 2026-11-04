@@ -67,8 +67,14 @@ test("루즈 프로필(VPIP 45/PFR 8) → 콜 범위 확대", call_loose > call_
 # 회귀 2026-10-30: 프로필 없는 SB 콜 범위가 GTO 차트(3% 남짓)라 리버에 '상위 2%' 로 좁혀졌다 → 최소 폭
 _sbc = rq.width_pct(rq.villain_range("call_open", "SB", 6, 100))
 test(f"프로필 없는 SB 콜 범위 ≥ 최소 폭 {rq.CALL_OPEN_FLOOR:g}%", _sbc >= rq.CALL_OPEN_FLOOR - 0.5, f"{_sbc:.1f}%")
-test("콜 범위 최소 폭은 3벳 범위(프리미엄)를 넣지 않음",
-     not (set(rq.villain_range("call_open", "SB", 6, 100)) & set(rq.villain_range("3bet", "SB", 6, 100))))
+_sbcall, _sb3 = rq.villain_range("call_open", "SB", 6, 100), rq.villain_range("3bet", "SB", 6, 100)
+test("콜 범위 최소 폭은 3벳 범위(프리미엄)를 넓혀 넣지 않음 — 3벳급 패는 슬로플레이 가중치(CALL_TRAP)만",
+     all(_sbcall.get(h, 0) <= rq.CALL_TRAP + 1e-9 for h in _sb3), str({h: _sbcall.get(h) for h in _sb3}))
+test("콜 범위의 3벳급 패는 0 이 아님 (슬로플레이·플랫, 2026-11-05 쇼다운 채점)",
+     all(_sbcall.get(h, 0) >= rq.CALL_TRAP - 1e-9 for h in _sb3))
+_c3 = rq.villain_range("call_3bet", "CO", 6, 100)
+test("3벳콜 범위의 4벳급 패(AA)는 슬로플레이 가중치", abs(_c3.get("AA", 0) - rq.CALL_TRAP) < 1e-9, str(_c3.get("AA")))
+test("차트 범위 자체에는 꼬리를 넣지 않음 (advisor 방어 계산용)", "72o" not in rq.villain_range("open", "UTG", 9, 100))
 test("3벳% 프로필 반영 (3bet 12%)",
      rq.width_pct(rq.villain_range("3bet", "BTN", 6, 100, {"threebet": 12, "hands": 500, "reliable": True}))
      > rq.width_pct(TIGHT3) + 3)

@@ -6,6 +6,7 @@ import sys
 import tempfile
 
 import evaluator as ev
+import handlog
 import handread as hr
 import score_reads as sr
 
@@ -43,18 +44,18 @@ REC = hand("s-0001", {
     "turn": [A("W", "check"), A("V", "bet", to=15.0), A("W", "call", to=15.0, facing=True)],
     "river": [A("W", "check"), A("V", "check")],
 }, ["Ah", "7d", "2s", "Kc", "9h"], {"V": ["As", "Kd"], "W": ["7h", "7c"]}, folded={"hero": "preflop"})
-sz = sr.bet_sizes(REC)
+sz = handlog.bet_sizes(REC["actions"])
 test("bet_sizes: 플랍 4.5 into 6 = 0.75", abs(sz[("flop", 1)] - 0.75) < 1e-9, str(sz))
 test("bet_sizes: 콜은 받은 벳 크기", abs(sz[("flop", 2)] - 0.75) < 1e-9)
 test("bet_sizes: 턴 15 into 15 = 1.0", abs(sz[("turn", 1)] - 1.0) < 1e-9)
 
 live = sr.replay_seats(REC)
-sized = sr.add_sizes(REC, live)
-test("add_sizes: 벳 단어에 크기가 붙음", sized["V"]["flop"][0] == {"a": "bet", "size": 0.75}, str(sized["V"]["flop"]))
-test("add_sizes: 원래 to_handread 결과는 그대로", live["V"]["flop"] == ["bet"])
-test("_kind_label: 크기 반영 cbet (0.75 → big)", sr._kind_label(sized["V"], "flop") == "cbet_big",
-     sr._kind_label(sized["V"], "flop"))
-test("_kind_label: 크기 모름 → '_?'", sr._kind_label(live["V"], "flop") == "cbet_?", sr._kind_label(live["V"], "flop"))
+raw = sr.raw_seats(REC)
+test("replay_seats(앱 입력): 벳 단어에 크기가 붙음", live["V"]["flop"][0] == {"a": "bet", "size": 0.75}, str(live["V"]["flop"]))
+test("raw_seats(예전 입력): 크기 없음", raw["V"]["flop"] == ["bet"])
+test("_kind_label: 크기 반영 cbet (0.75 → big)", sr._kind_label(live["V"], "flop") == "cbet_big",
+     sr._kind_label(live["V"], "flop"))
+test("_kind_label: 크기 모름 → '_?'", sr._kind_label(raw["V"], "flop") == "cbet_?", sr._kind_label(raw["V"], "flop"))
 test("truncate: 턴까지만", sr.truncate(live["V"], "turn")["river"] == [] and sr.truncate(live["V"], "turn")["turn"])
 
 # --- 2. 올인 뒤 '체크' 스트리트 ----------------------------------------------------------------------
@@ -67,25 +68,26 @@ test("phantom_streets: 올인 뒤 체크는 실제 선택이 아님", sr.phantom
      str(sr.phantom_streets(JAM)))
 test("phantom_streets: 정상 핸드는 없음", sr.phantom_streets(REC) == set())
 
-# --- 3. 프리플랍 입력 정리 --------------------------------------------------------------------------
+# --- 3. 프리플랍 입력 정리 (handlog.clean_preflop / to_handread — 앱과 같은 경로) ----------------------------------
 pre = [A("W", "post", to=1.0), A("V", "raise", to=1.3), A("V", "raise", to=2.0, rb=1), A("hero", "call", to=2.0, rb=2)]
-cl, nfix = sr.clean_preflop(pre)
+cl, nfix = handlog.clean_preflop(pre)
 test("clean_preflop: 같은 좌석 연속 레이즈 = 한 번", [a["act"] for a in cl].count("raise") == 1 and nfix >= 1)
 test("clean_preflop: 뒤 콜의 raises_before 다시 셈 (2 → 1)", cl[-1]["raises_before"] == 1, str(cl))
 test("clean_preflop: 합친 레이즈 금액은 큰 쪽", cl[1]["to"] == 2.0)
 pre2 = [A("W", "post", to=1.0), A("V", "raise", to=2.0), A("hero", "raise", to=2.1, allin=True, rb=1),
         A("W", "call", to=2.1, rb=2)]
-cl2, _ = sr.clean_preflop(pre2)
+cl2, _ = handlog.clean_preflop(pre2)
 test("clean_preflop: 최소 레이즈 미만 올인은 레이즈로 안 셈", cl2[-1]["raises_before"] == 1, str(cl2[-1]))
 pre3 = [A("W", "post", to=1.0), A("V", "raise", to=12.0, allin=True), A("W", "call", to=12.0, rb=1)]
-cl3, _ = sr.clean_preflop(pre3)
-test("clean_preflop: 올인에 콜 = 올인콜", cl3[-1].get("allin") is True)
-frec, _ = sr.fixed_record(JAM)
-seats_fixed = sr.replay_seats(frec)
-test("fixed: 올인에 콜한 BB → call_jam", seats_fixed["W"]["preflop"][-1] == "call_jam", str(seats_fixed["W"]))
-test("eff_stack: 올인 상대는 올인 금액으로", sr.eff_stack(frec, "V", 100) == 12.0 and sr.eff_stack(frec, "W", 100) == 12.0)
-test("eff_stack: 올인 아닌 상대는 그대로", sr.eff_stack(REC, "V", 100) == 100)
-test("원본 기록은 바뀌지 않음", JAM["actions"]["preflop"][-1].get("allin") is None)
+cl3, _ = handlog.clean_preflop(pre3)
+test("clean_preflop: 올인에 콜 = 올인콜 표시", cl3[-1].get("vs_allin") is True)
+seats_jam = sr.replay_seats(JAM)
+test("replay: 올인에 콜한 BB → call_jam", seats_jam["W"]["preflop"][-1] == "call_jam", str(seats_jam["W"]))
+test("replay: 올인/올인콜 상대 스택 = 올인 금액",
+     seats_jam["V"].get("stack_bb") == 12.0 and seats_jam["W"].get("stack_bb") == 12.0)
+test("replay: 올인 아닌 상대는 스택 없음 (앱이 넘기는 내 스택 사용)", "stack_bb" not in sr.replay_seats(REC)["V"])
+test("raw: 예전 입력은 '콜'", sr.raw_seats(JAM)["W"]["preflop"][-1] == "call")
+test("원본 기록은 바뀌지 않음", "vs_allin" not in JAM["actions"]["preflop"][-1] and pre[2]["act"] == "raise")
 
 # --- 4. 점수 계산 --------------------------------------------------------------------------------
 board = [ev.parse_card(c) for c in ("Ah", "7d", "2s")]
@@ -134,6 +136,14 @@ test("parse_logged: '외 8%' → 표기 92%", p["covered"] == 92.0)
 test("parse_logged: 분류 3개", p["classes"] == {"탑페어+": 40.0, "드로우": 30.0, "노페어": 12.0} and p["board"] is True)
 p2 = sr.parse_logged("BB 블라인드: 예상 상위 87% (22+, A2s+) | 프리플랍 기준: 기타 68% · 브로드웨이 15%")
 test("parse_logged: '외' 없으면 100%, 프리플랍 기준", p2["covered"] == 100.0 and p2["board"] is False)
+p3 = sr.parse_logged("CO 오픈: 예상 상위 12% (TT-55, ATs-A8s, KQs 중 하나일 확률 약 50%) | 보드 기준: 탑페어+ 40%")
+test("parse_logged: 새 표기 '중 하나일 확률 약 50%' → 50%",
+     p3["covered"] == 50.0 and "77" in p3["codes"] and "KQs" in p3["codes"], str(p3))
+test("score_result: 요약 표기 없으면 포함 여부 None", m["sum_in"] is None and m["sum_claim"] is None)
+fake2 = dict(fake, summary_codes=["AKo", "QQ"], summary_pct=75.0, summary_hit_pct=60)
+m2 = sr.score_result(fake2, "AsKd", "AKo", hr.CLASSES_POST.index("탑페어+"), n_live)
+test("score_result: 요약 포함 + 화면 확률(보정) / 모델 확률",
+     m2["sum_in"] is True and m2["sum_claim"] == 0.6 and m2["sum_model"] == 0.75, str(m2))
 
 # --- 6. 끝까지: 합성 폴더로 실행 ---------------------------------------------------------------------
 DEC = {"type": "decision", "id": "s-0001/1", "t": 2.0, "hand_id": "s-0001", "street": "flop", "stack_bb": 100,

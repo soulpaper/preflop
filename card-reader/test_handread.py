@@ -4,6 +4,7 @@ import time
 
 import evaluator as ev
 import handread as hr
+import rangeq as rq
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -46,7 +47,10 @@ test("UTG 오픈+큰 c-bet: 탑페어+ 증가", cl(cb, "탑페어+") + cl(cb, *S
      f"{cl(base, '탑페어+') + cl(base, *STRONG):.0f}% → {cl(cb, '탑페어+') + cl(cb, *STRONG):.0f}%")
 test("UTG 오픈+큰 c-bet: 노페어(에어) 급감", cb["classes"]["노페어"] < base["classes"]["노페어"] * 0.75,
      f"{base['classes']['노페어']}% → {cb['classes']['노페어']}%")
-test("UTG 오픈+큰 c-bet: 중간·약한 페어 급감", cb["classes"]["중간·약한 페어"] < base["classes"]["중간·약한 페어"] * 0.6)
+# 2026-11-05 쇼다운 채점: 벳/레이즈한 상대의 중간·약한 페어가 예측보다 훨씬 많았다(31% vs 13%) → bet_big M 0.18 → 0.35.
+# 그래서 '급감'(x0.6)이 아니라 '줄어듦'(x0.9 미만), 대신 탑페어+ 비중보다는 덜 남는다
+test("UTG 오픈+큰 c-bet: 중간·약한 페어 줄어듦", cb["classes"]["중간·약한 페어"] < base["classes"]["중간·약한 페어"] * 0.9,
+     f"{base['classes']['중간·약한 페어']}% → {cb['classes']['중간·약한 페어']}%")
 test("UTG 오픈+큰 c-bet: 탑페어+ 가 최다 분류", max(cb["classes"], key=cb["classes"].get) == "탑페어+", str(cb["classes"]))
 test("UTG 오픈 summary 표준 표기 (AQo+ 포함, 외 N%)", "AQo" in cb["summary"] and "외" in cb["summary"], cb["summary"])
 
@@ -135,7 +139,8 @@ test("seats 비어 있으면 {}", hr.estimate({}, [], 9) == {} and hr.estimate(N
 p1 = one({"pos": "UTG", "preflop": ["open"]}, [])
 p2 = one({"pos": "BTN", "preflop": ["open"]}, [])
 test("프리플랍 UTG 오픈이 BTN 오픈보다 좁다", p1["width_pct"] < p2["width_pct"], f"{p1['width_pct']} vs {p2['width_pct']}")
-test("프리플랍 3벳: 프리미엄 페어 비중 큼", one({"pos": "BTN", "preflop": ["3bet"]}, [])["classes"]["프리미엄 페어"] > 25)
+# 차트 밖 꼬리(PRE_FLOOR, 최대 PRE_TAIL_MAX)가 생겨 3벳 범위의 프리미엄 비중이 예전(~35%)보다 낮다 → 기준 25 → 20
+test("프리플랍 3벳: 프리미엄 페어 비중 큼", one({"pos": "BTN", "preflop": ["3bet"]}, [])["classes"]["프리미엄 페어"] > 20)
 test("프리플랍 4벳: 프리미엄 페어 비중 > 오픈", one({"pos": "BTN", "preflop": ["4bet"]}, [])["classes"]["프리미엄 페어"] > one({"pos": "BTN", "preflop": ["open"]}, [])["classes"]["프리미엄 페어"] * 3)
 test("프리플랍 summary 표준 표기 (22+, AJs+ 등)", "+" in p1["summary"], p1["summary"])
 test("top_hands <= 5, 확률 내림차순", len(p1["top_hands"]) <= 5 and
@@ -324,6 +329,42 @@ test("to_handread: 체크 넘어온 턴 — 콜러 = probe, 어그레서 = delay
      _h3["B"]["bet_role"] == {"turn": "probe"} and _h4["A"]["bet_role"] == {"turn": "delay"})
 _h5 = _hl.to_handread({"preflop": [_a("A", "call", raises_before=0), _a("B", "check")], "flop": [_a("B", "bet")]}, _pos)
 test("to_handread: 림프 팟(프리플랍 레이저 없음)은 역할 없음", "bet_role" not in _h5["B"])
+
+# --- 2026-11-05 쇼다운 채점 반영: 프리플랍 꼬리 / 올인 스택 / 체크 배율 / 화면 표기 -----------------------------
+_utg = one({"pos": "UTG", "preflop": ["open"]}, [])
+_mass = {}
+for _k, _p in _utg["range"].items():
+    _hi, _lo = hr._cards(_k)
+    _mass[hr._combo_code(_hi, _lo)] = _mass.get(hr._combo_code(_hi, _lo), 0) + _p
+test("프리플랍 꼬리: UTG 오픈에도 169 핸드 모두 확률 > 0 (72o 포함)", len(_mass) == 169 and _mass.get("72o", 0) > 0,
+     f"{len(_mass)} 핸드")
+_tail = sum(p for c, p in _mass.items() if c not in rq.villain_range("open", "UTG", 9, 100))
+test("프리플랍 꼬리: 차트 밖 질량은 PRE_TAIL_MAX 이하, 그래도 10% 이상", 0.10 < _tail <= hr.PRE_TAIL_MAX + 0.02, f"{_tail:.2f}")
+_4b = one({"pos": "CO", "preflop": ["open", "4bet"]}, [])
+_4bm = {}
+for _k, _p in _4b["range"].items():
+    _hi, _lo = hr._cards(_k)
+    _4bm[hr._combo_code(_hi, _lo)] = _4bm.get(hr._combo_code(_hi, _lo), 0) + _p
+_4bt = sum(p for c, p in _4bm.items() if c not in rq.villain_range("4bet", "CO", 9, 100))
+test("좁은 4벳 범위도 꼬리는 PRE_TAIL_MAX 까지만 (아무 패나 4벳으로 보지 않음)", _4bt <= hr.PRE_TAIL_MAX + 0.02, f"{_4bt:.2f}")
+_j100 = one({"pos": "SB", "preflop": ["blind", "jam"]}, [])
+_j12 = hr.estimate({"X": {"pos": "SB", "preflop": ["blind", "jam"], "stack_bb": 12}}, [], 9, stack_bb=100)["X"]
+_j300 = hr.estimate({"X": {"pos": "SB", "preflop": ["blind", "jam"], "stack_bb": 300}}, [], 9, stack_bb=40)["X"]
+_j40 = hr.estimate({"X": {"pos": "SB", "preflop": ["blind", "jam"]}}, [], 9, stack_bb=40)["X"]
+test("올인 범위는 상대의 올인 금액(12BB)으로 — 내 스택(100BB)보다 훨씬 넓다", _j12["width_pct"] > _j100["width_pct"] + 10,
+     f"{_j100['width_pct']} → {_j12['width_pct']}")
+test("올인 금액이 내 스택보다 크면 유효 스택(내 스택)으로", abs(_j300["width_pct"] - _j40["width_pct"]) < 1e-6)
+_xbase = one({"pos": "CO", "preflop": ["open"]}, ["Kd", "8h", "3c"])
+_xchk = one({"pos": "CO", "preflop": ["open"], "flop": ["check"]}, ["Kd", "8h", "3c"])
+test("체크: 탑페어+ 비중이 확실히 줄어듦 (체크한 상대의 탑페어+ 실측 13% vs 예측 25%)",
+     cl(_xchk, "탑페어+") < cl(_xbase, "탑페어+") * 0.75, f"{cl(_xbase, '탑페어+'):.0f}% → {cl(_xchk, '탑페어+'):.0f}%")
+test("요약: 표기한 핸드의 모델 확률과 화면 확률(실측 보정, 5% 단위)",
+     cb["summary_pct"] is not None and cb["summary_hit_pct"] == int(5 * round(cb["summary_pct"] * hr.SUMMARY_CAL / 5))
+     and cb["summary_hit_pct"] < cb["summary_pct"], f"{cb['summary_pct']} / {cb['summary_hit_pct']}")
+_d0 = hr.describe(cb)[0]
+test("describe: '외 N%'(= 나머지 전부 덮는다는 오해) 대신 '중 하나일 확률 약 N%'",
+     "중 하나일 확률 약" in _d0 and " 외 " not in _d0 and f"약 {cb['summary_hit_pct']}%" in _d0, _d0)
+test("요약 코드 집합 = 표기 토큰을 펼친 것", set(cb["summary_codes"]) and all(len(c) in (2, 3) for c in cb["summary_codes"]))
 
 # --- 결과 ---------------------------------------------------------------------------------------
 failed = 0

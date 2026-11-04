@@ -163,7 +163,9 @@ def test_3bet_pot():
     tb.step(bets={"UTG": 6.0}, bubble={"UTG": "call"})
     live = tb.tr.live()                                                     # handread 입력 모양
     assert live["seat_BL"]["preflop"] == ["open", "call_3bet"] and live["seat_TC"]["preflop"] == ["3bet"], live
-    assert live["seat_TC"]["flop"] == ["bet"] and live["seat_BL"]["flop"] == ["call"], live
+    # 포스트플랍 벳/콜에는 기록 금액으로 계산한 팟 대비 크기가 붙는다: 6 into 19.5 (0.5+1+9+9) ≈ 0.31
+    assert [w["a"] for w in live["seat_TC"]["flop"]] == ["bet"] and [w["a"] for w in live["seat_BL"]["flop"]] == ["call"], live
+    assert abs(live["seat_TC"]["flop"][0]["size"] - 6.0 / 19.5) < 0.01, live["seat_TC"]["flop"]
     assert live["hero"]["preflop"] == ["blind", "fold"] and live["seat_TC"]["opener"] == "UTG"
     tb.step(board=["Kc", "Qd", "3s", "9h"], collect=True, bubble={})
     tb.step()
@@ -680,6 +682,120 @@ def test_showdown_watch_gating():
     tb2.step(fold=["UTG", "MP", "CO", "BTN"])
     tb2.step(fold=["SB"])
     assert tb2.tr.showdown_watch() is None                               # 남은 사람 1명
+
+
+# --- to_handread 입력 정리 (2026-11-05 쇼다운 채점에서 찾은 읽기 오류 모양, 가짜 기록) ------------------------------
+def _pa(seat, act, to=None, allin=False):
+    a = {"seat": seat, "act": act}
+    if to is not None:
+        a["to"] = to
+    if allin:
+        a["allin"] = True
+    return a
+
+
+_POS = {"S": "SB", "B": "BB", "U": "UTG", "M": "MP", "C": "CO", "D": "BTN"}
+_BLINDS = [_pa("S", "post", 0.5), _pa("B", "post", 1.0)]
+
+
+def _pre(seats, k):
+    return seats[k]["preflop"]
+
+
+def _rb(acts):
+    """Tracker 처럼 raises_before = 앞의 '레이즈' 기록 수 (정리 전 값)."""
+    n = 0
+    for a in acts["preflop"]:
+        a["raises_before"] = n
+        n += a["act"] == "raise"
+    return acts
+
+
+def test_to_handread_same_raise_read_twice():
+    """오픈 1.3 → 2.0 을 두 번 읽음: 오픈 하나. 뒤 사람의 레이즈는 4벳이 아니라 3벳."""
+    acts = _rb({"preflop": _BLINDS + [_pa("U", "raise", 1.3), _pa("U", "raise", 2.0), _pa("C", "raise", 8.3),
+                                      _pa("D", "call", 8.3)]})
+    out = handlog.to_handread(acts, _POS)
+    assert _pre(out, "U") == ["open"] and _pre(out, "C") == ["3bet"], out
+    assert _pre(out, "D") == ["call_3bet"], out
+    raw = handlog.to_handread(acts, _POS, clean=False)
+    assert _pre(raw, "U") == ["open", "3bet"] and _pre(raw, "C") == ["4bet"], raw     # 예전 입력 (비교)
+    cleaned, fixed = handlog.clean_preflop(acts["preflop"])
+    assert fixed >= 1 and [a["act"] for a in cleaned].count("raise") == 2, cleaned
+
+
+def test_to_handread_allin_reread_and_call_is_call_jam():
+    """올인 114.7 → 115 다시 읽음 = 올인 하나. 그 올인에 콜(콜한 사람은 올인 아님) = 올인콜, 스택 = 올인 금액."""
+    acts = _rb({"preflop": _BLINDS + [_pa("U", "call", 1.0), _pa("C", "raise", 114.7, True), _pa("C", "raise", 115.0, True),
+                                      _pa("B", "call", 115.0)]})
+    out = handlog.to_handread(acts, _POS)
+    assert _pre(out, "C") == ["jam"] and out["C"]["stack_bb"] == 115.0, out["C"]
+    assert _pre(out, "B") == ["blind", "call_jam"] and out["B"]["stack_bb"] == 115.0, out["B"]
+    assert "stack_bb" not in out["U"]
+
+
+def test_to_handread_short_jam_call():
+    """8.5BB 오픈 올인에 BB 콜 → BB 는 올인콜 (예전엔 '오픈 콜'), 두 사람 모두 스택 8.5."""
+    acts = _rb({"preflop": _BLINDS + [_pa("D", "raise", 8.5, True), _pa("B", "call", 8.5)]})
+    out = handlog.to_handread(acts, _POS)
+    assert _pre(out, "D") == ["jam"] and _pre(out, "B") == ["blind", "call_jam"], out
+    assert out["D"]["stack_bb"] == 8.5 and out["B"]["stack_bb"] == 8.5
+    assert _pre(handlog.to_handread(acts, _POS, clean=False), "B") == ["blind", "call"]
+
+
+def test_to_handread_tiny_allin_is_not_a_3bet():
+    """2.0 오픈에 2.1 올인(최소 레이즈 미만): 레이즈로 안 센다 → 뒤 콜은 3벳콜이 아니고, 오프너의 0.1 콜은 새 결정이 아님."""
+    acts = _rb({"preflop": _BLINDS + [_pa("U", "call", 1.0), _pa("C", "raise", 2.0), _pa("S", "raise", 2.1, True),
+                                      _pa("B", "call", 2.1), _pa("U", "call", 2.1), _pa("C", "call", 2.1)]})
+    out = handlog.to_handread(acts, _POS)
+    assert _pre(out, "C") == ["open"], out["C"]                       # 예전: ['open', 'call_3bet']
+    assert _pre(out, "S") == ["blind", "jam"] and out["S"]["stack_bb"] == 2.1, out["S"]
+    assert _pre(out, "B") == ["blind", "call"], out["B"]              # 예전: 3벳콜
+    assert _pre(out, "U") == ["limp", "call"], out["U"]
+    raw = handlog.to_handread(acts, _POS, clean=False)
+    assert _pre(raw, "C") == ["open", "call_3bet"], raw["C"]
+
+
+def test_to_handread_tiny_raise_not_allin_is_a_call():
+    """올인 아닌 2.0 → 2.1 '레이즈' = 콜 금액을 다시 읽은 것."""
+    acts = _rb({"preflop": _BLINDS + [_pa("U", "raise", 2.0), _pa("C", "raise", 2.1), _pa("D", "call", 2.1)]})
+    out = handlog.to_handread(acts, _POS)
+    assert _pre(out, "C") == ["call"] and _pre(out, "D") == ["call"], out
+
+
+def test_to_handread_limp_reread_merged():
+    """림프 0.6 → 1.0 (같은 칩을 두 번 읽음) = 림프 하나."""
+    acts = _rb({"preflop": _BLINDS + [_pa("U", "call", 0.6), _pa("U", "call", 1.0), _pa("B", "check")]})
+    assert _pre(handlog.to_handread(acts, _POS), "U") == ["limp"]
+
+
+def test_to_handread_absurd_sizes():
+    """700 / 1400BB 레이즈(올인 아님) = 잘못 읽은 금액 → 레이즈 순서는 남기고 금액은 버림 (팟·벳 크기를 망치지 않게)."""
+    acts = _rb({"preflop": _BLINDS + [_pa("U", "call", 1.0), _pa("S", "raise", 700.0), _pa("B", "raise", 1400.0),
+                                      _pa("U", "call", 1400.0), _pa("S", "call", 1400.0)],
+                "flop": [_pa("S", "check"), _pa("B", "bet", 4.0), _pa("U", "call", 4.0), _pa("S", "fold")]})
+    cleaned, fixed = handlog.clean_preflop(acts["preflop"])
+    assert fixed >= 3 and all(a.get("to") is None for a in cleaned if a["act"] in ("raise", "call") and a["seat"] != "U"
+                              or a.get("size_bad")), cleaned
+    out = handlog.to_handread(acts, _POS)
+    assert _pre(out, "S") == ["blind", "open", "call_3bet"] and _pre(out, "B") == ["blind", "3bet"], out
+    bet = out["B"]["flop"][0]
+    assert isinstance(bet, dict) and bet["size"] > 0.3, bet           # 2800BB 팟이면 0.001 (작은 벳)로 잘못 나옴
+    assert "stack_bb" not in out["S"] and "stack_bb" not in out["B"]
+
+
+def test_to_handread_postflop_sizes():
+    """포스트플랍 벳/콜/레이즈에 팟 대비 크기: 3BB 오픈·콜(팟 6.5) → 플랍 벳 4.5 = 0.69, 체크레이즈 크기."""
+    acts = _rb({"preflop": _BLINDS + [_pa("C", "raise", 3.0), _pa("S", "fold"), _pa("B", "call", 3.0)],
+                "flop": [_pa("B", "check"), _pa("C", "bet", 4.5), _pa("B", "raise", 15.0), _pa("C", "call", 15.0)]})
+    out = handlog.to_handread(acts, _POS)
+    c, b = out["C"]["flop"], out["B"]["flop"]
+    assert c[0]["a"] == "bet" and abs(c[0]["size"] - 4.5 / 6.5) < 0.01, c
+    assert b[0] == "check" and b[1]["a"] == "checkraise" and abs(b[1]["size"] - 10.5 / 15.5) < 0.01, b
+    assert c[1]["a"] == "call" and abs(c[1]["size"] - b[1]["size"]) < 1e-9
+    assert out["C"]["bet_role"] == {"flop": "cbet"}
+    plain = handlog.to_handread(acts, _POS, sizes=False)
+    assert plain["C"]["flop"] == ["bet", "call"], plain["C"]
 
 
 if __name__ == "__main__":
