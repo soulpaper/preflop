@@ -19,10 +19,10 @@ python reader.py
 ## exe 빌드
 
 ```
-pyinstaller --onefile --windowed --name CardReader --collect-all winrt --hidden-import masterlock --hidden-import masterlock_build --hidden-import names --hidden-import handlog --hidden-import profiles --hidden-import handread --hidden-import rangeq --hidden-import recorder --hidden-import userinfo --hidden-import advisor --hidden-import tablestate --hidden-import solverlib --hidden-import icm --hidden-import eqtable --hidden-import decisionlog --hidden-import gto_update --hidden-import gto_dist_common --add-data "eqtable/preflop_random.json;eqtable" reader.py
+pyinstaller --onefile --windowed --name CardReader --collect-all winrt --hidden-import masterlock --hidden-import masterlock_build --hidden-import names --hidden-import handlog --hidden-import profiles --hidden-import handread --hidden-import rangeq --hidden-import recorder --hidden-import userinfo --hidden-import advisor --hidden-import tablestate --hidden-import solverlib --hidden-import icm --hidden-import eqtable --hidden-import decisionlog --hidden-import showdown --hidden-import gto_update --hidden-import gto_dist_common --add-data "eqtable/preflop_random.json;eqtable" reader.py
 ```
 
-exe 옆에 `templates/`, `font_glyphs/`, `gto_lib/` 를 둔다.
+exe 옆에 `templates/`, `templates_shown/`, `font_glyphs/`, `gto_lib/` 를 둔다.
 
 복기 도구 exe:
 
@@ -151,6 +151,15 @@ CARD_READER_DIR=<card-reader 저장소 폴더>
 경쟁자로만 쓰인다 (그 숫자가 이기면 `?`). exe로 쓸 때는 `font_glyphs/`도 exe 옆에 둔다.
 
 라벨이 틀린 템플릿은 `templates_quarantine/`으로 옮겨 둔다 (예: 7c로 저장됐던 J♣).
+
+### 쇼다운 공개 카드 (`showdown.py`)
+
+쇼다운에서 상대가 보여 준 카드 2장(그 좌석 아바타 위에 작게 뜸)을 읽어 핸드 기록의 `seats[k].shown` /
+`showdown.shown` 에 넣는다 (나중에 상대 예상을 실제 패로 채점). 리버/올인 등 쇼다운일 수 있을 때만
+(`handlog.Tracker.showdown_watch`) 남은 상대 자리만 보고, 좌석마다 확정되면 그 핸드에서는 더 안 읽는다.
+템플릿은 `templates/`(보드 카드) + `templates_shown/`(공개 카드, 기록 화면에서 뽑아 눈으로 확인한 48종).
+`templates_shown/`에 없는 카드는 같은 색 다른 무늬(♣↔♠, ♦↔♥)와 헷갈릴 수 있어 무늬 판별이 따로 확인할 때만 인정한다.
+공개 카드가 아바타를 덮으면 흑백(폴드)처럼 보이므로, 카드를 보여 준 좌석의 그 폴드는 기록에서 되돌린다.
 
 ## 추천 엔진 (`advisor.py`)
 

@@ -65,8 +65,8 @@ class Table:
                 "to_act": False, "preaction": False, "call": None, "can_check": False, "can_raise": False,
                 "street": None, "facing_allin": False, "preflop": None, "notes": []}
 
-    def step(self, bets=None, fold=(), bubble=None, allin=(), board=None, dt=1.0, collect=False):
-        """한 프레임: 바뀐 것만 넣음. collect=True → 바닥 벳이 팟으로 모임 (스트리트 끝)."""
+    def step(self, bets=None, fold=(), bubble=None, allin=(), board=None, dt=1.0, collect=False, shown=None):
+        """한 프레임: 바뀐 것만 넣음. collect=True → 바닥 벳이 팟으로 모임 (스트리트 끝). shown: 쇼다운 공개 카드."""
         if collect:
             self.bets = {}
         for k, v in (bets or {}).items():
@@ -81,7 +81,7 @@ class Table:
             self.board = list(board)
         self.t += dt
         hero = ["back", "back"] if "hero" in self.folded else self.hero
-        recs = self.tr.update(self.snap(), hero, self.board, self.names, self.t)
+        recs = self.tr.update(self.snap(), hero, self.board, self.names, self.t, shown=shown)
         self.out += recs
         return recs
 
@@ -593,6 +593,93 @@ def test_call_amount_reread_is_not_a_new_action():
     # 진짜 새 콜(림프 1 → 레이즈 5 에 콜)은 그대로 두 액션
     utg = [a["act"] for a in rec["actions"]["preflop"] if a["seat"] == "seat_UR"]
     assert utg == ["call", "call"], utg
+
+
+# --- 쇼다운 공개 카드 (showdown.Watcher → Tracker.update(shown=...)) ------------------------------------------
+def _to_river(tb):
+    """UTG(seat_BL) 오픈, BB(hero) 콜, 나머지 폴드 → 리버까지 체크."""
+    tb.step()
+    tb.step(bets={"UTG": 2.5}, bubble={"UTG": "raise"})
+    tb.step(fold=["MP", "CO", "BTN", "SB"])
+    tb.step(bets={"BB": 2.5}, bubble={"BB": "call"})
+    tb.step(board=["8c", "4d", "Jh"], collect=True, bubble={})
+    tb.step(bubble={"BB": "check", "UTG": "check"})
+    tb.step(board=["8c", "4d", "Jh", "3c"], bubble={})
+    tb.step(bubble={"BB": "check", "UTG": "check"})
+    tb.step(board=["8c", "4d", "Jh", "3c", "7s"], bubble={})
+    tb.step(bubble={"BB": "check", "UTG": "check"})
+
+
+def test_shown_cards_in_record():
+    tb = Table(handlog.Tracker("sd1"))
+    _to_river(tb)
+    assert tb.tr.showdown_watch() == (tb.tr.hand.id, ["seat_BL"]), tb.tr.showdown_watch()
+    # 공개 카드가 아바타를 덮어 흑백(폴드)으로 보이는 프레임에 카드도 읽힘 → 폴드 아님
+    tb.step(fold=["UTG"], shown={"seat_BL": ["9c", "7c"]})
+    tb.step(fold=["UTG"], shown={"seat_BL": ["9c", "7c"]})
+    rec = finish(tb)
+    assert rec["seats"]["seat_BL"]["shown"] == ["9c", "7c"], rec["seats"]["seat_BL"]
+    assert rec["seats"]["seat_BL"]["folded"] is None, rec["seats"]["seat_BL"]
+    assert rec["showdown"] is not None and rec["showdown"]["shown"] == {"seat_BL": ["9c", "7c"]}, rec["showdown"]
+    assert set(rec["showdown"]["seats"]) == {"seat_BL", "hero"}, rec["showdown"]
+    assert not any(a["act"] == "fold" for a in rec["actions"].get("river", [])), rec["actions"].get("river")
+    assert st(rec, "seat_BL")["showdown"] == 1 and rec["seats"]["hero"]["shown"] is None
+
+
+def test_shown_late_read_undoes_grey_fold():
+    # 카드가 뜬 첫 프레임은 못 읽어서 흑백 폴드가 기록됨 → 다음 프레임에 읽히면 그 폴드를 되돌림
+    tb = Table(handlog.Tracker("sd2"))
+    _to_river(tb)
+    tb.step(fold=["UTG"])
+    assert tb.tr.hand.seats["seat_BL"].folded
+    assert tb.tr.showdown_watch() == (tb.tr.hand.id, ["seat_BL"]), "이번 스트리트에 흑백이 된 좌석도 본다"
+    tb.step(fold=["UTG"], shown={"seat_BL": ["Ad", "5d"]})
+    rec = finish(tb)
+    assert rec["seats"]["seat_BL"]["folded"] is None and rec["seats"]["seat_BL"]["shown"] == ["Ad", "5d"]
+    assert rec["showdown"] and rec["showdown"]["shown"] == {"seat_BL": ["Ad", "5d"]}
+    assert any("fold undone" in n for n in rec["notes"]), rec["notes"]
+
+
+def test_shown_none_drops_and_bad_values_ignored():
+    tb = Table(handlog.Tracker("sd3"))
+    _to_river(tb)
+    tb.step(shown={"seat_BL": ["9c", "7c"]})
+    tb.step(shown={"seat_BL": None})                                   # Watcher: 다른 값이 읽혀 어긋남 → 지움
+    tb.step(shown={"seat_UL": ["9c", "9c"], "seat_TC": ["Xx", "7c"], "seat_UR": ["9c"]})   # 잘못된 값은 무시
+    rec = finish(tb)
+    assert rec["showdown"]["shown"] == {}, rec["showdown"]
+    assert all(s["shown"] is None for s in rec["seats"].values())
+
+
+def test_shown_on_boundary_frame_goes_to_finished_hand():
+    # 새 핸드로 넘어가는 프레임에 아직 보이는 공개 카드는 끝나는 핸드 것
+    tb = Table(handlog.Tracker("sd4"))
+    _to_river(tb)
+    first = tb.tr.hand.id
+    tb.new_hand("seat_BR", ("2c", "7d"))
+    recs = tb.step(shown={"seat_BL": ["Ks", "Kd"]})      # 이 프레임에서 'folded seats dealt again' 으로 핸드가 끝남
+    assert [r["id"] for r in recs] == [first], recs
+    assert recs[0]["seats"]["seat_BL"]["shown"] == ["Ks", "Kd"], recs[0]["seats"]["seat_BL"]
+    assert tb.tr.hand is not None and not tb.tr.hand.shown
+
+
+def test_showdown_watch_gating():
+    tb = Table(handlog.Tracker("sd5"))
+    assert tb.tr.showdown_watch() is None                                # 핸드 없음
+    tb.step()
+    tb.step(bets={"UTG": 2.5}, bubble={"UTG": "raise"})
+    assert tb.tr.showdown_watch() is None                                # 프리플랍, 올인 없음
+    tb.step(fold=["MP", "CO", "BTN", "SB"])
+    tb.step(bets={"BB": 2.5}, bubble={"BB": "call"})
+    tb.step(board=["8c", "4d", "Jh"], collect=True, bubble={})
+    assert tb.tr.showdown_watch() is None                                # 플랍, 아무도 흑백 아님
+    tb.step(bets={"UTG": 47.5}, allin=["UTG"], bubble={"UTG": "allin"})
+    assert tb.tr.showdown_watch() == (tb.tr.hand.id, ["seat_BL"])       # 올인
+    tb2 = Table(handlog.Tracker("sd6"))
+    tb2.step()
+    tb2.step(fold=["UTG", "MP", "CO", "BTN"])
+    tb2.step(fold=["SB"])
+    assert tb2.tr.showdown_watch() is None                               # 남은 사람 1명
 
 
 if __name__ == "__main__":

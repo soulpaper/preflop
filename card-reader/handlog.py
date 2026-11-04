@@ -3,6 +3,7 @@
     tracker = handlog.Tracker(session="20261029_0102")
     for each frame (~1 s):
         done = tracker.update(state, hero_cards, board, names, t, pot=None, shown=None)
+        # shown: 쇼다운 공개 카드 {seat_key: ['9c', '7c']} (showdown.Watcher). 진행 중 핸드에 넣음, None 이면 그 좌석 값을 지움
         for rec in done: store.observe(rec)          # 끝난 핸드 기록 (dict)
     tracker.flush(t)                                 # 앱 종료 / 다시 보정 때
 
@@ -164,6 +165,26 @@ class Tracker:
             self.last_error = repr(exc)
             return {}
 
+    def showdown_watch(self):
+        """쇼다운 공개 카드를 찾아볼 만한가 → (핸드 id, 남은 상대 좌석 키 목록) / None.
+        리버까지 왔거나 남은 사람 중 올인이 있고, 남은 사람이 2명 이상(상대 1명 이상)일 때만 (평소 프레임은 비용 0).
+        남은 사람 = 폴드 안 함 + 이번 스트리트에 '폴드'로 잡힘 (공개 카드가 아바타를 덮어 흑백으로 보였을 수 있음)."""
+        try:
+            h = self.hand
+            if h is None:
+                return None
+            live = [s for s in h.seats.values() if not s.folded or s.fold_street == h.street]
+            # 포스트플랍에서 이번 스트리트에 흑백이 된 좌석 = 공개 카드일 수 있음 (올인을 못 읽은 턴 올인 쇼다운 등)
+            greyed = h.street > 0 and any(s.folded for s in live)
+            if len(live) < 2 or not (h.street == 3 or h.allin_runout or any(s.allin for s in live) or greyed):
+                return None
+            opps = [s.key for s in live if not s.hero]
+            return (h.id, opps) if opps else None
+        except Exception as exc:
+            self.errors += 1
+            self.last_error = repr(exc)
+            return None
+
     def new_session(self, session=None, t=None):
         """새 보정/새 테이블: 진행 중 핸드를 닫고 세션 id 를 바꿈 (잘린 닉네임 기억은 세션 단위)."""
         out = self.flush(t, "new_session")
@@ -195,6 +216,14 @@ class Tracker:
         dealt = [k for k, s in seats.items() if s.get("dealt")]
 
         h = self.hand
+        if h is not None and shown:
+            # 공개 카드는 화면에 보이는 동안의 핸드 것: 이 프레임에서 새 핸드로 넘어가더라도 끝나는 핸드에 넣는다
+            for k, cards in shown.items():
+                if cards is None:
+                    h.shown.pop(k, None)   # 앞서 읽은 값이 다른 프레임과 어긋남 → 버림 (showdown.Watcher)
+                elif len(cards) == 2 and all(_is_card(c) for c in cards) and cards[0] != cards[1]:
+                    h.shown[k] = list(cards)
+                    self._unfold_shown(h, k)
         if h is not None:
             reason = self._boundary(h, state, seats, hero, board)
             if reason:
@@ -216,10 +245,6 @@ class Tracker:
             h.board = board[:5]
         if _num(pot) is not None:
             h.pot = _num(pot)
-        if shown:
-            for k, cards in shown.items():
-                if cards and all(_is_card(c) for c in cards):
-                    h.shown[k] = list(cards)
         if state.get("dealer"):
             h.dealer[state["dealer"]] += 1
         if state.get("pos_players"):
@@ -389,7 +414,8 @@ class Tracker:
             elif allin and not seat.allin and b is None and new_bubble:
                 h.issue("allin_unread", k)
                 seat.allin = True
-            if s.get("folded") or bubble == "fold":
+            if (s.get("folded") or bubble == "fold") and k not in h.shown:
+                # 공개 카드가 아바타를 덮으면 흑백(폴드)처럼 보인다: 카드를 보여 준 좌석은 폴드가 아님
                 folds.append(k)
             elif new_bubble and bubble == "check":
                 checks.append(k)
@@ -497,6 +523,23 @@ class Tracker:
         self._record(h, k, "fold", None, False, "grey/bubble")
         seat.folded = True
         seat.fold_street = h.street
+
+    def _unfold_shown(self, h, k):
+        """쇼다운에서 카드를 보여 준 좌석의 폴드(흑백/말풍선으로 추정, 그 좌석의 마지막 액션)를 되돌림.
+        공개 카드가 아바타를 덮어 흑백으로 보여서 생긴 가짜 폴드 (카드를 읽기 전 프레임에 기록된 경우)."""
+        seat = h.seats.get(k)
+        if seat is None or not seat.folded or seat.fold_street is None:
+            return
+        name = STREETS[seat.fold_street]
+        if any(a.get("seat") == k for s in STREETS[seat.fold_street + 1:] for a in h.actions[s]):
+            return
+        acts = h.actions[name]
+        mine = [i for i, a in enumerate(acts) if a.get("seat") == k]
+        if mine and acts[mine[-1]].get("act") == "fold" and acts[mine[-1]].get("src") == "grey/bubble":
+            del acts[mine[-1]]
+            seat.folded = False
+            seat.fold_street = None
+            h.notes.append(f"{k}: fold undone (cards shown)")
 
     def _check(self, h, k):
         seat = h.seats[k]

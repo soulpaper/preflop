@@ -507,12 +507,14 @@ def merge_equity(a, b):
 
 
 class Matcher:
-    def __init__(self):
+    def __init__(self, dirs=None):
+        """dirs: 템플릿 폴더들 (기본: templates/). 쇼다운 공개 카드용은 templates/ + templates_shown/ (showdown.py)."""
         TEMPLATE_DIR.mkdir(exist_ok=True)
         self.items = []
         self.glyphs = glyphs.Prototypes()  # 숫자/무늬 원형 (통째로 학습 안 된 카드용)
         self.fast = FastMatcher(norm_size=NORM_SIZE, inset=INSET, corner=CORNER)
-        for f in sorted(TEMPLATE_DIR.glob("*.png")):
+        files = [f for d in (dirs or (TEMPLATE_DIR,)) if Path(d).is_dir() for f in sorted(Path(d).glob("*.png"))]
+        for f in files:
             img = cv2.imread(str(f))
             if img is not None:
                 self.items.append((f.stem.split("_")[0], img))
@@ -1395,6 +1397,7 @@ class App:
         self.popup = None          # 게임 '유저 정보' 팝업 읽기 (userinfo.PopupWatcher)
         self.pending_toast = None  # 상태 스레드 → Tk 스레드 알림
         self.handread = self.rangeq = None
+        self.showdown = self.shown_watch = self.shown_match = None  # 쇼다운 공개 카드 읽기 (showdown.py)
         self.rec_on, self.rec_t0 = False, None   # 기록 모드 (항상 꺼진 채로 시작)
         self.calib_seen = None
         self.cols_used = 0
@@ -2297,6 +2300,8 @@ class App:
                         self.declog.link_hand(rec)
                 self.tracker = handlog_m.Tracker(on_hand=on_hand)
                 self.store.new_session(self.tracker.session)
+                self.showdown = _optional("showdown")
+                self.shown_watch = self.showdown.Watcher() if self.showdown else None
             rec_m = _optional("recorder")
             self.recorder = rec_m.Recorder(BASE / "recordings") if rec_m else None
             ui_m = _optional("userinfo")
@@ -2371,7 +2376,8 @@ class App:
         if self.tracker is None or not isinstance(st, dict) or "seats" not in st:
             return
         names = self.name_reader.read(img, calib, st) if self.name_reader else {}
-        if self.tracker.update(st, hero, board, names, now):
+        shown = self.read_shown(img, calib, st, hero, board)
+        if self.tracker.update(st, hero, board, names, now, shown=shown):
             self.hands_done += 1   # 핸드가 끝남 → 카드 잠금을 푸는 새 핸드 신호
         profiles = self.store.get_for_table(names, session=self.tracker.session,
                                             tab=self.cfg.get("game_tab")) if self.store else {}
@@ -2388,6 +2394,25 @@ class App:
         except Exception:
             self.log_once("summarize_hand")
         self.track = {"names": names, "profiles": profiles, "live": live, "reads": reads, "t": now, "hist": hist}
+
+    def read_shown(self, img, calib, st, hero, board):
+        """쇼다운 공개 카드 {seat_key: ['9c', '7c'] 또는 None} → 핸드 기록 (상대 예상 채점용). 쇼다운일 수 있을 때만
+        (리버/올인 등, Tracker.showdown_watch) 남은 상대 좌석 자리만 보고, 좌석마다 확정되면 그 핸드에서는 더 안 읽는다."""
+        if self.shown_watch is None or st.get("layout_ok") is False:
+            return None
+        try:
+            watch = self.tracker.showdown_watch()
+            if not watch:
+                return None
+            if self.shown_match is None:  # 처음 쓸 때 한 번 (공개 카드 템플릿 + 보드 템플릿, 화면 인식용 matcher 와 따로)
+                folder = BASE / self.showdown.SHOWN_DIR
+                self.shown_match = self.showdown.ShownMatch(Matcher(dirs=(TEMPLATE_DIR, folder)), self.cfg.get("threshold", 0.95),
+                                                            self.showdown.shown_labels(folder))
+            self.shown_match.threshold = self.cfg.get("threshold", 0.95)
+            return self.shown_watch.update(watch[0], img, calib, watch[1], self.shown_match, exclude=hero + board)
+        except Exception:
+            self.log_once("read_shown")
+            return None
 
     def refresh_reads(self, reads, st, hero, board, live, profiles):
         """남은 상대가 바뀌었거나 새 액션이 있으면 상대 예상을 다시 계산 (아니면 그대로)."""
