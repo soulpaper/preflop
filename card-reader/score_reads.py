@@ -12,6 +12,8 @@
             올인콜·말이 안 되는 금액) + 올인/올인콜 상대는 실제 올인 금액을 스택으로 + 기록 금액으로 계산한 벳 크기(팟 대비))
     raw     예전 입력 (정리·크기·올인 스택 없음, 모든 벳/콜이 '보통 크기') — 지금 모델에서 입력 정리의 몫을 본다
     pre     프리플랍 액션만 반영 (포스트플랍 배율표가 도움이 되는지 보는 기준선)
+    notype  live 에서 상대 유형(LAG/LP/TAG/TP) 보정만 뺀 것 — handread.STYLE_ADJ 가 도움이 되는지 본다
+            (유형: 핸드 기록 seats[k].type > 결정 기록 프로필의 style. 둘 다 없으면 live 와 같다)
     uniform 남은 카드에서 무작위 (완전 무지 기준선)
   점수
     콤보 로그손실   -ln p(실제 콤보) (p 는 1% 를 균등과 섞어 0 방지). uniform 대비 '정보 이득(bit)' = 얼마나 좁혀 맞췄나
@@ -47,7 +49,7 @@ STREETS = ("preflop", "flop", "turn", "river")
 STREET_KO = {"preflop": "프리플랍", "flop": "플랍", "turn": "턴", "river": "리버"}
 NEED = {"preflop": 0, "flop": 3, "turn": 4, "river": 5}
 EPS = 0.01                     # 범위 확률을 균등과 섞는 비율 (0 확률 → 무한 로그손실 방지)
-VARIANTS = ("live", "raw", "pre", "uniform")
+VARIANTS = ("live", "raw", "pre", "notype", "uniform")
 POST_WORDS = ("check", "bet", "call", "raise", "fold")
 FAMILY = {"check": "체크", "call": "콜", "aggr": "벳/레이즈"}
 OUT_NAME = "read_scores.json"
@@ -257,6 +259,22 @@ def profile_type(p):
     return tag + style
 
 
+def seat_type(rec_seat, prof):
+    """상대 유형 키(LAG/LP/TAG/TP) 또는 None: 핸드 기록 seats[k].type (예전 기록엔 없음) > 결정 기록 프로필의 style."""
+    t = hr._style_key((rec_seat or {}).get("type"))
+    if t:
+        return t
+    return hr._style_key(prof.get("style")) if isinstance(prof, dict) else None
+
+
+def _with_style(prof, style):
+    """프로필 사본에 유형을 넣거나(style) 빼서(None) estimate 의 profiles 인자로."""
+    p = {k: v for k, v in (prof or {}).items() if k != "style"}
+    if style:
+        p["style"] = style
+    return p or None
+
+
 # --- 결정 기록 (사용자가 본 리딩) --------------------------------------------------------------
 _CLS_RE = re.compile(r"^(.*\S)\s+(\d+(?:\.\d+)?)%$")
 
@@ -439,7 +457,10 @@ def score_hands(hands, decs, ok_only=False):
             code = hr._combo_code(hi, lo)
             prof = profiles.get(k)
             ptype = profile_type(prof)
-            prof_arg = {k: prof} if prof else None
+            styp = seat_type(seats_rec.get(k), prof)
+            p_live, p_notype = _with_style(prof, styp), _with_style(prof, None)
+            prof_arg = {k: p_live} if p_live else None
+            prof_notype = {k: p_notype} if p_notype else None
             for st in STREETS:
                 n = NEED[st]
                 if st != "preflop":
@@ -459,13 +480,19 @@ def score_hands(hands, decs, ok_only=False):
                                        ("pre", pre_only(live_seats[k]), stack)):
                     ests[var] = hr.estimate({k: seat}, b, players, dead=dead, profiles=prof_arg, stack_bb=stk,
                                             ante=ante)[k]
+                if styp:
+                    ests["notype"] = hr.estimate({k: truncate(live_seats[k], st)}, b, players, dead=dead,
+                                                 profiles=prof_notype, stack_bb=stack, ante=ante)[k]
+                else:
+                    ests["notype"] = ests["live"]
                 kind = _kind_label(live_seats[k], st)
                 row = OrderedDict(hand=rec.get("id"), seat=k, street=st, actual=code, actual_class=names[y],
                                   kind=kind, kind_raw=_kind_label(raw[k], st),
-                                  family=_family(kind), profile=ptype, conf=rec.get("confidence"),
+                                  family=_family(kind), profile=ptype, type=styp or "없음",
+                                  conf=rec.get("confidence"),
                                   label=ests["live"].get("label"), label_raw=ests["raw"].get("label"),
                                   stack=stack, stack_jam=live_seats[k].get("stack_bb"), input_fixes=nfix)
-                for var in ("live", "raw", "pre"):
+                for var in ("live", "raw", "pre", "notype"):
                     row[var] = score_result(ests[var], key, code, y, n_live)
                 row["uniform"] = score_uniform(b, dead, y, n_live)
                 row["class_names"] = names
@@ -513,7 +540,7 @@ def agg(rows):
         }
     if rows:
         u = out["uniform"]["ll"]
-        for var in ("live", "raw", "pre"):
+        for var in ("live", "raw", "pre", "notype"):
             out[var]["bits_vs_uniform"] = (u - out[var]["ll"]) / math.log(2)
     return out
 
@@ -557,6 +584,14 @@ def summarize(rows, lrows, skipped):
     s["by_preflop_action_raw"] = OrderedDict((k, agg(v)) for k, v in sorted(
         group([r for r in rows if r["street"] == "preflop"], lambda r: r["kind_raw"]).items()))
     s["by_profile"] = OrderedDict((k, agg(v)) for k, v in sorted(group(rows, lambda r: r["profile"]).items()))
+    # 상대 유형별 (팝업 LAG/LP/TAG/TP): live vs notype(유형 보정 없음) — STYLE_ADJ 를 데이터로 다시 맞출 때 본다
+    typed = [r for r in post if r.get("type", "없음") != "없음"]
+    s["by_type"] = OrderedDict((k, agg(v)) for k, v in sorted(group(rows, lambda r: r.get("type", "없음")).items()))
+    s["by_type_family"] = OrderedDict(
+        (f"{t}/{fam}", agg(v)) for (t, fam), v in sorted(group(typed, lambda r: (r["type"], r["family"])).items()))
+    s["calibration_by_type_family"] = OrderedDict(
+        (k, {"n": len(v), "classes": calibration(v), "classes_notype": calibration(v, "notype")})
+        for k, v in sorted(group(typed, lambda r: f"{r['type']}/{r['family']}").items()))
     s["by_confidence"] = OrderedDict((k, agg(v)) for k, v in sorted(group(rows, lambda r: r["conf"]).items()))
     s["calibration_by_family"] = OrderedDict(
         (f"{st}/{fam}", {"n": len(v), "classes": calibration(v)})
@@ -597,6 +632,13 @@ def _line(name, a):
             f" 모델 {_pct(lv.get('sum_model'))})")
 
 
+def _type_line(name, a):
+    lv, nt = a["live"], a["notype"]
+    return (f"  {name:<16} n={a['n']:>3} | 정보이득 live {_f(lv.get('bits_vs_uniform'), 2)}bit"
+            f" (notype {_f(nt.get('bits_vs_uniform'), 2)}) | 실제분류 확률 {_pct(lv['cls_p'], 1)}"
+            f" (notype {_pct(nt['cls_p'], 1)}) | Brier {_f(lv['brier'], 3)}/{_f(nt['brier'], 3)} | PIT {_f(lv['pit'])}")
+
+
 def report(s, out=None):
     w = (out or sys.stdout).write
     w(f"== 상대 리딩 채점: 공개된 상대 {s['n_seats']}명, 채점 지점 {s['n_rows']}개 ==\n")
@@ -620,6 +662,14 @@ def report(s, out=None):
     w("\n[프로필별]\n")
     for k, a in s["by_profile"].items():
         w(_line(k, a) + "\n")
+    if any(k != "없음" for k in s.get("by_type") or {}):
+        w("\n[상대 유형별 (유저 정보 팝업) — live vs 유형 보정 없음(notype)]\n")
+        for k, a in list(s["by_type"].items()) + list(s["by_type_family"].items()):
+            w(_type_line(k, a) + "\n")
+        for k, c in s["calibration_by_type_family"].items():
+            parts = [f"{n} {_pct(v['pred'])}/{_pct(c['classes_notype'][n]['pred'])}→{_pct(v['actual'])}"
+                     for n, v in c["classes"].items() if v["pred"] >= 0.03 or v["actual"] > 0]
+            w(f"  보정 {k} (n={c['n']}, 예측 live/notype→실제): " + " · ".join(parts) + "\n")
     w("\n[기록 신뢰도별]\n")
     for k, a in s["by_confidence"].items():
         w(_line(str(k), a) + "\n")

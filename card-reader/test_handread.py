@@ -366,6 +366,73 @@ test("describe: '외 N%'(= 나머지 전부 덮는다는 오해) 대신 '중 하
      "중 하나일 확률 약" in _d0 and " 외 " not in _d0 and f"약 {cb['summary_hit_pct']}%" in _d0, _d0)
 test("요약 코드 집합 = 표기 토큰을 펼친 것", set(cb["summary_codes"]) and all(len(c) in (2, 3) for c in cb["summary_codes"]))
 
+# --- 상대 유형(유저 정보 팝업 LAG/LP/TAG/TP) 포스트플랍 보정 -------------------------------------------------
+NP, MP, TP_ = "노페어", "중간·약한 페어", "탑페어+"
+_STY_BET = {"pos": "CO", "preflop": ["open"], "flop": [{"a": "bet", "size": 0.66}]}
+_STY_CALL = {"pos": "BTN", "preflop": ["call"], "opener": "CO", "flop": [{"a": "call", "size": 0.5}]}
+_STY_XR = {"pos": "BB", "preflop": ["call"], "flop": ["checkraise"]}
+_STY_CHK = {"pos": "BB", "preflop": ["call"], "flop": ["check"]}
+
+
+def sty(seat, style, board=BOARD_AR, **prof):
+    s = dict(seat)
+    if style is not None or prof:
+        s["profile"] = dict(prof, style=style)
+    return hr.estimate({"V": s}, board, 6)["V"]
+
+
+_b = {t: sty(_STY_BET, t) for t in (None, "LP", "TP", "LAG", "TAG")}
+_c = {t: sty(_STY_CALL, t) for t in (None, "LP", "TP", "LAG", "TAG")}
+_x = {t: sty(_STY_XR, t, ["Ks", "8d", "4c"]) for t in (None, "LP", "LAG")}
+_k = {t: sty(_STY_CHK, t, ["Ks", "8d", "4c"]) for t in (None, "LP", "TP", "LAG")}
+_fmt = lambda d, n: " / ".join(f"{t}:{r['classes'][n]}" for t, r in d.items())
+test("유형: LP 벳은 LAG 벳보다 에어(노페어)가 적다", cl(_b["LP"], NP) < cl(_b["LAG"], NP) - 10, _fmt(_b, NP))
+test("유형: LP·TP 벳은 기본보다 에어 적고 탑페어+ 많음, LAG 벳은 에어 많음",
+     cl(_b["LP"], NP) < cl(_b[None], NP) and cl(_b["TP"], NP) < cl(_b[None], NP) < cl(_b["LAG"], NP)
+     and cl(_b["LP"], TP_) > cl(_b[None], TP_) > cl(_b["LAG"], TP_), _fmt(_b, TP_))
+test("유형: LP 콜은 TP 콜보다 중간·약한 페어와 에어가 많다",
+     cl(_c["LP"], MP) > cl(_c["TP"], MP) + 3 and cl(_c["LP"], NP) > cl(_c["TP"], NP), _fmt(_c, MP))
+test("유형: TP 콜은 기본보다 탑페어+ 이상이 많다 (약한 패는 폴드)",
+     cl(_c["TP"], TP_, *STRONG) > cl(_c[None], TP_, *STRONG) + 3, _fmt(_c, TP_))
+test("유형: LAG 콜은 기본보다 조금 넓다 (약한 패 비중 증가, 크지 않게)",
+     0 < cl(_c["LAG"], MP, NP) - cl(_c[None], MP, NP) < 10, _fmt(_c, MP))
+test("유형: LP 체크레이즈는 셋 이상이 많고, LAG 체크레이즈는 에어가 많다",
+     cl(_x["LP"], *STRONG) > cl(_x[None], *STRONG) > cl(_x["LAG"], *STRONG) and cl(_x["LAG"], NP) > cl(_x["LP"], NP),
+     _fmt(_x, "셋/트립스"))
+test("유형: TP·LAG 체크는 기본보다 약하고, LP 체크엔 강한 패가 더 남는다",
+     cl(_k["TP"], TP_, *STRONG) < cl(_k[None], TP_, *STRONG) < cl(_k["LP"], TP_, *STRONG)
+     and cl(_k["LAG"], TP_, *STRONG) < cl(_k[None], TP_, *STRONG), _fmt(_k, TP_))
+test("유형: TAG 는 벳·콜에서 기본과 같고, 레이즈만 조금 강함",
+     _b["TAG"]["classes"] == _b[None]["classes"] and _c["TAG"]["classes"] == _c[None]["classes"]
+     and cl(sty(_STY_XR, "TAG", ["Ks", "8d", "4c"]), *STRONG) > cl(_x[None], *STRONG))
+test("유형: 보정 크기는 완만 (벳 탑페어+ 차이 10%p 이내, 콜 중간 페어 차이 10%p 이내)",
+     all(abs(cl(_b[t], TP_) - cl(_b[None], TP_)) < 10 for t in _b)
+     and all(abs(cl(_c[t], MP) - cl(_c[None], MP)) < 10 for t in _c))
+test("유형 설명이 note 와 style_note 에 붙음 ('루즈-패시브: 콜이 넓음')",
+     _c["LP"]["style_note"].startswith("루즈-패시브: 콜이 넓음") and _c["LP"]["note"].endswith(_c["LP"]["style_note"])
+     and _c["LP"]["style"] == "LP", _c["LP"]["note"])
+test("유형 이름 변형 ('lp', '루즈-패시브', 좌석 type 필드)도 같은 결과",
+     sty(_STY_CALL, "lp")["classes"] == sty(_STY_CALL, "루즈-패시브")["classes"] == _c["LP"]["classes"]
+     == hr.estimate({"V": dict(_STY_CALL, type="LP")}, BOARD_AR, 6)["V"]["classes"])
+# 유형 없음 = 예전 코드와 완전히 같은 출력 (b538c3d 기준으로 잰 값 고정 + 없음/None/모르는 값이 서로 같음)
+_none = [sty(_STY_CALL, None), sty(_STY_CALL, ""), sty(_STY_CALL, "XYZ"), hr.estimate({"V": _STY_CALL}, BOARD_AR, 6)["V"]]
+test("유형 없음/빈 값/모르는 값 → 출력 동일, style 키 없음",
+     all(r == _none[0] for r in _none) and "style" not in _none[0] and "style_note" not in _none[0])
+test("유형 없음 → b538c3d 와 같은 값 (BTN 콜→플랍 콜, A72: 탑페어+ 31.6 / 중간·약한 페어 47.5 / 노페어 13.7)",
+     (_none[0]["classes"][TP_], _none[0]["classes"][MP], _none[0]["classes"][NP]) == (31.6, 47.5, 13.7),
+     str(_none[0]["classes"]))
+_pre_lp = sty({"pos": "CO", "preflop": ["open"]}, "LP", [])
+_pre_no = sty({"pos": "CO", "preflop": ["open"]}, None, [])
+test("유형은 프리플랍 폭에 영향 없음 (VPIP/PFR 만 프리플랍에 — 이중 반영 방지)",
+     _pre_lp["range"] == _pre_no["range"] and "style_note" not in _pre_lp)
+# 직접 본 포스트플랍 통계(fold_to_bet/AF)가 있으면 유형 보정은 그 가중치만큼 약해진다
+_obs = dict(hands=150, vpip=45, pfr=8, fold_to_bet=45, af=2.0, reliable=True)   # 중립 통계 → 프로필 보정 0
+_c_obs_lp = sty(_STY_CALL, "LP", **_obs)
+_c_obs_no = sty(_STY_CALL, None, **_obs)
+test("직접 관측 통계가 많으면 유형 보정이 약해진다 (150핸드 → 세기 25%)",
+     0 < cl(_c_obs_lp, MP) - cl(_c_obs_no, MP) < (cl(_c["LP"], MP) - cl(_c[None], MP)) * 0.5,
+     f"{cl(_c_obs_no, MP)} → {cl(_c_obs_lp, MP)}")
+
 # --- 결과 ---------------------------------------------------------------------------------------
 failed = 0
 for ok, name, info in results:

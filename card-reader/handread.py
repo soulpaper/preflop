@@ -45,6 +45,8 @@
   프로필(신뢰될 때만, 가중치 = hands/(hands+50)):
     fold_to_bet 높음 → 계속하는 레인지가 더 강함 / 낮음(콜링스테이션) → 약한 패가 더 남음
     AF 높음 → 벳 레인지에 블러프 증가, 낮음 → 벳이 강함 (콜/체크에서는 반대로 최강 패 비중 조정)
+  상대 유형(profile["style"] 또는 좌석 "type": LAG/LP/TAG/TP, 유저 정보 팝업): 포스트플랍 액션 배율에만 STYLE_ADJ 를 곱한다
+    (프리플랍 폭은 VPIP/PFR 로 이미 반영). 결과에 style / style_note("루즈-패시브: 콜이 넓음 …")가 붙고 note 끝에도 붙는다.
   상대 간 카드 제거 효과는 무시하고 상대마다 독립 추정한다.
 """
 import math
@@ -107,7 +109,50 @@ def _build_role_rows():
 
 
 _build_role_rows()
-_AGGR = ("bet_small", "bet_med", "bet_big", "raise", "checkraise", "allin") + tuple(
+
+# --- 상대 유형(게임 유저 정보 팝업의 스타일)별 포스트플랍 보정 ------------------------------------------
+#   유형은 사이트가 VPIP/PFR 로 매긴 것이라, 프리플랍 폭은 지금처럼 VPIP/PFR(rangeq)만 쓰고 이 표는 포스트플랍 액션 배율에만
+#   곱한다 (이중 반영 방지). 액션 묶음(bet = 모든 벳·cbet/lead/delay/probe, raise = 레이즈·올인, checkraise, call, check)마다
+#   ([N, W, T, M, A] 배율, 드로우 배율, 한 줄 설명). 표에 없는 묶음은 보정 없음. 유형이 없거나 모르는 값이면 예전과 똑같다.
+#   쇼다운 데이터가 아직 없어 크기는 보수적으로(대부분 0.85~1.25, 에어만 0.4~1.8) 잡았다 — score_reads 의 '유형별' 칸
+#   (live vs 유형 없음 notype, 유형/액션별 분류 보정)으로 다시 맞춘다.
+#   우리가 직접 본 포스트플랍 통계(fold_to_bet / AF)가 있으면 그쪽이 더 직접적이므로 이 표의 세기를 (1 - 프로필 가중치)로 줄인다
+#   (배율 ** 세기) — 같은 성향을 두 번 곱하지 않게.
+STYLE_ADJ = {
+    # 루즈-패시브(콜링 스테이션): 콜이 아주 넓고(약한 페어·드로우·에어), 먼저 벳/레이즈하면 밸류 위주, 체크에도 강한 패가 숨어 있음
+    "LP": {
+        "bet":        ([1.10, 1.05, 1.05, 0.90, 0.55], 0.85, "벳은 밸류 위주 (블러프 적음)"),
+        "raise":      ([1.20, 1.05, 0.85, 0.75, 0.45], 0.75, "레이즈는 아주 강한 패 위주"),
+        "checkraise": ([1.25, 1.05, 0.80, 0.70, 0.40], 0.70, "체크레이즈는 넛급 위주"),
+        "call":       ([0.95, 1.00, 1.00, 1.40, 1.50], 1.20, "콜이 넓음 (약한 페어·드로우·에어도 콜)"),
+        "check":      ([1.15, 1.10, 1.10, 1.00, 1.00], 1.00, "수동적 → 체크에도 강한 패가 섞임"),
+    },
+    # 타이트-패시브(닛): 콜도 벳도 강한 쪽, 블러프가 거의 없음, 체크는 약한 패 위주
+    "TP": {
+        "bet":        ([1.10, 1.05, 1.05, 0.85, 0.55], 0.80, "벳은 강한 패 위주 (블러프 적음)"),
+        "raise":      ([1.20, 1.05, 0.85, 0.70, 0.45], 0.70, "레이즈는 아주 강한 패 위주"),
+        "checkraise": ([1.25, 1.05, 0.80, 0.65, 0.40], 0.65, "체크레이즈는 넛급 위주"),
+        "call":       ([1.05, 1.05, 1.10, 0.85, 0.60], 0.85, "콜도 강한 편 (약한 패는 폴드)"),
+        "check":      ([0.85, 0.90, 0.90, 1.00, 1.00], 1.00, "체크는 약한 패 위주"),
+    },
+    # 루즈-어그레시브: 벳·레이즈에 에어와 드로우(블러프·세미블러프)가 많고, 콜도 조금 넓다. 강한 패는 대개 벳 → 체크는 약함
+    "LAG": {
+        "bet":        ([0.95, 0.95, 0.95, 1.10, 1.60], 1.20, "벳에 블러프·드로우가 많음"),
+        "raise":      ([0.95, 0.95, 1.00, 1.15, 1.60], 1.25, "레이즈에 블러프·세미블러프가 섞임"),
+        "checkraise": ([0.95, 0.95, 1.00, 1.10, 1.50], 1.25, "체크레이즈에 세미블러프가 많음"),
+        "call":       ([1.00, 1.00, 1.00, 1.15, 1.25], 1.10, "콜이 조금 넓음"),
+        "check":      ([0.85, 0.90, 0.95, 1.00, 1.00], 1.00, "강한 패는 대개 벳 → 체크는 약한 편"),
+    },
+    # 타이트-어그레시브: 기본 모델이 이 유형에 가깝다 — 레이즈만 조금 더 강하게
+    "TAG": {
+        "raise":      ([1.05, 1.05, 0.95, 0.90, 0.85], 0.95, "레이즈는 조금 더 강함"),
+        "checkraise": ([1.05, 1.05, 0.95, 0.90, 0.85], 0.95, "체크레이즈는 조금 더 강함"),
+    },
+}
+STYLE_KO = {"LAG": "루즈-어그레시브", "LP": "루즈-패시브", "TAG": "타이트-어그레시브", "TP": "타이트-패시브"}  # = userinfo.STYLES
+_STYLE_ALIAS = {**{v: k for k, v in STYLE_KO.items()}, **{v.replace("-", ""): k for k, v in STYLE_KO.items()}}
+
+_AGGR =("bet_small", "bet_med", "bet_big", "raise", "checkraise", "allin") + tuple(
     f"{r}_{s}" for r in ROLE_ADJ for s in ("small", "med", "big"))
 _CALL = ("call_small", "call_med", "call_big")
 SMALL_BET, BIG_BET, DEFAULT_SIZE = 0.40, 0.75, 0.55
@@ -476,7 +521,64 @@ def _profile_factors(profile):
     return adj_f, afx
 
 
-def _kind_mults(kind, adj_f, afx):
+def _style_key(v):
+    """'LP' / 'lp' / '루즈-패시브' → 'LP'. 모르는 값·없음 → None."""
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    k = s.upper()
+    if k in STYLE_ADJ:
+        return k
+    return _STYLE_ALIAS.get(s) or _STYLE_ALIAS.get(s.replace(" ", ""))
+
+
+def _seat_style(seat, prof):
+    """좌석의 상대 유형: profile["style"] (팝업) > 좌석 profile["style"] > 좌석 "type"/"style" (핸드 기록 필드)."""
+    for src in (prof, seat.get("profile")):
+        if isinstance(src, dict):
+            k = _style_key(src.get("style"))
+            if k:
+                return k
+    return _style_key(seat.get("type")) or _style_key(seat.get("style"))
+
+
+def _style_strength(prof):
+    """유형 보정의 세기 0~1. 우리가 본 포스트플랍 통계(fold_to_bet/AF)가 신뢰되면 그 가중치만큼 줄인다 (이중 반영 방지)."""
+    if not prof or not rq.profile_reliable(prof):
+        return 1.0
+    if _num(prof.get("fold_to_bet")) is None and _num(prof.get("af")) is None:
+        return 1.0
+    return 1.0 - rq.profile_weight(prof)
+
+
+def _style_group(kind):
+    if kind == "checkraise":
+        return "checkraise"
+    if kind in ("raise", "allin"):
+        return "raise"
+    if kind in _AGGR:
+        return "bet"
+    if kind in _CALL:
+        return "call"
+    return kind
+
+
+def _style_row(kind, style):
+    """(유형, 액션) → STYLE_ADJ 의 (배율, 드로우, 설명) 또는 None."""
+    return (STYLE_ADJ.get(style) or {}).get(_style_group(kind)) if style else None
+
+
+def _kind_mults(kind, adj_f, afx, style=None, strength=1.0):
+    m, d = _kind_mults_base(kind, adj_f, afx)
+    row = _style_row(kind, style)
+    if row and strength > 0:
+        sm, sd, _ = row
+        m = [x * y ** strength for x, y in zip(m, sm)]
+        d = min(1.5, d * sd ** strength)
+    return m, d
+
+
+def _kind_mults_base(kind, adj_f, afx):
     base, draw = MULT[kind]
     m = list(base)
     d = draw
@@ -500,8 +602,8 @@ def _kind_mults(kind, adj_f, afx):
     return m, d
 
 
-def _apply_kind(weights, bi, kind, adj_f, afx, combos, prev_bi=None):
-    m, d = _kind_mults(kind, adj_f, afx)
+def _apply_kind(weights, bi, kind, adj_f, afx, combos, prev_bi=None, style=None, strength=1.0):
+    m, d = _kind_mults(kind, adj_f, afx, style, strength)
     cls = _classify
     boost = IMPROVE.get(kind.split("_")[0], 1.0) if prev_bi is not None else 1.0
     for i, key in enumerate(combos):
@@ -637,6 +739,8 @@ def _estimate_one(seat, board, players, dead, profile, stack_bb, ante=False):
     pre_width = _eff_width(weights)
 
     adj_f, afx = _profile_factors(prof)
+    style = _seat_style(seat, prof)
+    s_str = _style_strength(prof) if style else 0.0
     nb = len(board)
     last_kind = last_street = None
     n_actions = 0
@@ -651,7 +755,7 @@ def _estimate_one(seat, board, players, dead, profile, stack_bb, ante=False):
         bi = _board_info(board[:need])
         prev_bi = _board_info(board[:need - 1]) if need > 3 else None
         for kind, _ in kinds:
-            _apply_kind(weights, bi, kind, adj_f, afx, combos, prev_bi)
+            _apply_kind(weights, bi, kind, adj_f, afx, combos, prev_bi, style, s_str)
             last_kind, last_street = kind, ko
             n_actions += 1
         if sum(weights) <= 0:
@@ -720,6 +824,12 @@ def _estimate_one(seat, board, players, dead, profile, stack_bb, ante=False):
         "n_actions": n_actions,
     }
     out["note"] = _note(out, last_kind, last_street, recognized, skipped, bool(adj_f or afx))
+    if style:   # 유형이 없으면 결과는 예전과 완전히 같다 (키도 추가하지 않음)
+        out["style"] = style
+        row = _style_row(last_kind, style) if last_kind and s_str > 0 else None
+        if row and row[2]:
+            out["style_note"] = f"{STYLE_KO[style]}: {row[2]}"
+            out["note"] += f" · {out['style_note']}"
     return out
 
 

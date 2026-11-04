@@ -196,6 +196,41 @@ with tempfile.TemporaryDirectory() as d:
         sr.main([d, "--ok-only", "--quiet", "--json", out])
     test("main --ok-only --quiet: 출력 없음", buf2.getvalue() == "")
 
+# --- 7. 상대 유형(seats[k].type: LAG/LP/TAG/TP)별 채점 --------------------------------------------------------
+TYP = hand("t-0001", REC["actions"], ["Ah", "7d", "2s", "Kc", "9h"], {"V": ["Qs", "Qd"]}, folded={"hero": "preflop"})
+TYP["seats"]["V"]["type"] = "LP"
+OLD = hand("t-0002", REC["actions"], ["Ah", "7d", "2s", "Kc", "9h"], {"V": ["Js", "Jd"]}, folded={"hero": "preflop"})
+DEC_T = {"type": "decision", "id": "t-0002/1", "t": 3.0, "hand_id": "t-0002", "street": "flop", "stack_bb": 100,
+         "ante": 0, "seats": {"V": {"profile": {"vpip": 25, "pfr": 20, "hands": 12, "style": "LAG"}}}}
+OLD2 = hand("t-0003", REC["actions"], ["Ah", "7d", "2s", "Kc", "9h"], {"V": ["Ts", "Td"]}, folded={"hero": "preflop"})
+rows_t, _, _ = sr.score_hands([TYP, OLD, OLD2], [DEC_T])
+by = {(r["hand"], r["street"]): r for r in rows_t}
+test("유형: 핸드 기록 seats[k].type → 행의 type", by[("t-0001", "flop")]["type"] == "LP")
+test("유형: 기록에 없으면 결정 기록 프로필의 style", by[("t-0002", "flop")]["type"] == "LAG")
+test("유형: 둘 다 없으면 '없음' (예전 기록)", by[("t-0003", "flop")]["type"] == "없음")
+test("유형: live 는 유형 보정, notype 은 보정 없음 (포스트플랍에서 다름)",
+     by[("t-0001", "flop")]["live"]["p"] != by[("t-0001", "flop")]["notype"]["p"])
+test("유형: 프리플랍은 유형 영향 없음 (live = notype)",
+     by[("t-0001", "preflop")]["live"]["p"] == by[("t-0001", "preflop")]["notype"]["p"])
+test("유형: 유형 없는 기록은 notype = live", by[("t-0003", "turn")]["live"] == by[("t-0003", "turn")]["notype"])
+_dir = hr.estimate({"V": sr.truncate(sr.replay_seats(TYP)["V"], "flop")}, [ev.parse_card(c) for c in ("Ah", "7d", "2s")],
+                   6, dead=[ev.parse_card(c) for c in TYP["hero_cards"]], profiles={"V": {"style": "LP"}})["V"]
+test("유형: live = estimate(profile style=LP) 직접 호출",
+     abs(by[("t-0001", "flop")]["live"]["p"]
+         - _dir["range"].get(sr.combo_key(ev.parse_card("Qs"), ev.parse_card("Qd"))[0], -1)) < 1e-12)
+s_t = sr.summarize(rows_t, [], {})
+test("summarize: by_type (LP/LAG/없음) + 유형/액션별 + 보정표",
+     set(s_t["by_type"]) == {"LP", "LAG", "없음"} and "LP/aggr" in s_t["by_type_family"]
+     and "없음/aggr" not in s_t["by_type_family"] and s_t["calibration_by_type_family"]["LP/aggr"]["n"] > 0,
+     str(list(s_t["by_type_family"])))
+import io as _io
+_buf = _io.StringIO()
+sr.report(s_t, _buf)
+test("report: 유형별 칸 (live vs notype)", "[상대 유형별" in _buf.getvalue() and "LP/aggr" in _buf.getvalue())
+_buf2 = _io.StringIO()
+sr.report(sr.summarize([r for r in rows_t if r["type"] == "없음"], [], {}), _buf2)
+test("report: 유형 없는 데이터면 유형 칸 생략", "[상대 유형별" not in _buf2.getvalue())
+
 # --- 결과 ---------------------------------------------------------------------------------------
 failed = 0
 for ok, name, info in results:
