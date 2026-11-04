@@ -1,12 +1,14 @@
 """showdown.py 테스트: 쇼다운 공개 카드 찾기/인식/핸드별 모으기. 실행: python test_showdown.py
 
 합성 이미지·가짜 matcher 테스트는 항상 돈다. 실제 화면 테스트(샘플 스크린샷, 기록 모드 프레임)는 이 PC 의 로컬 파일
-(저장소에 없음: 닉네임 포함)을 절대 경로로 읽고, 없으면 건너뛴다.
+(저장소에 없음: 닉네임 포함)을 읽고, 없으면 건너뛴다.
+기본 위치는 이 파일이 있는 card-reader 폴더(samples/, dist/recordings/). 다른 곳이면 환경변수 CARD_READER_DATA 로 지정.
 기록 프레임 정답은 프레임을 눈으로 확인해 적은 것. templates_shown/ 이 이 프레임들에서 뽑은 것이라 여기 인식률은 회귀 확인용
 (핸드 하나씩 빼고 만든 템플릿으로 잰 값: 정답을 확인한 공개 좌석 56곳 중 50곳 정확, 틀림 0).
 """
 import glob
 import json
+import os
 from pathlib import Path
 
 import cv2
@@ -15,7 +17,7 @@ import numpy as np
 import showdown
 
 HERE = Path(__file__).resolve().parent
-LOCAL = Path(r"C:\Users\soulo\Documents\preflop\card-reader")
+LOCAL = Path(os.environ.get("CARD_READER_DATA") or HERE)
 SAMPLE = LOCAL / "samples" / "showdown_2026-11-04_97c_J2.png"
 RECORDINGS = LOCAL / "dist" / "recordings"
 SAMPLE_CALIB = {"geom": {"pill_center": [600.0, 325.0], "pw": 228.0, "size": [1198, 865]},

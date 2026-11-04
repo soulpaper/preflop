@@ -1,7 +1,8 @@
 """차례 고리(acting_seat/acting_progress) · 말풍선 색 기준 · handlog 차례 기록 테스트. 실행: python test_ring.py
 
 합성 그림 테스트는 늘 돈다. 실제 화면 테스트는 로컬에만 있는 파일(samples/, dist/recordings/ — 다른 사람 닉네임이 보여서
-저장소에 없음)을 절대 경로로 읽고, 없으면 SKIP. 녹화 프레임의 기대값은 2026-11-04 에 눈으로 확인한 것.
+저장소에 없음)을 읽고, 없으면 SKIP.
+기본 위치는 이 파일이 있는 card-reader 폴더, 다른 곳이면 환경변수 CARD_READER_DATA 로 지정. 녹화 프레임의 기대값은 2026-11-04 에 눈으로 확인한 것.
 """
 import glob
 import json
@@ -22,7 +23,7 @@ import test_handlog
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-APP = Path(r"C:\Users\soulo\Documents\preflop\card-reader")
+APP = Path(os.environ.get("CARD_READER_DATA") or Path(__file__).resolve().parent)
 REC = APP / "dist" / "recordings"
 SAMPLE = APP / "samples" / "turn_ring_2026-11-04_top_seat.png"
 results, skipped = [], []

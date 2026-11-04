@@ -2,7 +2,7 @@
 
 데이터: jevonmao/postflop-solver-reasoning-traces-1m (Hugging Face, CC-BY-4.0) — postflop-solver 엔진으로 만든
 헤즈업 블라인드 대 블라인드(SB 오픈 / BB 디펜스, 200BB, SB 50 / BB 100 칩) 포스트플랍 결정 467,680개.
-전처리본: ../../preflop-tools/gto_dataset/spots.jsonl.gz  (환경변수 GTO_DATASET 로 바꿀 수 있다)
+전처리본: ../../preflop-tools/gto_dataset/spots.jsonl.gz  (환경변수 GTO_DATASET 로, 또는 PREFLOP_TOOLS 로 도구 폴더를 바꿀 수 있다)
 
   python bench_gto.py --n 20000                # 검증 분할 앞 20k — 범위/랜덤 에쿼티 두 모드
   python bench_gto.py --n 20000 --split train  # 학습 분할에서 (HU_GTO 튜닝은 train 만 봤다)
@@ -39,10 +39,9 @@ if HERE not in sys.path:
 
 import evaluator as ev  # noqa: E402
 
-DATA = os.environ.get("GTO_DATASET", os.path.join(os.path.dirname(os.path.dirname(HERE)), "preflop-tools",
-                                                   "gto_dataset", "spots.jsonl.gz"))
-if not os.path.exists(DATA):
-    DATA = r"C:\Users\soulo\Documents\preflop-tools\gto_dataset\spots.jsonl.gz"
+import solverlib  # noqa: E402
+
+DATA = os.environ.get("GTO_DATASET", os.path.join(solverlib.TOOLS_DIR, "gto_dataset", "spots.jsonl.gz"))
 EQ_CACHE = os.path.join(os.path.dirname(DATA), "eq_random_cache.json")
 BB = 100.0
 SEED = 20261029
