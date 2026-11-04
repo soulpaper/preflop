@@ -1161,9 +1161,9 @@ check("턴 플러시 드로우 vs 하프팟, 유효 20BB (콜이 스택 25% 초�
 check("플랍 양차 vs 하프팟 100BB (범위 42%) → 콜",
       dict(hero=["8s", "7s"], board=["9d", "6c", "2h"], opponents_in_hand=1, pot=6, pot_total=9, call=3, stack_bb=100,
            to_act=True, equity=0.42, equity_basis="range"), "콜", 3, 0.01)
-check("플랍 양차 vs 3/4 팟 100BB → 폴드 (솔버: 큰 벳엔 폴드 최빈)",
+check("플랍 양차 vs 3/4 팟 100BB → 콜 (내재 배당 k=0.9)",
       dict(hero=["8s", "7s"], board=["9d", "6c", "2h"], opponents_in_hand=1, pot=6, pot_total=10.5, call=4.5, stack_bb=100,
-           to_act=True, equity=0.42, equity_basis="range"), "폴드")
+           to_act=True, equity=0.42, equity_basis="range"), "콜", reason_has="내재 배당")
 check("거트샷 + 오버카드(드로우 아웃츠 4장)는 헤즈업 내재 배당 대상 아님 → 폴드",
       dict(hero=["Ac", "Jd"], board=["Ts", "8h", "3c"], opponents_in_hand=1, pot=6, pot_total=9, call=3, stack_bb=100,
            to_act=True, equity=0.32, equity_basis="range"), "폴드")
@@ -1213,6 +1213,25 @@ results.append((not bad, f"D: SB 18BB 169핸드 모두 올인/폴드 (나온 행
 check("D: SB 18BB AA → 올인 18", dict(SB18, hero=["Ah", "Ad"]), "올인", 18)
 check("D: BTN 18BB AA → 레이즈", dict(PF, hero=["Ah", "Ad"], players=9, hero_pos="BTN", situation="open", stack_bb=18,
                                      my_stack=18, call=1, pot_total=2.6, ante=1.125, can_check=False), "레이즈")
+
+
+# --- 포스트플랍 ②③⑤ (2026-11-05): 약한 단일 무늬 포쁠 / 작은 벳 약한 드로우 / 플랍 에어 커밋 ----------------------
+HUQ = dict(opponents_in_hand=1, to_act=True, equity_basis="range", stack_bb=100)
+check("② 보드 As Js 7s, Kd 2s (약한 포쁠 1장) vs 3/4 팟 → 폴드",
+      dict(HUQ, hero=["Kd", "2s"], board=["As", "Js", "7s"], pot=6, pot_total=10.5, call=4.5, equity=0.25), "폴드")
+check("② 보드 Ks Js 7s, As 2d (너트 포쁠) vs 3/4 팟 → 콜 (내재 배당)",
+      dict(HUQ, hero=["As", "2d"], board=["Ks", "Js", "7s"], pot=6, pot_total=10.5, call=4.5, equity=0.30), "콜",
+      reason_has="내재 배당")
+check("③ Th9h 보드 Qs8h4s (거트샷) vs 1/3 팟 100BB → 콜 (실현 보정 제한)",
+      dict(HUQ, hero=["Th", "9h"], board=["Qs", "8h", "4s"], pot=6, pot_total=8, call=2, equity=0.26), "콜")
+check("③ 같은 핸드 vs 3/4 팟 → 폴드",
+      dict(HUQ, hero=["Th", "9h"], board=["Qs", "8h", "4s"], pot=6, pot_total=10.5, call=4.5, equity=0.26), "폴드")
+check("⑤ 플랍 에어 Ad6d 보드 Qs8h4s, 14BB, 에쿼티 36% vs 3/4 팟 → 폴드 (에어는 커밋 안 함)",
+      dict(HUQ, hero=["Ad", "6d"], board=["Qs", "8h", "4s"], pot=6, pot_total=10.5, call=4.5, stack_bb=14, my_stack=14,
+           equity=0.36), "폴드")
+check("⑤ 양차 7c6c 보드 8h5dKs, 14BB, 에쿼티 40% vs 3/4 팟 → 올인 유지",
+      dict(HUQ, hero=["7c", "6c"], board=["8h", "5d", "Ks"], pot=6, pot_total=10.5, call=4.5, stack_bb=14, my_stack=14,
+           equity=0.40), "올인")
 
 # --- 결과 -----------------------------------------------------------------------
 failed = 0

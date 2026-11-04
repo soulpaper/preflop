@@ -1745,9 +1745,11 @@ DRAW_KEYS = ("드로우", "것샷", "양차", "포쁠")
 # 헤즈업 진짜 드로우(플러시·스트레이트 아웃츠 8장+, 오버카드·페어 아웃츠 제외)의 내재 배당: 완성 시 '콜 후 팟 × k' 까지 더 받는다고 본다
 # (뒷스택 이하).  솔버 표(HU_GTO implied=0)는 200BB BvB 데이터의 68% 가 SPR<4 노드라 드로우 내재 배당을 0 으로 맞췄는데, 그러면
 # 턴 플러시 드로우가 4:1 배당(필요 20% ≈ 완성 20%) + 뒷스택 227BB 에도 '+2BB 만 더 받으면 되는데' 폴드했다.
-# k 는 남은 거리 수 기준: 플랍 0.75 (두 거리), 턴 0.5 (리버 벳 한 번).  큰 벳(3/4 팟+)의 OESD 는 여전히 폴드 (솔버 최빈 = 폴드).
+# k 는 남은 거리 수 기준: 플랍 HU_DRAW_IMPLIED_K['flop'] (두 거리), 턴 0.5 (리버 벳 한 번).
 HU_DRAW_OUTS = 8
-HU_DRAW_IMPLIED_K = {"flop": 0.75, "turn": 0.5}
+HU_DRAW_IMPLIED_K = {"flop": 0.9, "turn": 0.5}   # 플랍 k 는 여기 한 곳 (0.9 ↔ 1.0 조정)
+WEAK_DRAW_MAX_FRAC = 0.36   # 약한 드로우(4장+)가 작은 벳(팟의 36% 이하)에 콜 여유를 두는 벳 상한
+WEAK_DRAW_PAD = 0.03        # 그때 실현 보정(hu_pad) 상한
 
 
 def _draw_out_count(outs):
@@ -1759,6 +1761,32 @@ def _draw_out_count(outs):
     return len(s)
 
 
+def _weak_mono_flush(hero, board):
+    """플랍이 한 무늬 3장이고 내가 그 무늬를 정확히 1장(너트 아님)만 가진 포쁠 — 보드가 이미 플러시 깔림이라 상대가 먼저 완성돼 있기 쉽다."""
+    if len(board) != 3 or len({x & 3 for x in board}) != 1:
+        return False
+    suit = board[0] & 3
+    return sum(1 for h in hero if h & 3 == suit) == 1 and not _nut_flush_draw(hero, board)
+
+
+def _hu_draw_outs(c, outs):
+    """_draw_out_count 와 같되, 약한 단일 무늬 플러시 드로우(_weak_mono_flush)의 '포쁠' 그룹은 뺀다."""
+    weak = _weak_mono_flush(c.hero, c.board)
+    s = set()
+    for g in outs.get("groups") or []:
+        if weak and "포쁠" in g[0]:
+            continue
+        if any(k in g[0] for k in DRAW_KEYS) and len(g) > 1 and isinstance(g[1], (list, tuple)):
+            s.update(g[1])
+    return len(s)
+
+
+def _weak_draw_small_bet(c, outs, bet_frac, allin):
+    """헤즈업 플랍, 올인 아님, 작은 벳(<= WEAK_DRAW_MAX_FRAC)에 드로우 아웃츠 4장+ 면 True (실현 보정을 WEAK_DRAW_PAD 로 제한)."""
+    return (c.opp == 1 and c.street == "flop" and not allin and bet_frac <= WEAK_DRAW_MAX_FRAC and bool(outs)
+            and _hu_draw_outs(c, outs) >= 4)
+
+
 def _implied_rule(c, outs, T, mw, nut_draw):
     """드로우 내재 배당 콜 기준 (다음 카드 완성 확률, cap(뒷스택, 콜 후 팟), 아웃츠 장수) — 완성 시 더 받아야 할 금액이 cap 이하면 콜.
     None = 내재 배당 콜 없음.  멀티웨이: 뒷스택 × 0.35 (너트 드로우 0.5).  헤즈업: 진짜 드로우 8장+ 는 HU_DRAW_IMPLIED_K,
@@ -1766,7 +1794,7 @@ def _implied_rule(c, outs, T, mw, nut_draw):
     if mw:
         frac = 0.5 if nut_draw else 0.35
         return outs["next"], (lambda room, pot_after: frac * room), outs["count"]
-    nd = _draw_out_count(outs)
+    nd = _hu_draw_outs(c, outs)
     k = HU_DRAW_IMPLIED_K.get(c.street)
     if nd >= HU_DRAW_OUTS and k:
         hit = ev.hit_probability(nd, 52 - 2 - len(c.board), 1)
@@ -1933,6 +1961,8 @@ def _facing_bet(c, cls, made, tp_plus, twopair_plus, tex, eq, eq_src, outs, stro
         hu_pad = _hu_margin(T, c.street, bet_frac, allin_call, pot)
     else:
         hu_pad = 0.0 if allin_call else _hu_margin(T, c.street, bet_frac, False, pot)
+    if _weak_draw_small_bet(c, outs, bet_frac, allin_call):
+        hu_pad = min(hu_pad, WEAK_DRAW_PAD)
     cadj = c.post["call_adj"]
     need_eff = need + pad + ppad + cadj + hu_pad
     icm_pad, icm_line = _icm_facing(c, call, pot, allin_call, need_eff)   # 토너먼트 ICM (없거나 초반이면 0)
@@ -1969,7 +1999,9 @@ def _facing_bet(c, cls, made, tp_plus, twopair_plus, tex, eq, eq_src, outs, stro
     if hu:  # 헤즈업: 솔버 표 — 낮은 SPR 커밋 / 에지 기준 밸류 레이즈
         edge = adj - need - ppad - c.post["call_adj"]
         st = c.street
-        if spr_after is not None and spr_after < T["jam_spr"] and \
+        # 플랍 에어(드로우 아웃츠 8장 미만, 콤보 아님)는 에지가 커 보여도(실현 보정 부족) 커밋하지 않는다
+        commit_hand = c.street != "flop" or cls != "air" or combo or _hu_draw_outs(c, outs or {}) >= HU_DRAW_OUTS
+        if commit_hand and spr_after is not None and spr_after < T["jam_spr"] and \
                 edge >= T["jam_edge"][st] + _icm_commit_pad(c, call, pot, eff):
             return _out(ALLIN, eff, _bb(eff), f"{made} + 낮은 SPR → 커밋 (올인)", [spr_line, odds_line, eq_src],
                         conf)
@@ -2213,6 +2245,8 @@ def _max_call(c, pl, p0):
         adj, _ = _adj_equity(c, eq, cls, made, tw, f)
         ppad, _ = _prof_facing(c, cls, tw, f)
         hu_pad = _hu_margin(T, c.street, f, False, p0 * (1 + f) if p0 else None)
+        if _weak_draw_small_bet(c, pl["outs"], f, False):
+            hu_pad = min(hu_pad, WEAK_DRAW_PAD)
         base = f / (1 + 2 * f) + pad + ppad + c.post["call_adj"] + hu_pad
         if c.icm is not None and p0:   # _facing_bet 과 같은 ICM 가산 (올인 크기면 ICM 올인 필요 승률)
             allin = bool(pl["eff"]) and f * p0 >= 0.98 * pl["eff"]
