@@ -51,6 +51,8 @@ PROGRESS = os.path.join(SOLVES, "progress.json")
 STOP_FILE = os.path.join(SOLVES, "STOP")
 LOCK = os.path.join(SOLVES, "runner.lock")
 CONTROL = os.path.join(SOLVES, "control.json")
+THERMAL = os.path.join(SOLVES, "thermal.json")   # deploy/gto_thermal.py 가 쓰는 온도 단계
+THERMAL_STALE = 120                              # 이 초보다 오래된 thermal.json 은 무시 (제어기가 죽어도 러너는 멈추지 않음)
 WINDOWS = os.name == "nt"
 EXE = os.path.join(sl.SOLVER_DIR, "console_solver.exe" if WINDOWS else "console_solver")
 CPU = os.cpu_count() or 4
@@ -238,6 +240,17 @@ def is_solver_pid(pid):
     if argv is False:
         return True
     return bool(argv) and os.path.basename(argv[0]) == os.path.basename(EXE)
+
+
+def thermal_hold():
+    """온도 제어기가 새 솔브 배정 중지(hold)를 요청 중인가. 파일이 없거나 오래됐거나 깨졌으면 False."""
+    t = read_json(THERMAL)
+    if not isinstance(t, dict) or t.get("hold") is not True:
+        return False
+    try:
+        return 0 <= time.time() - float(t.get("updated")) <= THERMAL_STALE
+    except (TypeError, ValueError):
+        return False
 
 
 def low_threads():
@@ -535,6 +548,14 @@ def status():
             el = time.time() - cur.get("t0", time.time())
             print(f"현재{' w%d' % cur['worker'] if 'worker' in cur else ''}: {cur['spot']} {cur['stack']}BB {cur['flop']} "
                   f"(스레드 {cur.get('threads', '?')}, {el / 60:.1f}분 경과)")
+    th = read_json(THERMAL)
+    if isinstance(th, dict) and th.get("name"):
+        try:
+            age = time.time() - float(th.get("updated"))
+            print(f"온도: {th['name']}{' (배정 중지)' if th.get('hold') else ''} {th.get('temp')}°C · 5분 평균 {th.get('avg5m')}°C"
+                  + (f" ({age:.0f}초 전)" if age <= THERMAL_STALE else " (오래됨, 무시)"))
+        except (TypeError, ValueError):
+            pass
     left_acc = 0.0
     for tier, (a, b, s) in sorted(per_tier.items()):
         spots, stacks, rng = PLAN[tier]
@@ -719,6 +740,13 @@ def run(args, only=None):
         while True:
             if stopping():
                 return None
+            if thermal_hold():
+                if not state.get("thermal_said"):
+                    state["thermal_said"] = True
+                    say("온도 보호: 새 솔브 배정 대기")
+                time.sleep(5)
+                continue
+            state["thermal_said"] = False
             with qlock:
                 if state["next"] >= len(queue):
                     return None

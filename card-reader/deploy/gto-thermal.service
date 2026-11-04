@@ -1,0 +1,12 @@
+[Unit]
+Description=GTO runner thermal controller
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/gto-runner/env
+ExecStart=/usr/bin/python3 -u ${CARD_READER_DIR}/deploy/gto_thermal.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

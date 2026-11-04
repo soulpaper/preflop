@@ -117,6 +117,30 @@ CARD_READER_DIR=<card-reader 저장소 폴더>
 
 주의: `systemctl --user stop gto-runner.service`(와 재부팅)는 SIGTERM 뒤 control-group 전체를 정리하므로 진행 중 솔브가 사라진다. 완료된 솔브는 보존되고 다음 시작 때 이어서 푼다. 솔브를 지키며 멈추려면 `--stop`을 쓴다. 이미 돌고 있는 러너에는 코드 수정이 적용되지 않으므로 재시작 때 반영된다.
 
+### 온도 적응 모드 (`deploy/gto-thermal.service`)
+
+`deploy/gto_thermal.py`가 10초마다 CPU 온도(k10temp Tctl)를 읽어 돌고 있는 `console_solver`의 CPU 선호도(affinity)만 조절한다. 스레드 수와 nice는 건드리지 않는다. 설계와 실측 근거는 `홀덤연구소/thermal-design.md`.
+
+| 단계 | 이름 | 솔버 CPU 선호도 | 새 솔브 배정 |
+|---|---|---|---|
+| 3 | full | 0-11 | 함 |
+| 2 | normal | 0-9 | 함 |
+| 1 | cool | 0,2,4 | 함 |
+| 0 | hold | 0,2,4 | 안 함 (진행 중 솔브는 계속) |
+
+- 상한(ceiling): `control.json`의 `low=true` → normal, `low=false` → full (파일이 없으면 normal). 실제 단계 = min(상한, 온도 단계)
+- 감속: 5분 평균 > 91°C → 한 단계 내림(최소 120초 간격). 30초 평균 ≥ 93°C → 즉시 cool
+- 배정 중지: 30초 평균 ≥ 95°C가 60초 이어지면 hold. 30초 평균 < 90°C면 풀림
+- 복귀: 5분 평균 < 88.5°C, 30초 평균 < 91°C, 현재 단계에 300초 이상 있었을 때 한 단계 올림
+- 시작 후 50분이 지난 솔브는 cool/hold에서도 normal(0-9) 선호도를 준다(러너의 75분 제한 보호). 온도 읽기가 3번 연속 실패하면 cool + hold 해제
+- 임계값·시간은 `GTO_THERMAL_<이름>` 환경변수로 덮어쓴다(`deploy/gto_thermal.py`의 `DEFAULTS` 참고, 예: `GTO_THERMAL_SLOW_AVG5=90`)
+- `$PREFLOP_TOOLS/solves/thermal.json`: `{"level","name","hold","temp","avg5m","updated"}` (원자적 쓰기). 러너는 `updated`가 120초 안이고 `hold=true`일 때만 새 솔브 배정을 미룬다. 제어기가 죽거나 파일이 낡으면 러너는 그대로 돈다. `--status`에도 한 줄 나온다
+- 기록: `~/.local/state/gto-thermal/thermal.csv` (`ts,tctl_c,ppt_w,avg30s,avg5m,level,hold,ceiling,solver_pcpu`, 10초마다). 하루 지나면 `thermal-YYYYMMDD.csv`로 넘기고 14일 지난 것은 삭제. 폴더는 `GTO_THERMAL_STATE_DIR`로 변경
+- SIGTERM(서비스 중지) 때는 솔버 선호도를 상한 단계 것으로 되돌리고 `hold=false`를 쓴다
+- 시험/확인: `python3 deploy/test_gto_thermal.py`, `python3 deploy/gto_thermal.py --dry-run --once`(온도만 읽고 선호도·파일은 건드리지 않음), 온도 주입은 `GTO_THERMAL_TEMP_FILE=<파일>`
+- 설치: `cp deploy/gto-thermal.service ~/.config/systemd/user/ && systemctl --user enable --now gto-thermal.service`. 선호도 조절은 바로 동작하고, hold(배정 중지)는 러너가 이 코드로 재시작된 뒤부터 동작한다. 온도로 제어하므로 `gto-mode.timer`는 꺼 둔다(상한은 `control.json` 그대로)
+- 러너 시작 모드 고정: `~/.config/gto-runner/env`에 `GTO_MODE=low`(또는 `full`)를 두면 시작 스크립트가 시각 대신 그 모드로 시작한다. 없으면 이전처럼 시각(04~21시 full)으로 고른다. 실측상 low(5코어)가 full(6코어)보다 5% 느리고 4°C 시원해서 온도 적응 모드에서는 low를 권장
+
 ## 학습 데이터
 
 `templates/`에 게임 화면에서 뽑은 실제 카드 템플릿이 들어 있다 (30종). exe로 쓸 때는 이 폴더를 exe 옆에 두면 된다.

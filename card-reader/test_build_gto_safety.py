@@ -114,6 +114,25 @@ try:
     test("잠금 없음: 통과", exits(bl.acquire_lock) is None)
 
     # progress 에 가짜 pid(sleep)와 진짜 대상(console_solver)을 둘 다 넣는다
+    # thermal_hold: 제어기가 죽거나 파일이 이상해도 러너는 멈추지 않는다
+    test("thermal_hold: 파일 없음 -> False", bl.thermal_hold() is False)
+    bl.write_json(bl.THERMAL, {"hold": True, "updated": time.time() - bl.THERMAL_STALE - 30})
+    test("thermal_hold: hold=true 라도 오래됨 -> False", bl.thermal_hold() is False)
+    with open(bl.THERMAL, "w") as f:
+        f.write("{깨진 json")
+    test("thermal_hold: 깨진 파일 -> False", bl.thermal_hold() is False)
+    bl.write_json(bl.THERMAL, {"hold": True})
+    test("thermal_hold: updated 없음 -> False", bl.thermal_hold() is False)
+    bl.write_json(bl.THERMAL, {"hold": True, "updated": "abc"})
+    test("thermal_hold: updated 가 숫자 아님 -> False", bl.thermal_hold() is False)
+    bl.write_json(bl.THERMAL, {"hold": False, "updated": time.time()})
+    test("thermal_hold: 새것 + hold=false -> False", bl.thermal_hold() is False)
+    bl.write_json(bl.THERMAL, {"hold": True, "updated": time.time()})
+    test("thermal_hold: 새것 + hold=true -> True", bl.thermal_hold() is True)
+    bl.write_json(bl.THERMAL, {"hold": True, "updated": time.time() + 3600})
+    test("thermal_hold: 미래 시각(시계 이상) -> False", bl.thermal_hold() is False)
+    os.remove(bl.THERMAL)
+
     before = state(other.pid)
     bl.write_json(bl.PROGRESS, {"workers": [{"solver_pid": other.pid}], "current": {"solver_pid": other.pid}})
     quiet(bl.set_mode, "low")

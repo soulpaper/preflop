@@ -16,6 +16,10 @@ GTO_HOUR=10 bash "$here/gto-runner-start.sh"; check "시작 스크립트 10시: 
 grep -q -- "FAKE-RUNNER --full --workers 2" "$log"; check "10시 -> --full --workers 2" $? 0
 GTO_HOUR=22 GTO_WORKERS=3 bash "$here/gto-runner-start.sh"
 grep -q -- "FAKE-RUNNER --low --workers 3" "$log"; check "22시, GTO_WORKERS=3 -> --low --workers 3" $? 0
+GTO_HOUR=10 GTO_MODE=low bash "$here/gto-runner-start.sh"
+grep -q -- "FAKE-RUNNER --low --workers 2" "$log"; check "10시라도 GTO_MODE=low -> --low" $? 0
+: >"$log"; GTO_HOUR=22 GTO_MODE=bogus bash "$here/gto-runner-start.sh"
+grep -q -- "FAKE-RUNNER --low --workers 2" "$log"; check "GTO_MODE 이상값 -> 시각 기준(22시 low)" $? 0
 touch "$t/tools/solves/STOP"; : >"$log"
 GTO_HOUR=10 bash "$here/gto-runner-start.sh"; check "STOP 있으면 exit 0" $? 0
 grep -q FAKE-RUNNER "$log"; check "STOP 있으면 러너 호출 안 함" $? 1
@@ -28,4 +32,13 @@ out="$(ACTIVE_RC=3 GTO_HOUR=21 bash "$here/gto-mode-sync.sh")"; rc=$?
 check "inactive: 러너 호출 없음" "$(echo "$out" | grep -c FAKE-RUNNER)" 0
 grep -q "^\[Install\]" "$here/gto-runner.service"; check "gto-runner.service 에 [Install] 있음" $? 0
 grep -q "^WantedBy=default.target" "$here/gto-runner.service"; check "gto-runner.service WantedBy=default.target" $? 0
+grep -q "^\[Install\]" "$here/gto-thermal.service"; check "gto-thermal.service 에 [Install] 있음" $? 0
+grep -q "^WantedBy=default.target" "$here/gto-thermal.service"; check "gto-thermal.service WantedBy=default.target" $? 0
+grep -q "^ExecStart=/usr/bin/python3 -u \${CARD_READER_DIR}/deploy/gto_thermal.py$" "$here/gto-thermal.service"; check "gto-thermal.service ExecStart" $? 0
+grep -q "^Restart=always" "$here/gto-thermal.service"; check "gto-thermal.service Restart=always" $? 0
+if command -v systemd-analyze >/dev/null; then
+    v="$(systemd-analyze --user verify "$here/gto-thermal.service" 2>&1 | grep -v -i "environment\|EnvironmentFile\|CARD_READER_DIR\|Executable path is not absolute\|No such file" )"
+    check "gto-thermal.service 문법(systemd-analyze)" "$v" ""
+fi
+python3 -m py_compile "$here/gto_thermal.py"; check "gto_thermal.py 문법" $? 0
 exit $fail

@@ -4,6 +4,7 @@
 #   CARD_READER_DIR (필수) build_gto_lib.py 가 있는 폴더
 #   GTO_LIB_DIR     (선택) gto_lib 출력 폴더 (build_gto_lib/solverlib 가 직접 읽는다)
 #   GTO_WORKERS     (선택) 동시 솔브 수, 기본 2
+#   GTO_MODE        (선택) low/full 고정. 없으면 시각으로 고름 (gto-mode-lib.sh). 온도 적응 모드에서는 low 권장
 # solves/STOP 이 있으면 아무것도 하지 않고 exit 0 (Restart=on-failure 라 재시작되지 않는다).
 # 시험용: GTO_HOUR 로 시각 주입, GTO_RUNNER_CMD 로 러너 명령 교체(기본 python3 $CARD_READER_DIR/build_gto_lib.py).
 set -eu
@@ -18,7 +19,10 @@ if [ -e "$solves/STOP" ]; then
     echo "$(date '+%F %T') STOP 파일이 있어 시작하지 않습니다 (exit 0)"
     exit 0
 fi
-mode="$(gto_mode)"
+case "${GTO_MODE:-}" in
+    low|full) mode="$GTO_MODE" ;;
+    *) mode="$(gto_mode)" ;;
+esac
 workers="${GTO_WORKERS:-2}"
 echo "$(date '+%F %T') 시작: --$mode --workers $workers"
 cd "$CARD_READER_DIR"
