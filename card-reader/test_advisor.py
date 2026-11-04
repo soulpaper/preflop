@@ -1154,16 +1154,24 @@ TFD = dict(hero=["9h", "3h"], board=["2d", "6h", "Ah", "Ad"], opponents_in_hand=
 check("실제: 턴 플러시 드로우 vs 1/3 팟 벳, 뒷스택 227BB → 콜 (내재 배당)",
       dict(TFD, pot=63.0, pot_total=84.0, call=21.0, stack_bb=248.4, my_stack=248.4, equity=0.2732), "콜", 21, 0.01,
       reason_has="내재 배당")
-check("턴 플러시 드로우 vs 팟 벳 → 폴드 (리버 한 번으로는 못 받음)",
-      dict(TFD, pot=40.0, pot_total=80.0, call=40.0, stack_bb=248.4, my_stack=248.4, equity=0.24), "폴드")
-check("턴 플러시 드로우 vs 하프팟, 유효 20BB (콜이 스택 25% 초과) → 폴드",
-      dict(TFD, pot=12.0, pot_total=18.0, call=6.0, stack_bb=20, my_stack=20, equity=0.24), "폴드")
+check("턴 플러시 드로우 vs 팟 벳 딥스택 → 콜 (턴 k=0.95; 옛 k=0.5 는 폴드)",
+      dict(TFD, pot=40.0, pot_total=80.0, call=40.0, stack_bb=248.4, my_stack=248.4, equity=0.24), "콜", reason_has="내재 배당")
+check("턴 플러시 드로우 vs 하프팟, 유효 16BB (콜이 스택 33% 초과) → 폴드",
+      dict(TFD, pot=12.0, pot_total=18.0, call=6.0, stack_bb=16, my_stack=16, equity=0.24), "폴드")
 check("플랍 양차 vs 하프팟 100BB (범위 42%) → 콜",
       dict(hero=["8s", "7s"], board=["9d", "6c", "2h"], opponents_in_hand=1, pot=6, pot_total=9, call=3, stack_bb=100,
            to_act=True, equity=0.42, equity_basis="range"), "콜", 3, 0.01)
 check("플랍 양차 vs 3/4 팟 100BB → 콜 (내재 배당 k=0.9)",
       dict(hero=["8s", "7s"], board=["9d", "6c", "2h"], opponents_in_hand=1, pot=6, pot_total=10.5, call=4.5, stack_bb=100,
            to_act=True, equity=0.42, equity_basis="range"), "콜", reason_has="내재 배당")
+# 턴 OESD (9c8c, 보드 7h6d2sKc: 5/T 8아웃, 플러시 드로우 없음), 범위 에쿼티 18%.  턴 k 0.5 → 0.95, 스택 컷 0.25 → 0.33
+TOE = dict(hero=["9c", "8c"], board=["7h", "6d", "2s", "Kc"], opponents_in_hand=1, to_act=True, equity=0.18, equity_basis="range")
+check("턴 OESD vs 팟 벳 100BB (팟 20, 콜 20) → 콜 (내재 배당 k=0.95; 옛 k=0.5 는 폴드)",
+      dict(TOE, pot=20, pot_total=40, call=20, stack_bb=100, my_stack=100), "콜", 20, 0.01, reason_has="내재 배당")
+check("턴 OESD vs 2배 오버벳 200BB (팟 20, 콜 40) → 폴드 (완성 시 +130BB 필요, k 로도 부족)",
+      dict(TOE, pot=20, pot_total=60, call=40, stack_bb=200, my_stack=200), "폴드")
+check("턴 OESD, 콜이 유효 스택의 30% (팟 60, 콜 30, 스택 100) → 콜 (스택 컷 0.33; 0.25 였으면 폴드)",
+      dict(TOE, pot=60, pot_total=90, call=30, stack_bb=100, my_stack=100), "콜", 30, 0.01, reason_has="내재 배당")
 check("거트샷 + 오버카드(드로우 아웃츠 4장)는 헤즈업 내재 배당 대상 아님 → 폴드",
       dict(hero=["Ac", "Jd"], board=["Ts", "8h", "3c"], opponents_in_hand=1, pot=6, pot_total=9, call=3, stack_bb=100,
            to_act=True, equity=0.32, equity_basis="range"), "폴드")

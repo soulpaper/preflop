@@ -1745,9 +1745,12 @@ DRAW_KEYS = ("드로우", "것샷", "양차", "포쁠")
 # 헤즈업 진짜 드로우(플러시·스트레이트 아웃츠 8장+, 오버카드·페어 아웃츠 제외)의 내재 배당: 완성 시 '콜 후 팟 × k' 까지 더 받는다고 본다
 # (뒷스택 이하).  솔버 표(HU_GTO implied=0)는 200BB BvB 데이터의 68% 가 SPR<4 노드라 드로우 내재 배당을 0 으로 맞췄는데, 그러면
 # 턴 플러시 드로우가 4:1 배당(필요 20% ≈ 완성 20%) + 뒷스택 227BB 에도 '+2BB 만 더 받으면 되는데' 폴드했다.
-# k 는 남은 거리 수 기준: 플랍 HU_DRAW_IMPLIED_K['flop'] (두 거리), 턴 0.5 (리버 벳 한 번).
+# k 는 남은 거리 수 기준: 플랍 HU_DRAW_IMPLIED_K['flop'] (두 거리), 턴 0.95 (리버 벳 한 번).
+# 턴 0.5 → 0.95: 턴 GTO 트리에는 50%/100% 벳이 있어 팟 사이즈 벳에 OESD 콜이 GTO 데이터 안에 들어간다 (93 스윕: 임계 0.44/0.71/0.92,
+# 0.95 는 여유를 더한 값; 분기 일치율 59.8 → 65.3%).
 HU_DRAW_OUTS = 8
-HU_DRAW_IMPLIED_K = {"flop": 0.9, "turn": 0.5}   # 플랍 k 는 여기 한 곳 (0.9 ↔ 1.0 조정)
+HU_DRAW_IMPLIED_K = {"flop": 0.9, "turn": 0.95}   # 플랍 k 는 여기 한 곳 (0.9 ↔ 1.0 조정)
+HU_DRAW_STACK_CUT = 0.33   # 내재 배당 콜은 콜 금액이 유효 스택의 이 비율 이하일 때만 (0.25 → 0.33)
 WEAK_DRAW_MAX_FRAC = 0.36   # 약한 드로우(4장+)가 작은 벳(팟의 36% 이하)에 콜 여유를 두는 벳 상한
 WEAK_DRAW_PAD = 0.03        # 그때 실현 보정(hu_pad) 상한
 
@@ -2042,7 +2045,7 @@ def _facing_bet(c, cls, made, tp_plus, twopair_plus, tex, eq, eq_src, outs, stro
         room = stack_after or 0.0
         line = f"아웃츠 {n_hit}장 · 다음 카드 {_pct(hit)} · 완성 시 +{_bb(more)} 필요" + \
             (" (너트 드로우 다자 -25%)" if mw and nut_draw else "")
-        if more <= cap(room, pot + call) and call <= 0.25 * (eff or 0):
+        if more <= cap(room, pot + call) and call <= HU_DRAW_STACK_CUT * (eff or 0):
             return _out(CALL, call, None, "드로우 — 내재 배당으로 콜 가능",
                         [line, odds_line, f"{eq_src} · 뒷스택 {_bb(room)}" + (f" · {spr_line}" if spr_line else "")],
                         "medium" if more <= 0.25 * room else "low")
@@ -2269,7 +2272,7 @@ def _max_call(c, pl, p0):
         x = f * p0
         more = odds.implied_needed(p0, x, hit) * (0.75 if mw and pl["nut_draw"] else 1.0)
         room = eff - x
-        if x > 0.25 * eff or room <= 0:
+        if x > HU_DRAW_STACK_CUT * eff or room <= 0:
             return -1.0
         return cap(room, p0 + 2 * x) - more
     f_imp = _plan_gain(gi, PLAN_IMPLIED_MAX_F)
