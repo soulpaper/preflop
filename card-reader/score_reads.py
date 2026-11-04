@@ -144,9 +144,11 @@ def seat_positions(rec):
     return {k: s.get("pos") for k, s in (rec.get("seats") or {}).items()}
 
 
-def replay_seats(rec):
-    """앱과 같은 입력 (handlog.to_handread: 프리플랍 정리 + 올인 금액 스택 + 포스트플랍 벳 크기)."""
-    return handlog.to_handread(rec.get("actions") or {}, seat_positions(rec))
+def replay_seats(rec, ante_bb=0.0):
+    """앱과 같은 입력 (handlog.to_handread: 프리플랍 정리 + 올인 금액 스택 + 포스트플랍 벳 크기).
+    rec["street_pot"](스트리트 시작 화면 팟, 앤티 포함)이 있으면 그 팟 기준, 없으면 ante_bb(결정 기록 ctx 의 앤티 추정)를 팟에 더해 계산."""
+    return handlog.to_handread(rec.get("actions") or {}, seat_positions(rec), street_pot=rec.get("street_pot"),
+                               ante=ante_bb)
 
 
 def raw_seats(rec):
@@ -410,6 +412,20 @@ def _context(rec, decs_by_hand, sess_defaults):
     return stack, ante, profiles
 
 
+def _ante_bb(rec, decs_by_hand, sess_defaults):
+    """결정 기록 ctx 의 앤티 합계(BB) 추정: 숫자면 그 값, True 면 어드바이저와 같이 1.0, 없음/False 면 0."""
+    ds = decs_by_hand.get(rec.get("id")) or []
+    v = (ds[-1] if ds else {}).get("ante")
+    if isinstance(v, bool):
+        return 1.0 if v else 0.0
+    n = _num(v)
+    if n is not None:
+        return max(0.0, n)
+    if ds:
+        return 0.0
+    return 1.0 if (sess_defaults.get(str(rec.get("id") or "").rsplit("-", 1)[0]) or {}).get("ante") else 0.0
+
+
 def _session_defaults(decs):
     acc = defaultdict(list)
     for d in decs:
@@ -446,7 +462,7 @@ def score_hands(hands, decs, ok_only=False, ablation=False):
             continue
         board = hr._board_cards(rec.get("board") or [])
         dead = [c for c in hr._cards(rec.get("hero_cards") or []) if c not in board]
-        live_seats = replay_seats(rec)
+        live_seats = replay_seats(rec, _ante_bb(rec, decs_by_hand, sess_defaults))
         raw = raw_seats(rec)
         nfix = input_fixes(rec)
         phantom = phantom_streets(rec)
@@ -584,7 +600,7 @@ def group(rows, keyfn):
     return g
 
 
-def summarize(rows, lrows, skipped, bet_fold=None):
+def summarize(rows, lrows, skipped, bet_fold=None, boot=1000):
     post = [r for r in rows if r["street"] != "preflop"]
     final = {}
     for r in rows:
@@ -618,6 +634,7 @@ def summarize(rows, lrows, skipped, bet_fold=None):
     s["calibration_postflop_all"] = {"n": len(post), "classes": calibration(post)}
     s["calibration_preflop"] = {"n": sum(1 for r in rows if r["street"] == "preflop"),
                                 "classes": calibration([r for r in rows if r["street"] == "preflop"])}
+    s["by_row"] = by_row(rows, boot)
     if bet_fold:
         s["bet_fold_by_type"] = bet_fold
     if lrows:
@@ -631,6 +648,110 @@ def summarize(rows, lrows, skipped, bet_fold=None):
                      "summary_claims": _mean([x["covered"] / 100 for x in summ])}
         s["logged"] = lg
     return s
+
+
+# --- 액션 행별 채점 (크기·역할 변형을 합친 행) + 시트 단위 부트스트랩 -----------------------------------
+ROW_NAMES = ("check", "bet_small", "bet_med", "bet_big", "raise", "checkraise", "allin",
+             "call_small", "call_med", "call_big", "size_unknown")
+ROW_MIN_STREET = 10        # 스트리트 × 행은 n 이 이 이상일 때만
+
+
+def row_label(kind):
+    """_kind_label 결과 → 합친 행 이름 (cbet/lead/delay/probe/bet 은 bet_* 로). 해당 없으면 None."""
+    if not kind or kind.startswith("pre_"):
+        return None
+    if kind.endswith("_?"):
+        return "size_unknown"
+    if kind in ("check", "raise", "checkraise", "allin"):
+        return kind
+    head, _, size = kind.rpartition("_")
+    if size in ("small", "med", "big"):
+        return ("call_" if head == "call" else "bet_") + size
+    return None
+
+
+def _row_cluster_stats(rows, var="live"):
+    """(hand, seat) 묶음별 [n, 균등 ll 합, ll 합, cls_p 합, pit 합, zero 합]."""
+    bun = OrderedDict()
+    for r in rows:
+        v = bun.setdefault((r["hand"], r["seat"]), [0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        s = r[var]
+        v[0] += 1
+        v[1] += r["uniform"]["ll"]
+        v[2] += s["ll"]
+        v[3] += s["cls_p"]
+        v[4] += s["pit"]
+        v[5] += 1.0 if s["zero"] else 0.0
+    return list(bun.values())
+
+
+def _row_stats(vs):
+    n = sum(v[0] for v in vs)
+    if not n:
+        return None
+    t = [sum(v[j] for v in vs) for j in range(6)]
+    return {"bits": (t[1] - t[2]) / n / math.log(2), "cls_p": t[3] / n, "pit": t[4] / n, "zero": t[5] / n}
+
+
+def score_with_ci(rows, B=1000, seed=BOOT_SEED, var="live"):
+    """행 묶음 → n 과 지표(bits·cls_p·pit·zero)별 (추정, 하한, 상한). (hand, seat) 묶음을 다시 뽑는 부트스트랩, seed 고정."""
+    vecs = _row_cluster_stats(rows, var)
+    est = _row_stats(vecs)
+    out = {"n": len(rows), "n_seats": len(vecs)}
+    if est is None:
+        return out
+    draws = {k: [] for k in est}
+    if B > 0:
+        rng = random.Random(seed)
+        for _ in range(B):
+            st = _row_stats([vecs[rng.randrange(len(vecs))] for _ in vecs])
+            for k in est:
+                draws[k].append(st[k])
+    for k, x in est.items():
+        xs = sorted(draws[k])
+        out[k] = (x, _pctile(xs, 0.025), _pctile(xs, 0.975)) if xs else (x, None, None)
+    return out
+
+
+def class_calibration_ci(rows, var="live"):
+    """분류별 평균 예측 확률 vs 실제 빈도(+ Wilson 95%). 행 기준."""
+    if not rows:
+        return OrderedDict()
+    names = rows[0]["class_names"]
+    n = len(rows)
+    out = OrderedDict()
+    for i, nm in enumerate(names):
+        k = sum(1 for r in rows if r["actual_class"] == nm)
+        lo, hi = wilson(k, n)
+        out[nm] = {"pred": _mean([r[var]["cls_probs"][i] for r in rows]), "actual": k / n, "k": k,
+                   "lo": lo, "hi": hi}
+    return out
+
+
+def by_row(rows, B=1000, seed=BOOT_SEED):
+    """포스트플랍 행을 ROW_NAMES 로 합쳐 채점. → {"all": {행: {...}}, "street": {"flop/행": {...}}}"""
+    post = [r for r in rows if r["street"] != "preflop"]
+    for r in post:
+        r["_row"] = row_label(r["kind"])
+    pr = [r for r in post if r["_row"]]
+
+    def pack(v):
+        d = score_with_ci(v, B, seed)
+        d["classes"] = class_calibration_ci(v)
+        return d
+    out = OrderedDict(all=OrderedDict(), street=OrderedDict())
+    for nm in ROW_NAMES:
+        v = [r for r in pr if r["_row"] == nm]
+        if v:
+            out["all"][nm] = pack(v)
+    for st in ("flop", "turn", "river"):
+        for nm in ROW_NAMES:
+            v = [r for r in pr if r["street"] == st and r["_row"] == nm]
+            if len(v) >= ROW_MIN_STREET:
+                out["street"][f"{st}/{nm}"] = pack(v)
+    for r in post:
+        r.pop("_row", None)
+    return out
 
 
 # --- 기여 분리: 부트스트랩 -------------------------------------------------------------------------
@@ -824,6 +945,7 @@ def report(s, out=None):
     w("\n[포스트플랍 마지막 액션별 (크기=기록 금액 기준, _?=금액 모름 → 보통 크기로 계산)]\n")
     for k, a in s["by_kind"].items():
         w(_line(str(k), a) + "\n")
+    _report_by_row(s.get("by_row"), w)
     w("\n[프로필별]\n")
     for k, a in s["by_profile"].items():
         w(_line(k, a) + "\n")
@@ -866,6 +988,34 @@ def report(s, out=None):
 
 def _ci(x, d=3):
     return "-" if x is None else f"{x[0]:+.{d}f} [{x[1]:+.{d}f}, {x[2]:+.{d}f}]"
+
+
+def _ci_pt(x, d=2, pct=False):
+    if x is None:
+        return "-"
+    f = (lambda v: f"{v * 100:.0f}%") if pct else (lambda v: f"{v:+.{d}f}")
+    if x[1] is None:
+        return f(x[0])
+    return f"{f(x[0])} [{f(x[1])}, {f(x[2])}]"
+
+
+def _report_by_row(br, w):
+    if not br or not br.get("all"):
+        return
+    w("\n[액션 행별 채점 (포스트플랍, live; 크기·역할 합침; 95% 구간 = (hand, seat) 묶음 부트스트랩)]\n")
+    w("  행 / n / 정보이득 bit / 실제 분류 확률 / PIT / 0확률 비율\n")
+    for title, d in (("전체", br["all"]), ("스트리트별", br["street"])):
+        if not d:
+            continue
+        w(f" {title}\n")
+        for k, a in d.items():
+            w(f"  {k:<18} n={a['n']:>4} 좌석 {a['n_seats']:>4} | 이득 {_ci_pt(a['bits'])} | 분류확률 {_ci_pt(a['cls_p'], 2)}"
+              f" | PIT {_ci_pt(a['pit'], 2)} | 0확률 {_ci_pt(a['zero'], pct=True)}\n")
+    w("  행별 분류 보정 (예측 평균 → 실제 [Wilson 95%]; 큰 벳/올인 범위가 좁으면 실제가 예측보다 높은 분류가 보인다)\n")
+    for k, a in list(br["all"].items()):
+        parts = [f"{n} {_pct(v['pred'])}→{_pct(v['actual'])} [{_pct(v['lo'])}~{_pct(v['hi'])}]"
+                 for n, v in a["classes"].items() if v["pred"] >= 0.03 or v["actual"] > 0]
+        w(f"   {k} (n={a['n']}): " + " · ".join(parts) + "\n")
 
 
 def _report_ablation(ab, w):
@@ -920,7 +1070,7 @@ def main(argv=None):
     hands, decs = load(folder)
     abl = not args.no_ablation
     rows, lrows, skipped = score_hands(hands, decs, ok_only=args.ok_only, ablation=abl)
-    s = summarize(rows, lrows, skipped, bet_fold=bet_fold_rates(hands, decs))
+    s = summarize(rows, lrows, skipped, bet_fold=bet_fold_rates(hands, decs), boot=args.boot)
     if abl and args.boot > 0 and rows:
         post = bootstrap_ablation(rows, args.boot, subset=lambda r: r["street"] != "preflop")
         s["ablation"] = {"all": bootstrap_ablation(rows, args.boot), "post": post, "decision": decide(post)}

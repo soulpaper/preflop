@@ -124,6 +124,8 @@ class _Hand:
         self.issues = []
         self.notes = []
         self.pot = None
+        self.street_pot = {}     # 플랍/턴/리버 시작 때 화면 팟 (BB, 앤티 포함; 앞 스트리트 벳이 모인 뒤 ~ 이번 스트리트 첫 벳 전)
+        self._sp_frozen = set()
         self.shown = {}
         self.inhand_start = {0: None}
         self.over = False        # 남은 사람 1명 (나머지 폴드) 또는 화면상 핸드 종료
@@ -217,7 +219,8 @@ class Tracker:
         try:
             h = self.hand
             return to_handread(h.actions, {k: (s.pos.most_common(1)[0][0] if s.pos else None)
-                                           for k, s in h.seats.items()}) if h else {}
+                                           for k, s in h.seats.items()},
+                               street_pot=street_pot_named(h.street_pot)) if h else {}
         except Exception as exc:
             self.errors += 1
             self.last_error = repr(exc)
@@ -345,12 +348,27 @@ class Tracker:
             while h.street < street:
                 self._close_street(h)
                 self._open_street(h, seats)
+        if _num(pot) is not None:
+            self._street_pot(h, seats, _num(pot))   # 스트리트 전환 뒤에 (새 스트리트 팟을 앞 스트리트에 넣지 않게)
         if self._suspect():
             h.notes.append("skipped a frame (possible new hand)")
         elif not h.over:
             self._actions(h, seats)
             self._turns(h, state, t)
         return out
+
+    @staticmethod
+    def _street_pot(h, seats, pot):
+        """포스트플랍 스트리트 시작 팟: 좌석 앞에 벳이 하나도 안 보이는 프레임의 화면 팟 중 마지막 값 (그 스트리트 첫 벳이
+        보이면 확정). 화면 팟은 앤티를 포함하므로 handlog.bet_sizes 가 앱 어드바이저와 같은 팟 기준을 쓸 수 있다."""
+        st = h.street
+        if st < 1 or st in h._sp_frozen or pot <= 0:
+            return
+        if any((_num(s.get("bet")) or 0) > EPS for s in seats.values()):
+            if st in h.street_pot:
+                h._sp_frozen.add(st)
+        else:
+            h.street_pot[st] = pot
 
     def _turns(self, h, state, t):
         """차례 고리 기록 + 고리가 지나간 자리인데 RING_GRACE 프레임 안에 액션(벳/폴드/체크 말풍선)을 못 읽었으면
@@ -744,6 +762,8 @@ class Tracker:
             "notes": h.notes,
             "turns": h.turns,
         }
+        if h.street_pot:   # 선택 키: 스트리트 시작 화면 팟(BB). 없으면 bet_sizes 는 앤티 없는 팟으로 계산 (예전 기록)
+            rec["street_pot"] = street_pot_named(h.street_pot)
         names = {}
         for k, seat in h.seats.items():
             if seat.names:  # 닉네임은 메모리에만 (names_for). 같은 이름이 한 번이라도 잘려 읽혔으면 잘린 이름
@@ -917,13 +937,25 @@ def _pre_stacks(pre):
     return out
 
 
-def bet_sizes(actions, pre=None):
+def street_pot_named(sp):
+    """{스트리트 인덱스: 팟} → {"flop": x, ...} (기록용, 2자리 반올림)."""
+    return {STREETS[i]: round(v, 2) for i, v in sorted(sp.items()) if 1 <= i < len(STREETS)}
+
+
+def bet_sizes(actions, pre=None, street_pot=None, ante=0.0):
     """{(street, 액션 인덱스): 팟 대비 크기} (포스트플랍 bet/raise/call). 벳/레이즈 = 올린 만큼 / (콜한 뒤의 팟), 콜 = 받은 벳의 크기.
     'to' = 그 스트리트에서 그 좌석이 넣은 총액(BB). 금액을 모르거나 말이 안 되면(올인 아닌데 팟의 MAX_JUMP 배 초과) 크기 없음.
-    pre: 정리된 프리플랍 (없으면 clean_preflop). 앤티는 금액을 몰라 팟에서 빠진다 (벳 크기가 약간 크게 나올 수 있음)."""
+    pre: 정리된 프리플랍 (없으면 clean_preflop).
+    street_pot: {"flop": BB, "turn": BB, "river": BB} = 그 스트리트 시작 때 화면 팟 (앤티 포함; 기록 rec["street_pot"]). 있는 스트리트는
+    이 값을 팟 기준으로 쓴다 (앱 어드바이저와 같은 기준). 없으면 기록된 금액을 누적해 계산 — 이때 앤티는 모르므로 팟에서 빠진다
+    (벳 크기가 크게 나옴). ante: 그 경우 쓸 앤티 합계(BB) 추정값 (예: 결정 기록 ctx 의 ante), 기본 0."""
     pre = clean_preflop(actions.get("preflop"))[0] if pre is None else pre
-    pot, out = 0.0, {}
+    pot, out = max(0.0, _num(ante) or 0.0), {}
+    sp = street_pot if isinstance(street_pot, dict) else {}
     for st in STREETS:
+        base_pot = _num(sp.get(st)) if st != "preflop" else None
+        if base_pot is not None and base_pot > 0:
+            pot = base_pot
         put, level, last = {}, 0.0, None
         for i, a in enumerate(pre if st == "preflop" else (actions.get(st) or [])):
             k, act, to = a.get("seat"), a.get("act"), _num(a.get("to"))
@@ -951,9 +983,10 @@ def bet_sizes(actions, pre=None):
     return out
 
 
-def to_handread(actions, pos, clean=True, sizes=True):
+def to_handread(actions, pos, clean=True, sizes=True, street_pot=None, ante=0.0):
     """액션 목록({street: [action]}) + {seat: pos} → handread.estimate 의 seats 모양.
     clean: 프리플랍 정리(clean_preflop) + 올인/올인콜 좌석에 실제 올인 금액 'stack_bb'.
+    street_pot/ante: bet_sizes 참고 (스트리트 시작 화면 팟 / 앤티 추정).
     sizes: 포스트플랍 벳/콜/레이즈/올인에 기록 금액으로 계산한 팟 대비 크기를 붙인다 ({"a": "bet", "size": 0.66}, 금액 모르면 문자열)."""
     out = {k: {"pos": p, "preflop": [], "flop": [], "turn": [], "river": []} for k, p in pos.items()}
     pre = clean_preflop(actions.get("preflop"))[0] if clean else list(actions.get("preflop", []))
@@ -979,7 +1012,7 @@ def to_handread(actions, pos, clean=True, sizes=True):
         for k, amt in _pre_stacks(pre).items():
             if k in out and out[k]["preflop"] and out[k]["preflop"][-1] in ("jam", "call_jam"):
                 out[k]["stack_bb"] = round(amt, 1)
-    size_of = bet_sizes(actions, pre) if sizes else {}
+    size_of = bet_sizes(actions, pre, street_pot, ante) if sizes else {}
     # 주도권: 프리플랍 마지막 레이저 = 어그레서. 스트리트의 첫 벳이 (이전 스트리트 어그레서의 벳 = cbet / 어그레서 없이 콜러가 리드 = lead /
     # 어그레서가 앞 스트리트를 체크로 넘기고 벳 = delay / 체크로 넘어온 스트리트에 콜러가 벳 = probe)
     pre_raises = [a["seat"] for a in pre if a["act"] == "raise" and a["seat"] in out and not a.get("incomplete")]

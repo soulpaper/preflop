@@ -66,7 +66,7 @@ class Table:
                 "to_act": False, "preaction": False, "call": None, "can_check": False, "can_raise": False,
                 "street": None, "facing_allin": False, "preflop": None, "notes": []}
 
-    def step(self, bets=None, fold=(), bubble=None, allin=(), board=None, dt=1.0, collect=False, shown=None):
+    def step(self, bets=None, fold=(), bubble=None, allin=(), board=None, dt=1.0, collect=False, shown=None, pot=None):
         """한 프레임: 바뀐 것만 넣음. collect=True → 바닥 벳이 팟으로 모임 (스트리트 끝). shown: 쇼다운 공개 카드."""
         if collect:
             self.bets = {}
@@ -82,7 +82,7 @@ class Table:
             self.board = list(board)
         self.t += dt
         hero = ["back", "back"] if "hero" in self.folded else self.hero
-        recs = self.tr.update(self.snap(), hero, self.board, self.names, self.t, shown=shown)
+        recs = self.tr.update(self.snap(), hero, self.board, self.names, self.t, shown=shown, pot=pot)
         self.out += recs
         return recs
 
@@ -682,6 +682,37 @@ def test_shown_cards_in_record():
     assert set(rec["showdown"]["seats"]) == {"seat_BL", "hero"}, rec["showdown"]
     assert not any(a["act"] == "fold" for a in rec["actions"].get("river", [])), rec["actions"].get("river")
     assert st(rec, "seat_BL")["showdown"] == 1 and rec["seats"]["hero"]["shown"] is None
+
+
+def test_street_pot_recorded_from_screen_pot():
+    """화면 팟(앤티 포함)을 스트리트 시작(벳이 보이기 전)에 기록 -> rec["street_pot"], bet_sizes 가 그 팟 기준으로 계산."""
+    tb = Table(handlog.Tracker("s2p"))
+    tb.step(pot=1.5)
+    tb.step(bets={"UTG": 2.5}, bubble={"UTG": "raise"}, pot=4.0)
+    tb.step(fold=["MP", "CO"], pot=4.0)
+    tb.step(bets={"BTN": 2.5}, bubble={"BTN": "call"}, pot=6.5)
+    tb.step(fold=["SB"], pot=6.5)
+    tb.step(bets={"BB": 2.5}, bubble={"BB": "call"}, pot=9.0)
+    tb.step(board=["Ah", "7c", "2d"], collect=True, bubble={}, pot=11.0)    # 플랍: 팟 11 (앤티 3 포함)
+    tb.step(pot=11.0)
+    tb.step(bets={"UTG": 3.0}, bubble={"UTG": "raise"}, pot=14.0)          # 벳이 보인 뒤의 팟은 기록 안 함
+    tb.step(fold=["BTN"], bubble={"BTN": "fold"}, pot=14.0)
+    tb.step(fold=["BB"], pot=14.0)
+    rec = finish(tb)
+    assert rec.get("street_pot") == {"flop": 11.0}, rec.get("street_pot")
+    sz = handlog.bet_sizes(rec["actions"], street_pot=rec["street_pot"])
+    bet = [v for (s, i), v in sz.items() if s == "flop" and rec["actions"]["flop"][i]["act"] == "bet"]
+    assert bet and abs(bet[0] - 3.0 / 11.0) < 0.01, sz
+
+
+def test_street_pot_absent_without_pot():
+    tb = Table(handlog.Tracker("s2q"))
+    tb.step()
+    tb.step(bets={"UTG": 2.5}, bubble={"UTG": "raise"})
+    tb.step(fold=["MP", "CO", "BTN", "SB"])
+    tb.step(fold=["BB"])
+    rec = finish(tb)
+    assert "street_pot" not in rec
 
 
 def test_shown_late_read_undoes_grey_fold():

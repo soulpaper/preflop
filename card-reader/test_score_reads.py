@@ -387,7 +387,86 @@ with tempfile.TemporaryDirectory() as d:
     sr.main([d, "--json", outp, "--quiet", "--no-ablation"])
     with open(outp, encoding="utf-8") as f:
         jj = json.load(f)
+    test("main: summary.by_row 키 (행별 채점)", isinstance(jj["summary"].get("by_row"), dict)
+         and set(jj["summary"]["by_row"]) == {"all", "street"})
     test("main --no-ablation: abl 없음", "abl" not in jj["rows"][0] and "ablation" not in jj["summary"])
+
+
+# --- 11. 앤티와 벳 크기 (street_pot) -------------------------------------------------------------------------
+ACT_ANTE = {
+    "preflop": [A("W", "post", to=1.0, blind="BB"), A("V", "raise", to=3.0), A("hero", "fold", rb=1),
+                A("W", "call", to=3.0, rb=1)],
+    "flop": [A("W", "check"), A("V", "bet", to=3.0), A("W", "call", to=3.0, facing=True)],
+}
+s0 = handlog.bet_sizes(ACT_ANTE)
+test("bet_sizes: street_pot 없음 = 앤티 없는 팟 (3 into 6 = 0.5)", abs(s0[("flop", 1)] - 0.5) < 1e-9, str(s0))
+s1 = handlog.bet_sizes(ACT_ANTE, street_pot={"flop": 9.0})
+test("bet_sizes: 앤티 포함 화면 팟 9 → 33% (≤0.40, 작은 벳)", abs(s1[("flop", 1)] - 1 / 3) < 1e-9 and s1[("flop", 1)] <= 0.40,
+     str(s1))
+test("bet_sizes: 콜 크기도 같은 기준", abs(s1[("flop", 2)] - 1 / 3) < 1e-9)
+test("bet_sizes: 빈 street_pot / 다른 스트리트만 있으면 변화 없음",
+     handlog.bet_sizes(ACT_ANTE, street_pot={}) == s0 and handlog.bet_sizes(ACT_ANTE, street_pot={"turn": 20.0}) == s0)
+test("bet_sizes: ante 추정값 (예전 기록 폴백) 3 → 9 팟", abs(handlog.bet_sizes(ACT_ANTE, ante=3.0)[("flop", 1)] - 1 / 3) < 1e-9)
+test("bet_sizes: street_pot 이 ante 보다 우선", abs(handlog.bet_sizes(ACT_ANTE, street_pot={"flop": 12.0}, ante=3.0)[("flop", 1)]
+                                              - 0.25) < 1e-9)
+th = handlog.to_handread(ACT_ANTE, {"W": "BB", "V": "BTN", "hero": "CO"}, street_pot={"flop": 9.0})
+th0 = handlog.to_handread(ACT_ANTE, {"W": "BB", "V": "BTN", "hero": "CO"})
+test("to_handread: street_pot 이면 33% → small, 없으면 0.5 → med",
+     hr._norm_post(th["V"]["flop"])[-1][0] == "bet_small" and hr._norm_post(th0["V"]["flop"])[-1][0] == "bet_med",
+     f"{th['V']['flop']} {th0['V']['flop']}")
+recp = dict(hand("s-ante", ACT_ANTE, ["Ah", "7d", "2s"], {"V": ["As", "Kd"], "W": ["7h", "7c"]}), street_pot={"flop": 9.0})
+test("replay_seats: rec['street_pot'] 사용", sr.replay_seats(recp)["V"]["flop"][0] == {"a": "bet", "size": 0.333}
+     and sr.replay_seats(recp | {"street_pot": None})["V"]["flop"][0]["size"] == 0.5)
+
+# --- 12. 액션 행별 채점 + 신뢰구간 ----------------------------------------------------------------------------
+test("row_label: 합치기", [sr.row_label(k) for k in ("check", "cbet_small", "lead_big", "probe_med", "delay_big", "bet_med", "call_big",
+     "raise", "checkraise", "allin", "cbet_?", "call_?", "pre_open", None, "fold")]
+     == ["check", "bet_small", "bet_big", "bet_med", "bet_big", "bet_med", "call_big", "raise", "checkraise", "allin",
+         "size_unknown", "size_unknown", None, None, None])
+CN = list(hr.CLASSES_POST)
+
+
+def brow(h, kind, street="flop", cls=0, pred=None, ll=3.0, ull=5.0, seat="V", zero=False, pit=0.5):
+    probs = pred or [1 / 7] * 7
+    return {"hand": h, "seat": seat, "street": street, "kind": kind, "actual_class": CN[cls], "class_names": CN,
+            "live": {"ll": ll, "cls_p": probs[cls], "pit": pit, "zero": zero, "cls_probs": probs},
+            "uniform": {"ll": ull}}
+
+
+wide = [brow(f"h{i}", ("cbet_big" if i % 2 else "bet_big"), cls=i % 3, ll=3.0 + (i % 4) * 0.2, zero=(i % 10 == 0)) for i in range(40)]
+wide += [brow(f"c{i}", "check", street="turn", cls=1) for i in range(12)]
+wide += [brow("p0", "pre_open", street="preflop"), brow("u0", "fold")]
+r1 = sr.by_row(wide, B=50)
+r2 = sr.by_row(wide, B=50)
+test("by_row: 같은 seed 면 같은 결과", r1 == r2)
+test("by_row: bet_big 에 cbet/bet 합침 n=40, check n=12, 프리플랍/미해당 제외",
+     r1["all"]["bet_big"]["n"] == 40 and r1["all"]["check"]["n"] == 12 and set(r1["all"]) == {"bet_big", "check"},
+     str({k: v["n"] for k, v in r1["all"].items()}))
+bb_ = r1["all"]["bet_big"]
+exp_bits = (5.0 - sum(3.0 + (i % 4) * 0.2 for i in range(40)) / 40) / math.log(2)
+test("by_row: 정보이득 추정 = (균등 ll - ll)/ln2, 구간이 추정치를 감쌈",
+     abs(bb_["bits"][0] - exp_bits) < 1e-9 and bb_["bits"][1] <= bb_["bits"][0] <= bb_["bits"][2], str(bb_["bits"]))
+test("by_row: zero 비율 0.1, cls_p 1/7, PIT 0.5",
+     abs(bb_["zero"][0] - 0.1) < 1e-9 and abs(bb_["cls_p"][0] - 1 / 7) < 1e-9 and abs(bb_["pit"][0] - 0.5) < 1e-9)
+test("by_row: 스트리트 행은 n>=10 만 (flop/bet_big 40, turn/check 12)",
+     set(r1["street"]) == {"flop/bet_big", "turn/check"} and r1["street"]["flop/bet_big"]["n"] == 40)
+test("by_row: B=0 이면 구간 없음(추정치만)", sr.by_row(wide, B=0)["all"]["check"]["bits"][1] is None)
+one = [brow(f"o{i}", "allin", cls=2, ll=1.0, ull=5.0) for i in range(30)]    # 모든 묶음 같음 → 구간 폭 0
+test("by_row: 동일 묶음이면 구간 폭 0", len(set(round(x, 9) for x in sr.by_row(one, B=30)["all"]["allin"]["bits"])) == 1)
+# 묶음 단위: 같은 (hand, seat) 의 두 스트리트 행은 같이 뽑힘 → n_seats 는 묶음 수
+dupb = [brow("d1", "bet_big"), brow("d1", "bet_big", street="turn"), brow("d2", "bet_big")]
+test("by_row: n_seats = (hand, seat) 묶음 수", sr.by_row(dupb, B=5)["all"]["bet_big"]["n"] == 3
+     and sr.by_row(dupb, B=5)["all"]["bet_big"]["n_seats"] == 2)
+narrow = [0.02, 0.5, 0.02, 0.02, 0.02, 0.4, 0.02]       # 예측이 좁음: 분류 2 를 거의 안 봄
+cal = [brow(f"k{i}", "bet_big", cls=(2 if i < 15 else 1), pred=narrow) for i in range(20)]
+cc = sr.by_row(cal, B=5)["all"]["bet_big"]["classes"]
+test("class calibration: 예측 평균 vs 실제 빈도 + Wilson",
+     abs(cc[CN[2]]["pred"] - 0.02) < 1e-9 and abs(cc[CN[2]]["actual"] - 0.75) < 1e-9 and cc[CN[2]]["k"] == 15
+     and cc[CN[2]]["lo"] < 0.75 < cc[CN[2]]["hi"] and cc[CN[1]]["lo"] is not None and abs(sum(v["actual"] for v in cc.values()) - 1) < 1e-9)
+_bb3 = _io.StringIO()
+sr._report_by_row(r1, _bb3.write)
+test("report: 액션 행별 절 + 보정 줄", "액션 행별 채점" in _bb3.getvalue() and "bet_big" in _bb3.getvalue()
+     and "분류 보정" in _bb3.getvalue() and "flop/bet_big" in _bb3.getvalue())
 
 # --- 결과 ---------------------------------------------------------------------------------------
 failed = 0
