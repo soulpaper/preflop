@@ -41,8 +41,9 @@ RE_PATS = {
     "SESSION": r"^[0-9]{8}_[0-9]{6}$",
     "DID": r"^([0-9]{8}_[0-9]{6}-[0-9]{4,9}/[0-9]{1,9}|t[0-9]{1,16}-[0-9]{1,9})$",
     "DAY": r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
-    "HAND_NAME": (r"^((하이카드|원페어|투페어|트리플|스트레이트|플러시|풀하우스|포카드|스트레이트 플러시)"
-                  r"( \([2-9TJQKA](, [2-9TJQKA])?\))?|포켓 페어 [2-9TJQKA]{2}|[2-9TJQKA]{2}[so]  ·  (수딧|오프수딧))$"),
+    "HAND_NAME": (r"^(((하이카드|플러시|스트레이트|스트레이트 플러시) \([2-9TJQKA] 하이\))|((원페어|트리플|포카드) \([2-9TJQKA]\))"
+                  r"|(투페어 \([2-9TJQKA], [2-9TJQKA]\))|(풀하우스 \([2-9TJQKA] / [2-9TJQKA]\))"
+                  r"|(포켓 페어 [2-9TJQKA]{2})|([2-9TJQKA]{2}[so]  ·  (수딧|오프수딧)))$"),
     "SPOT": r"^[A-Z]{2,3}_[A-Z]{2}$",
     "NODE": r"^[a-z_]{1,24}(:[a-z0-9_.]{1,16})?$",
     "LINE": r"^[a-z0-9_]{1,24}$",
@@ -124,6 +125,11 @@ SEAT_TYPES = frozenset(["LAG", "LP", "TAG", "TP"])
 # 닉네임 모양 (부분 일치). Go regexp 와 같은 결과가 나오도록 ASCII 클래스 + 문자 2개만 쓴다.
 NICK_PATS = (r"[Uu][Ss][Ee][Rr][0-9]{2}", "[‥…]", r"[A-Za-z]{3}[0-9]{4}")
 NICK_RES = tuple(re.compile(p) for p in NICK_PATS)
+# 닉네임 모양 검사를 하는 잎 형식 (명세 14.1). 정규식이 빡빡하게 정해진 잎(pid, 카드, 좌석, 열거 등)은 검사하지 않는다.
+# 자유 텍스트 TEXT 와, 형식이 느슨해 닉네임이 들어갈 수 있는 LINE, NODE 와 "X"(issue code 등) 만 본다.
+NICK_TYPES = ("LINE", "NODE", "TEXT", "X")
+# "X" 잎 중 값이 엄격한 형식과 일치하면 검사하지 않는다 (pid, 좌석 type, type_src, 기록 type)
+_X_STRICT = (PID_RE, re.compile(r"LAG|LP|TAG|TP|popup|decision|resolution"))
 # 이름처럼 보이는 키 토큰 (ASCII 소문자 비교, 부분 문자열)
 NAME_TOKENS = ("name", "nick", "player", "user", "account", "screen", "display", "truncat", "placeholder",
                "linked", "owner", "alias", "닉네임", "이름", "닉")
@@ -269,7 +275,7 @@ def schema_dump():
     d = {"v": FILTER_V, "hands": SCHEMA_HANDS, "decision": SCHEMA_DECISION, "resolution": SCHEMA_RESOLUTION,
          "re": RE_PATS, "classes": list(CLASSES), "nick": list(NICK_PATS), "tokens": list(NAME_TOKENS),
          "retired": sorted(RETIRED), "types": TYPES, "enums": {k: sorted(v) for k, v in ENUMS.items()},
-         "text_max": TEXT_MAX, "badcp": [list(x) for x in BADCP], "accept_min": ACCEPT_MIN}
+         "nick_types": list(NICK_TYPES), "text_max": TEXT_MAX, "badcp": [list(x) for x in BADCP], "accept_min": ACCEPT_MIN}
     return json.dumps(d, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -308,6 +314,20 @@ def leaf_check(typ, v):
                         if lo <= o <= hi:
                             return bad
     return "ok"
+
+
+def nick_leaf(typ, v):
+    """잎 자리의 문자열 v 에 닉네임 모양 검사를 할지 (명세 14.1)."""
+    if typ not in NICK_TYPES:
+        return False
+    if typ == "X" and any(r.fullmatch(v) for r in _X_STRICT):
+        return False
+    return True
+
+
+def nick_key(s_last):
+    """맵 키 검사 여부: 경로에 이름 없이 "?" 로 표시되는 키(ACTKEY 맵 키 등)만 본다. 좌석 키처럼 형식이 정해진 키는 건너뛴다."""
+    return s_last == "?"
 
 
 SEAT_RE = _RES["SEAT"]
@@ -481,8 +501,8 @@ def _scan(v, node, segs, ctx, on_key, on_str=None, on_leaf=None, on_ctxkey=None,
                 return True
         return False
     if not isinstance(v, Obj):
-        if on_leaf and isinstance(node, str) and on_leaf(v, node, segs):
-            return True
+        if isinstance(node, str):           # 잎 자리의 값은 on_leaf 만 본다 (on_str 은 잎이 아닌 자리의 문자열용)
+            return bool(on_leaf and on_leaf(v, node, segs))
         return bool(type(v) is str and on_str and on_str(v, segs))
     if on_leaf and isinstance(node, str) and on_leaf(v, node, segs):
         return True
@@ -718,11 +738,12 @@ def _check_top(kind, top, accept):
     p = leaf_hit(top, sch, "bad")
     if p is not None:
         return Verdict("block", "value_format", 0, p)
-    # 19. nick_value
+    # 19. nick_value (명세 14.1)
     def hit(s):
         return any(p.search(s) for p in NICK_RES)
-    _scan(top, sch, [], "top", lambda k, s, ok: hit(k) and (found.append(".".join(s)) or True),
-          lambda v, s: hit(v) and (found.append(".".join(s)) or True))
+    _scan(top, sch, [], "top", lambda k, s, ok: nick_key(s[-1]) and hit(k) and (found.append(".".join(s)) or True),
+          lambda v, s: hit(v) and (found.append(".".join(s)) or True),
+          lambda v, typ, s: type(v) is str and nick_leaf(typ, v) and hit(v) and (found.append(".".join(s)) or True))
     if found:
         return Verdict("block", "nick_value", 0, found[0])
     return None
@@ -909,8 +930,9 @@ def filter_record(kind, rec, paths=None, vstats=None):
     def nick(s):
         return any(p.search(s) or p.search(unicodedata.normalize("NFKC", s)) for p in NICK_RES)
     hit = []
-    _scan(out, schema_for(kind, out), [], "top", lambda k, s, ok: nick(k) and (hit.append(".".join(s)) or True),
-          lambda v, s: nick(v) and (hit.append(".".join(s)) or True))
+    _scan(out, schema_for(kind, out), [], "top", lambda k, s, ok: nick_key(s[-1]) and nick(k) and (hit.append(".".join(s)) or True),
+          lambda v, s: nick(v) and (hit.append(".".join(s)) or True),
+          lambda v, typ, s: type(v) is str and nick_leaf(typ, v) and nick(v) and (hit.append(".".join(s)) or True))
     if hit:
         raise FilterBlock("nick_value", hit[0])
     out["redacted"] = IntLit(str(FILTER_V))

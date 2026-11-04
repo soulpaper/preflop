@@ -16,6 +16,7 @@ import http.client
 import http.server
 import json
 import os
+import random
 import shutil
 import socket
 import ssl
@@ -35,9 +36,9 @@ import records_sync as RS  # noqa: E402
 
 FIXTURES = os.path.join(HERE, "testdata", "records_fixtures.jsonl")
 # sharebox server/testdata/records_fixtures.jsonl 과 바이트 동일해야 한다. 고치면 양쪽 상수와 사본을 같이 고친다.
-FIXTURES_SHA256 = "afb6228b2d07806f2efb562ed8ed7139c919bdae95b8fcaa32f720effddef5ec"
+FIXTURES_SHA256 = "a83dcb9caa5da156f644f22aff5549ddc5d1abef74f3e6266c1c486cef1606b6"
 # 스키마 정규화 덤프의 sha256. sharebox server/records_check_test.go 의 recordsSchemaSHA256 과 같아야 한다.
-RECORDS_SCHEMA_SHA256 = "1c310d46b6c2208e9b32db98a2ac38107b6a67e22059990c597f62e05b9c4c15"
+RECORDS_SCHEMA_SHA256 = "6a2bfa011cce4b69a2f6e0105c273890b5657c53a8146a91cd4decf7b97288b1"
 BIN = os.environ.get("RECORDS_TEST_SHAREBOXD")
 TMP = tempfile.mkdtemp(prefix="records-test-")
 REAL_HOME = os.environ.get("HOME")
@@ -745,6 +746,17 @@ class T29_Fixtures(unittest.TestCase):
             self.skipTest("sharebox 원본 없음 (RECORDS_SHAREBOX_SRC 로 경로를 준다)")
         with open(src, "rb") as f:
             self.assertEqual(f.read(), raw)
+
+    def test_29_fixture_pinned_binary(self):
+        """CRLF 로 체크아웃되면 SHA 가 달라진다 (git core.autocrlf): .gitattributes 로 -text 를 고정했는지 본다."""
+        with open(os.path.join(HERE, "testdata", "records_fixtures.jsonl"), "rb") as f:
+            self.assertNotIn(b"\r", f.read())
+        ga = os.path.join(HERE, ".gitattributes")
+        if not os.path.isfile(ga):
+            self.skipTest("card-reader 폴더 밖에서 복사해 쓰는 중 (.gitattributes 없음)")
+        with open(ga, encoding="utf-8") as f:
+            rules = [x.split() for x in f.read().splitlines() if x.strip() and not x.startswith("#")]
+        self.assertIn(["testdata/records_fixtures.jsonl", "-text"], rules)
 
     def test_29_all_cases(self):
         n = 0
@@ -1822,17 +1834,28 @@ class T53_GeneratedValues(unittest.TestCase):
             self.assertTrue(RC._RES["HAND_NAME"].fullmatch(n) or RC._RES["HAND_NAME"].match(n + " (A)") or
                             n.split()[0] in n, n)
 
-    def test_53_real_generated_lines_pass_filter(self):
+    @staticmethod
+    def _import_td():
+        """생성 코드 시험 도우미. numpy 가 없으면(리눅스) 빈 numpy 모듈로 대신해서 numpy 없이 가져온다
+        (test_handlog 는 numpy 를 import 만 하고 이 시험이 쓰는 경로에서는 쓰지 않는다)."""
         try:
-            import test_decisionlog as TD
-            import decisionlog as dl
-        except Exception as e:                          # numpy 등이 없으면 건너뜀
-            self.skipTest("생성 코드 시험 도우미를 읽지 못함: %s" % type(e).__name__)
+            import numpy  # noqa: F401
+        except ImportError:
+            import types
+            sys.modules.setdefault("numpy", types.ModuleType("numpy"))
+        import test_decisionlog as TD
+        import decisionlog as dl
+        return TD, dl
+
+    def test_53_real_generated_lines_pass_filter(self):
+        TD, dl = self._import_td()
+        import evaluator as ev
         d = tempfile.mkdtemp(prefix="rec53-")
         try:
-            tb = TD.play_to_flop_bet()
+            tb = TD.play_to_flop_bet(tag=None)          # 실제 앱처럼 기본 세션 id (시간 기반)
             log = dl.DecisionLog(d)
-            log.record(TD.make_ctx(), TD.make_advice(), state=tb.tr, t=time.time())
+            name = ev.hand_name(ev.evaluate([ev.parse_card(c) for c in ("Ah", "Kd", "Ac", "7c", "2d")]))
+            log.record(TD.make_ctx(hand_name=name), TD.make_advice(), state=tb.tr, t=time.time())
             rec = TD.finish_call_to_showdown(tb)
             log.link_hand(rec)
             lines = []
@@ -1843,9 +1866,63 @@ class T53_GeneratedValues(unittest.TestCase):
             for kind, text in lines:
                 st = _stats()
                 _, dk = RC.filter_record(kind, RC.parse_line(text), st["paths"], st)
-                self.assertEqual((dk, st["values"]), (0, 0), (kind, dict(st["paths"]), dict(st["vpaths"])))
+                # hands 의 notes(자유 문장)는 스키마에 없어 일부러 버려진다. 그 밖에는 버려지거나 형식이 틀린 값이 없어야 한다
+                self.assertLessEqual(set(st["paths"]), {"notes"}, (kind, dict(st["paths"])))
+                self.assertEqual(st["values"], 0, (kind, dict(st["paths"]), dict(st["vpaths"])))
+            ids = [json.loads(x) for k, x in lines]
+            self.assertTrue(RC._RES["HID"].fullmatch(rec["id"]), "hand id")
+            self.assertTrue(RC._RES["SESSION"].fullmatch(rec["session"]), "session")
+            for r in ids:
+                if r.get("type") in ("decision", "resolution"):
+                    self.assertTrue(RC._RES["DID"].fullmatch(r["id"]), "decision id")
+                if r.get("type") == "decision":
+                    self.assertTrue(RC._RES["HID"].fullmatch(r["hand_id"]), "hand_id")
+                    self.assertTrue(RC._RES["DAY"].fullmatch(r["day"]), "day")
         finally:
             shutil.rmtree(d, ignore_errors=True)
+
+    def test_53_decision_id_without_hand(self):
+        """핸드 id 가 없을 때의 결정 id 모양 (t<밀리초>-<번호>)."""
+        TD, dl = self._import_td()
+        d = tempfile.mkdtemp(prefix="rec53b-")
+        try:
+            log = dl.DecisionLog(d)
+            did = log.record(TD.make_ctx(hand_name="원페어 (A)"), TD.make_advice(), t=1793821519.5)
+            self.assertTrue(RC._RES["DID"].fullmatch(did), "id shape")
+            self.assertTrue(did.startswith("t"))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_53_hand_name_generated_forms(self):
+        """evaluator.hand_name 과 reader.preflop_name 이 만드는 모든 값이 HAND_NAME 에 맞는다 (소스를 그대로 가져와 실행)."""
+        import evaluator as ev
+        with open(os.path.join(HERE, "reader.py"), encoding="utf-8") as f:
+            fn = next(n for n in ast.parse(f.read()).body if isinstance(n, ast.FunctionDef) and n.name == "preflop_name")
+        ns = {"ev": ev}
+        exec(compile(ast.Module([fn], []), "reader.py", "exec"), ns)
+        pre = ns["preflop_name"]
+        pat = RC._RES["HAND_NAME"]
+        names = set()
+        for a in range(52):
+            for b in range(a + 1, 52):
+                names.add(pre([a, b]))
+        rnd = random.Random(53)
+        cats = set()
+        deck = list(range(52))
+        for _ in range(4000):
+            cs = rnd.sample(deck, rnd.choice((5, 6, 7)))
+            sc = ev.evaluate(cs)
+            cats.add(sc[0])
+            names.add(ev.hand_name(sc))
+        for cards in (["As", "Ks", "Qs", "Js", "Ts"], ["As", "2h", "3d", "4c", "5s"], ["9s", "9h", "9d", "9c", "2s"],
+                      ["Ks", "Kh", "Kd", "2c", "2s"], ["2s", "2h", "5d", "5c", "9s", "9h"]):
+            sc = ev.evaluate([ev.parse_card(c) for c in cards])
+            cats.add(sc[0])
+            names.add(ev.hand_name(sc))
+        self.assertEqual(cats, set(range(9)))
+        self.assertGreater(len(names), 100)
+        for n in sorted(names):
+            self.assertTrue(pat.fullmatch(n), n)
 
 
 class T54_Text(unittest.TestCase):
@@ -1875,6 +1952,19 @@ class T54_Text(unittest.TestCase):
             with self.subTest("ok %04X" % cp):
                 rec, st = self.body("a" + chr(cp) + "b")
                 self.assertEqual(rec["advice"]["reason"], "a" + chr(cp) + "b")
+
+    def test_54_pid_nick_shaped_passes_but_text_stops(self):
+        """정상 pid 는 닉네임 모양처럼 보여도 통과한다 (명세 14.1). 자유 텍스트의 같은 모양은 여전히 막는다."""
+        pids = ["p_abc12345", "p_def45678", "p_fed00001"]
+        seats = {"opp%d" % (i + 1): {"pid": p, "type": "LAG", "type_src": "popup"} for i, p in enumerate(pids)}
+        raw = json.dumps({"id": DID0, "type": "decision", "seats": seats}).encode() + b"\n"
+        st = _stats()
+        b = RS.build_body(D0, raw, None, st)[0]
+        self.assertEqual(sorted(x["pid"] for x in json.loads(b)["seats"].values()), sorted(pids))
+        self.assertTrue(RC.check_body(D0, b).ok())
+        with self.assertRaises(RS.Block) as cm:
+            self.body("call abc1234 now")
+        self.assertEqual(cm.exception.rule, "nick_value")
 
     def test_54_fullwidth_still_stops(self):
         with self.assertRaises(RS.Block) as cm:
