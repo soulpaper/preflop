@@ -46,8 +46,6 @@ import math
 from collections import Counter
 from functools import lru_cache
 
-import numpy as np
-
 STRUCTURES = {"standard": (1.0, 0.5), "flat": (0.70, 1.0), "top_heavy": (1.35, 0.3)}
 PAID_FRAC = 0.15
 EXACT_MAX = 11
@@ -56,11 +54,30 @@ STAGE_LABEL = {"early": "초반", "mid": "중반", "near_bubble": "버블 근처
                "final": "파이널 테이블", "unknown": "상금 구조 모름"}
 
 # 지수 경주 적분 격자: x = e^y, ∫ e^-x g(x) dx = ∫ x e^-x g(x) dy
-_Y = np.linspace(-26.0, 4.5, 340)
-_X = np.exp(_Y)
-_W = _X * np.exp(-_X) * (_Y[1] - _Y[0])
-_W[0] *= 0.5
-_W[-1] *= 0.5
+# numpy 는 살아 있는 인원 > EXACT_MAX 일 때만 필요하므로 처음 쓸 때 import 한다.
+_GRID = None
+
+
+def numpy_available():
+    try:
+        import numpy  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _grid():
+    """(np, X, W) — 처음 부를 때 numpy 를 import 해 격자를 만들고 캐시."""
+    global _GRID
+    if _GRID is None:
+        import numpy as np
+        y = np.linspace(-26.0, 4.5, 340)
+        x = np.exp(y)
+        w = x * np.exp(-x) * (y[1] - y[0])
+        w[0] *= 0.5
+        w[-1] *= 0.5
+        _GRID = (np, x, w)
+    return _GRID
 
 
 # --- 상금 구조 -------------------------------------------------------------------------
@@ -159,6 +176,7 @@ def _exact(st, pays):
 
 def _place_dist(hero, groups, K):
     """내 순위 분포 P(내 앞에 k 명) k=0..K-1 (지수 경주 적분).  groups: [(stack, count)] (stack > 0)."""
+    np, _X, _W = _grid()
     dist = np.zeros((_X.size, K))
     dist[:, 0] = 1.0
     for s, cnt in groups:
@@ -219,7 +237,7 @@ def hero_equity(hero, others, pays):
         st = [float(hero)] + [s for s, c in groups for _ in range(c)]
         return _exact(st, pays[:n_alive])[0]
     d = _place_dist(float(hero), groups, K)
-    return float(np.dot(d, pays[:K]))
+    return float(_grid()[0].dot(d, pays[:K]))
 
 
 def icm_equities(stacks, payouts_):
@@ -246,7 +264,7 @@ def icm_equities(stacks, payouts_):
     for i in alive:
         others = [st[j] for j in alive if j != i]
         groups, _ = _groups(others)
-        out[i] = float(np.dot(_place_dist(st[i], groups, K), pays[:K]))
+        out[i] = float(_grid()[0].dot(_place_dist(st[i], groups, K), pays[:K]))
     return out
 
 

@@ -9,6 +9,8 @@ import sys
 import time
 
 import advisor
+import icm
+import preflop as pf
 import evaluator as ev
 from advisor import recommend
 
@@ -896,117 +898,120 @@ if solved:
     results.append((warm < 30, f"GTO 실제 라이브러리: 캐시된 recommend {warm:.2f} ms (< 30)", r))
 
 # --- 토너먼트 ICM (icm.py) ----------------------------------------------------------------
-# 9인 MTT, 앤티 1.35BB (BB 100 / 앤티 15 × 9).  버블: 30명 남음 / 27명 지급, 평균 25BB
-TPF = dict(PF, ante=1.35, players=9)
-BUB = {"players_left": 30, "paid": 27, "avg_stack_bb": 25}
-TABLE = {1: 40, 2: 22, 3: 18, 4: 30, 5: 15, 6: 25, 7: 35, 8: 20}
-FT = {"players_left": 5, "paid": 27, "avg_stack_bb": 40}
-EARLY = {"players_left": 900, "entrants": 1000, "avg_stack_bb": 30}
+if icm.numpy_available():
+    # 9인 MTT, 앤티 1.35BB (BB 100 / 앤티 15 × 9).  버블: 30명 남음 / 27명 지급, 평균 25BB
+    TPF = dict(PF, ante=1.35, players=9)
+    BUB = {"players_left": 30, "paid": 27, "avg_stack_bb": 25}
+    TABLE = {1: 40, 2: 22, 3: 18, 4: 30, 5: 15, 6: 25, 7: 35, 8: 20}
+    FT = {"players_left": 5, "paid": 27, "avg_stack_bb": 40}
+    EARLY = {"players_left": 900, "entrants": 1000, "avg_stack_bb": 30}
 
 
-# 버블 숏스택: 칩EV 로는 +EV 인 잼 콜 (범위 승률 45% > 팟 오즈 43%) 이 ICM 으로는 -EV → 폴드
-JAMCALL = dict(TPF, hero=["Ad", "9c"], hero_pos="BB", villain_pos="CO", situation="jamcall", stack_bb=12, my_stack=12,
-               call=11, pot_total=14.85, can_check=False, facing_allin=True, equity=0.45, equity_basis="range")
-check("ICM 없음: 12BB A9o 잼 콜 (범위 승률 45% > 팟 오즈 43%) → 콜", JAMCALL, "콜")
-check("ICM 버블: 같은 잼 콜 → 폴드 (버블 팩터로 필요 승률 43%→55%)",
-      dict(JAMCALL, tournament=BUB, table_stacks_bb=TABLE, villain_stack_bb=28), "폴드", detail_has="ICM: 버블 팩터")
-check("ICM 버블: 덮이는 12BB 는 범위 승률 50% 도 폴드 (필요 55%)",
-      dict(JAMCALL, equity=0.50, tournament=BUB, table_stacks_bb=TABLE, villain_stack_bb=28), "폴드")
-check("ICM 버블: 내가 덮는 쪽(60BB vs 12BB 잼)이면 범위 승률 50% → 콜 (버블 팩터 ~1.1, 필요 45%)",
-      dict(JAMCALL, equity=0.50, my_stack=60, tournament=BUB, table_stacks_bb=TABLE, villain_stack_bb=0), "콜",
-      detail_has="필요 승률 43%→45%")
-# 포스트플랍 올인 콜도 같은 원리
-TURN_AI = dict(hero=["Ah", "Jd"], board=["Jc", "8s", "4d", "2h"], street="turn", opponents_in_hand=1, hero_pos="BB",
-               villain_pos="BTN", stack_bb=22, my_stack=22, pot=12, pot_total=34, call=22, to_act=True, can_check=False,
-               facing_allin=True, equity=0.55, equity_basis="range")
-check("ICM 없음: 턴 탑페어 올인 콜 (보정 에쿼티 52% > 필요 37%) → 콜", TURN_AI, "콜")
-check("ICM 버블: 덮인 숏스택의 같은 올인 콜 → 폴드", dict(TURN_AI, tournament=BUB, table_stacks_bb=TABLE, villain_stack_bb=40),
-      "폴드", detail_has="ICM: 버블 팩터", reason_has="(ICM)")
+    # 버블 숏스택: 칩EV 로는 +EV 인 잼 콜 (범위 승률 45% > 팟 오즈 43%) 이 ICM 으로는 -EV → 폴드
+    JAMCALL = dict(TPF, hero=["Ad", "9c"], hero_pos="BB", villain_pos="CO", situation="jamcall", stack_bb=12, my_stack=12,
+                   call=11, pot_total=14.85, can_check=False, facing_allin=True, equity=0.45, equity_basis="range")
+    check("ICM 없음: 12BB A9o 잼 콜 (범위 승률 45% > 팟 오즈 43%) → 콜", JAMCALL, "콜")
+    check("ICM 버블: 같은 잼 콜 → 폴드 (버블 팩터로 필요 승률 43%→55%)",
+          dict(JAMCALL, tournament=BUB, table_stacks_bb=TABLE, villain_stack_bb=28), "폴드", detail_has="ICM: 버블 팩터")
+    check("ICM 버블: 덮이는 12BB 는 범위 승률 50% 도 폴드 (필요 55%)",
+          dict(JAMCALL, equity=0.50, tournament=BUB, table_stacks_bb=TABLE, villain_stack_bb=28), "폴드")
+    check("ICM 버블: 내가 덮는 쪽(60BB vs 12BB 잼)이면 범위 승률 50% → 콜 (버블 팩터 ~1.1, 필요 45%)",
+          dict(JAMCALL, equity=0.50, my_stack=60, tournament=BUB, table_stacks_bb=TABLE, villain_stack_bb=0), "콜",
+          detail_has="필요 승률 43%→45%")
+    # 포스트플랍 올인 콜도 같은 원리
+    TURN_AI = dict(hero=["Ah", "Jd"], board=["Jc", "8s", "4d", "2h"], street="turn", opponents_in_hand=1, hero_pos="BB",
+                   villain_pos="BTN", stack_bb=22, my_stack=22, pot=12, pot_total=34, call=22, to_act=True, can_check=False,
+                   facing_allin=True, equity=0.55, equity_basis="range")
+    check("ICM 없음: 턴 탑페어 올인 콜 (보정 에쿼티 52% > 필요 37%) → 콜", TURN_AI, "콜")
+    check("ICM 버블: 덮인 숏스택의 같은 올인 콜 → 폴드", dict(TURN_AI, tournament=BUB, table_stacks_bb=TABLE, villain_stack_bb=40),
+          "폴드", detail_has="ICM: 버블 팩터", reason_has="(ICM)")
 
-# 칩 리더는 버블에서 미디엄 스택 상대로 더 넓게 잼 (상대가 콜하기 어렵다), 미디엄 스택은 칩 리더 상대로 더 좁게
-JAM = dict(TPF, hero_pos="CO", situation="jam", stack_bb=12, call=1, pot_total=2.85, can_check=False)
-check("ICM 없음: CO 12BB K5o 첫 진입 → 폴드 (잼 범위 밖)", dict(JAM, hero=["Kc", "5d"], my_stack=80), "폴드")
-check("ICM 버블 칩 리더(80BB) vs 12BB: K5o → 잼 (상대 콜 버블 팩터가 커서 폭 ×1.2)",
-      dict(JAM, hero=["Kc", "5d"], my_stack=80, tournament=BUB, table_stacks_bb=TABLE, villain_stack_bb=12), "올인",
-      detail_has="잼 폭")
-check("ICM 없음: CO 12BB K9o 첫 진입 → 잼", dict(JAM, hero=["Kc", "9d"], my_stack=12), "올인")
-check("ICM 버블 12BB vs 칩 리더 80BB: K9o → 폴드 (덮이는 잼은 좁게)",
-      dict(JAM, hero=["Kc", "9d"], my_stack=12, tournament=BUB, table_stacks_bb={**TABLE, 9: 80}, villain_stack_bb=80), "폴드")
-check("ICM 버블 칩 리더: AA 는 여전히 잼", dict(JAM, hero=["Ac", "Ad"], my_stack=80, tournament=BUB, table_stacks_bb=TABLE,
-                                           villain_stack_bb=12), "올인")
+    # 칩 리더는 버블에서 미디엄 스택 상대로 더 넓게 잼 (상대가 콜하기 어렵다), 미디엄 스택은 칩 리더 상대로 더 좁게
+    JAM = dict(TPF, hero_pos="CO", situation="jam", stack_bb=12, call=1, pot_total=2.85, can_check=False)
+    check("ICM 없음: CO 12BB K5o 첫 진입 → 폴드 (잼 범위 밖)", dict(JAM, hero=["Kc", "5d"], my_stack=80), "폴드")
+    check("ICM 버블 칩 리더(80BB) vs 12BB: K5o → 잼 (상대 콜 버블 팩터가 커서 폭 ×1.2)",
+          dict(JAM, hero=["Kc", "5d"], my_stack=80, tournament=BUB, table_stacks_bb=TABLE, villain_stack_bb=12), "올인",
+          detail_has="잼 폭")
+    check("ICM 없음: CO 12BB K9o 첫 진입 → 잼", dict(JAM, hero=["Kc", "9d"], my_stack=12), "올인")
+    check("ICM 버블 12BB vs 칩 리더 80BB: K9o → 폴드 (덮이는 잼은 좁게)",
+          dict(JAM, hero=["Kc", "9d"], my_stack=12, tournament=BUB, table_stacks_bb={**TABLE, 9: 80}, villain_stack_bb=80), "폴드")
+    check("ICM 버블 칩 리더: AA 는 여전히 잼", dict(JAM, hero=["Ac", "Ad"], my_stack=80, tournament=BUB, table_stacks_bb=TABLE,
+                                               villain_stack_bb=12), "올인")
 
-# 파이널 테이블 페이 점프: 더 짧은 스택(6BB)이 있을 때 미디엄 스택이 빅스택 올인에 콜 → 폴드
-FT_AI = dict(TURN_AI, equity=0.62)
-check("ICM 없음: 턴 탑페어 62% 올인 콜 → 콜", FT_AI, "콜")
-r = check("ICM 파이널 테이블(5명): 6BB 숏스택이 있으니 같은 콜 → 폴드 (페이 점프)",
-          dict(FT_AI, tournament=FT, table_stacks_bb={1: 90, 2: 60, 3: 6, 4: 40}, villain_stack_bb=40), "폴드",
-          detail_has="파이널 테이블")
+    # 파이널 테이블 페이 점프: 더 짧은 스택(6BB)이 있을 때 미디엄 스택이 빅스택 올인에 콜 → 폴드
+    FT_AI = dict(TURN_AI, equity=0.62)
+    check("ICM 없음: 턴 탑페어 62% 올인 콜 → 콜", FT_AI, "콜")
+    r = check("ICM 파이널 테이블(5명): 6BB 숏스택이 있으니 같은 콜 → 폴드 (페이 점프)",
+              dict(FT_AI, tournament=FT, table_stacks_bb={1: 90, 2: 60, 3: 6, 4: 40}, villain_stack_bb=40), "폴드",
+              detail_has="파이널 테이블")
 
-# 초반 (멀리서): 동작 동일 / 지급 인원 모름: 동작 동일
-same = True
-for base in (JAMCALL, TURN_AI, dict(JAM, hero=["Kc", "9d"], my_stack=12),
-             dict(TPF, hero=["Kd", "9c"], hero_pos="HJ", situation="open", stack_bb=25, my_stack=25, call=1, pot_total=2.85),
-             dict(hero=["Kh", "Jd"], board=["Jc", "8s", "4d"], street="flop", opponents_in_hand=1, hero_pos="BB",
-                  villain_pos="BTN", stack_bb=25, my_stack=25, pot=5, pot_total=8, call=3, to_act=False, can_check=False,
-                  equity=0.62)):
-    a = recommend(base)
-    for t in (EARLY, {"players_left": 32, "my_rank": "6/32"}, {"my_rank": "6/32"}, {"players_left": 400, "paid": 27}):
-        same = same and recommend(dict(base, tournament=t, table_stacks_bb=TABLE, villain_stack_bb=30)) == a
-results.append((same, "ICM 초반(900/1000, 400/27명 지급)·지급 인원 모름: 추천이 ICM 없을 때와 완전히 같음", a))
+    # 초반 (멀리서): 동작 동일 / 지급 인원 모름: 동작 동일
+    same = True
+    for base in (JAMCALL, TURN_AI, dict(JAM, hero=["Kc", "9d"], my_stack=12),
+                 dict(TPF, hero=["Kd", "9c"], hero_pos="HJ", situation="open", stack_bb=25, my_stack=25, call=1, pot_total=2.85),
+                 dict(hero=["Kh", "Jd"], board=["Jc", "8s", "4d"], street="flop", opponents_in_hand=1, hero_pos="BB",
+                      villain_pos="BTN", stack_bb=25, my_stack=25, pot=5, pot_total=8, call=3, to_act=False, can_check=False,
+                      equity=0.62)):
+        a = recommend(base)
+        for t in (EARLY, {"players_left": 32, "my_rank": "6/32"}, {"my_rank": "6/32"}, {"players_left": 400, "paid": 27}):
+            same = same and recommend(dict(base, tournament=t, table_stacks_bb=TABLE, villain_stack_bb=30)) == a
+    results.append((same, "ICM 초반(900/1000, 400/27명 지급)·지급 인원 모름: 추천이 ICM 없을 때와 완전히 같음", a))
 
-# 인 더 머니: 막 진입 vs 깊이 (파이널) — 같은 콜이 깊을수록 무겁다
-ITM_AI = dict(TURN_AI, equity=0.66)
-r1 = check("ICM 인 더 머니 막 진입(26/27명): 탑페어 66% 올인 콜 → 콜",
-           dict(ITM_AI, tournament={"players_left": 26, "paid": 27, "avg_stack_bb": 26}, table_stacks_bb={1: 40, 2: 26, 3: 30},
-                villain_stack_bb=40), "콜", detail_has="인 더 머니")
-r2 = check("ICM 인 더 머니 깊이(파이널 5명): 같은 콜 → 폴드",
-           dict(ITM_AI, tournament=FT, table_stacks_bb={1: 90, 2: 60, 3: 30, 4: 40}, villain_stack_bb=40), "폴드",
-           detail_has="파이널 테이블")
-
-
-def icm_need(res):
-    for d in res["detail"]:
-        m = re.search(r"필요 승률 (\d+)%→(\d+)%", d)
-        if m:
-            return int(m.group(1)), int(m.group(2))
-    return None
+    # 인 더 머니: 막 진입 vs 깊이 (파이널) — 같은 콜이 깊을수록 무겁다
+    ITM_AI = dict(TURN_AI, equity=0.66)
+    r1 = check("ICM 인 더 머니 막 진입(26/27명): 탑페어 66% 올인 콜 → 콜",
+               dict(ITM_AI, tournament={"players_left": 26, "paid": 27, "avg_stack_bb": 26}, table_stacks_bb={1: 40, 2: 26, 3: 30},
+                    villain_stack_bb=40), "콜", detail_has="인 더 머니")
+    r2 = check("ICM 인 더 머니 깊이(파이널 5명): 같은 콜 → 폴드",
+               dict(ITM_AI, tournament=FT, table_stacks_bb={1: 90, 2: 60, 3: 30, 4: 40}, villain_stack_bb=40), "폴드",
+               detail_has="파이널 테이블")
 
 
-n1, n2 = icm_need(r1), icm_need(r2)
-results.append((bool(n1 and n2 and n1[0] == n2[0] and n2[1] > n1[1] > n1[0]),
-                f"ICM 필요 승률: 칩 {n1 and n1[0]}% → 막 진입 {n1 and n1[1]}% < 파이널 {n2 and n2[1]}%", r2))
+    def icm_need(res):
+        for d in res["detail"]:
+            m = re.search(r"필요 승률 (\d+)%→(\d+)%", d)
+            if m:
+                return int(m.group(1)), int(m.group(2))
+        return None
 
-# 올인 아닌 결정: 오픈 폭이 버블에서 좁아지고 (빅스택은 유지), 콜 여유에 위험 프리미엄
-OPEN = dict(TPF, hero=["4h", "4d"], hero_pos="HJ", situation="open", stack_bb=25, my_stack=25, call=1, pot_total=2.85,
-            can_check=False)
-check("ICM 없음: HJ 25BB 44 첫 진입 → 레이즈", OPEN, "레이즈")
-check("ICM 버블 미디엄 스택: 44 → 폴드 (레인지 × 0.74)", dict(OPEN, tournament=BUB, table_stacks_bb=TABLE), "폴드",
-      detail_has="레인지 ×")
-check("ICM 버블 빅스택(70BB, 덮음): 44 → 레이즈 (압박: 오픈 폭 유지/조금 넓게)",
-      dict(OPEN, my_stack=70, tournament=BUB, table_stacks_bb=TABLE), "레이즈", detail_has="빅스택 압박")
-FLOP_BET = dict(hero=["Kh", "Jd"], board=["Jc", "8s", "4d"], street="flop", opponents_in_hand=1, hero_pos="BB",
-                villain_pos="BTN", stack_bb=25, my_stack=25, pot=5, pot_total=8, call=3, to_act=True, can_check=False,
-                equity=0.62)
-check("ICM 버블: 플랍 탑페어 벳에 콜 — 필요 승률에 위험 프리미엄 가산 표기",
-      dict(FLOP_BET, tournament=BUB, table_stacks_bb=TABLE, villain_stack_bb=40), "콜", detail_has="(ICM)")
 
-# 너트는 ICM 이 아무리 커도 접지 않는다 (리버 너트 올인 콜, 파이널 테이블 덮인 스택)
-NUTS = dict(hero=["Ah", "Kh"], board=["Qh", "Jh", "Th", "2c", "3d"], street="river", opponents_in_hand=1, hero_pos="BB",
-            villain_pos="BTN", stack_bb=22, my_stack=22, pot=12, pot_total=34, call=22, to_act=True, can_check=False,
-            facing_allin=True, equity=1.0)
-check("ICM 파이널: 리버 로열 플러시 올인 콜 → 콜",
-      dict(NUTS, tournament=FT, table_stacks_bb={1: 300, 2: 150, 3: 2, 4: 40}, villain_stack_bb=300), "콜")
-NUT98 = dict(NUTS, hero=["Ah", "5h"], board=["Kh", "Qh", "7h", "2c", "3d"], equity=0.985)
-check("ICM 파이널: 리버 너트 플러시(98.5%) 올인 콜 → 콜",
-      dict(NUT98, tournament=FT, table_stacks_bb={1: 300, 2: 150, 3: 2, 4: 40}, villain_stack_bb=300), "콜")
+    n1, n2 = icm_need(r1), icm_need(r2)
+    results.append((bool(n1 and n2 and n1[0] == n2[0] and n2[1] > n1[1] > n1[0]),
+                    f"ICM 필요 승률: 칩 {n1 and n1[0]}% → 막 진입 {n1 and n1[1]}% < 파이널 {n2 and n2[1]}%", r2))
 
-# 속도: ICM 포함 recommend (캐시 안 된 새 스택) < 30ms
-t0 = time.perf_counter()
-for k in range(5):
-    recommend(dict(JAMCALL, my_stack=12 + k * 0.7, tournament={"players_left": 33 + k, "paid": 27, "avg_stack_bb": 25 + k},
-                   table_stacks_bb=TABLE, villain_stack_bb=28 + k))
-ms = (time.perf_counter() - t0) / 5 * 1000
-results.append((ms < 30, f"ICM 포함 recommend (새 스택, 캐시 없음) {ms:.1f} ms (< 30)", recommend(JAMCALL)))
+    # 올인 아닌 결정: 오픈 폭이 버블에서 좁아지고 (빅스택은 유지), 콜 여유에 위험 프리미엄
+    OPEN = dict(TPF, hero=["4h", "4d"], hero_pos="HJ", situation="open", stack_bb=25, my_stack=25, call=1, pot_total=2.85,
+                can_check=False)
+    check("ICM 없음: HJ 25BB 44 첫 진입 → 레이즈", OPEN, "레이즈")
+    check("ICM 버블 미디엄 스택: 44 → 폴드 (레인지 × 0.74)", dict(OPEN, tournament=BUB, table_stacks_bb=TABLE), "폴드",
+          detail_has="레인지 ×")
+    check("ICM 버블 빅스택(70BB, 덮음): 44 → 레이즈 (압박: 오픈 폭 유지/조금 넓게)",
+          dict(OPEN, my_stack=70, tournament=BUB, table_stacks_bb=TABLE), "레이즈", detail_has="빅스택 압박")
+    FLOP_BET = dict(hero=["Kh", "Jd"], board=["Jc", "8s", "4d"], street="flop", opponents_in_hand=1, hero_pos="BB",
+                    villain_pos="BTN", stack_bb=25, my_stack=25, pot=5, pot_total=8, call=3, to_act=True, can_check=False,
+                    equity=0.62)
+    check("ICM 버블: 플랍 탑페어 벳에 콜 — 필요 승률에 위험 프리미엄 가산 표기",
+          dict(FLOP_BET, tournament=BUB, table_stacks_bb=TABLE, villain_stack_bb=40), "콜", detail_has="(ICM)")
+
+    # 너트는 ICM 이 아무리 커도 접지 않는다 (리버 너트 올인 콜, 파이널 테이블 덮인 스택)
+    NUTS = dict(hero=["Ah", "Kh"], board=["Qh", "Jh", "Th", "2c", "3d"], street="river", opponents_in_hand=1, hero_pos="BB",
+                villain_pos="BTN", stack_bb=22, my_stack=22, pot=12, pot_total=34, call=22, to_act=True, can_check=False,
+                facing_allin=True, equity=1.0)
+    check("ICM 파이널: 리버 로열 플러시 올인 콜 → 콜",
+          dict(NUTS, tournament=FT, table_stacks_bb={1: 300, 2: 150, 3: 2, 4: 40}, villain_stack_bb=300), "콜")
+    NUT98 = dict(NUTS, hero=["Ah", "5h"], board=["Kh", "Qh", "7h", "2c", "3d"], equity=0.985)
+    check("ICM 파이널: 리버 너트 플러시(98.5%) 올인 콜 → 콜",
+          dict(NUT98, tournament=FT, table_stacks_bb={1: 300, 2: 150, 3: 2, 4: 40}, villain_stack_bb=300), "콜")
+
+    # 속도: ICM 포함 recommend (캐시 안 된 새 스택) < 30ms
+    t0 = time.perf_counter()
+    for k in range(5):
+        recommend(dict(JAMCALL, my_stack=12 + k * 0.7, tournament={"players_left": 33 + k, "paid": 27, "avg_stack_bb": 25 + k},
+                       table_stacks_bb=TABLE, villain_stack_bb=28 + k))
+    ms = (time.perf_counter() - t0) / 5 * 1000
+    results.append((ms < 30, f"ICM 포함 recommend (새 스택, 캐시 없음) {ms:.1f} ms (< 30)", recommend(JAMCALL)))
+else:
+    print("[SKIP] 토너먼트 ICM 섹션 (numpy 없음)")
 
 # --- 2026-10-30 라이브 회귀: 체크 가능한데 폴드 / 3벳·4벳 팟 KK 폴드 ------------------------------------------
 # p_014947: CO 아이솔레이션 레이즈 5인 팟, 플랍 A♥9♦4♣ 에 K♥K♣, 넷 다 체크 → 내 차례 (체크 버튼).
@@ -1162,6 +1167,52 @@ check("플랍 양차 vs 3/4 팟 100BB → 폴드 (솔버: 큰 벳엔 폴드 최�
 check("거트샷 + 오버카드(드로우 아웃츠 4장)는 헤즈업 내재 배당 대상 아님 → 폴드",
       dict(hero=["Ac", "Jd"], board=["Ts", "8h", "3c"], opponents_in_hand=1, pot=6, pot_total=9, call=3, stack_bb=100,
            to_act=True, equity=0.32, equity_basis="range"), "폴드")
+
+# --- 얕은 스택 B/A/C/D (2026-11-05) ----------------------------------------------------------
+# B) 16~22BB 블라인드의 3벳 잼 대응: 오픈 ∩ 상위 X%.  9인, 앤티, 20BB, 오픈 2.2 → 20BB 올인 (콜 17.8)
+J3 = dict(PF, players=9, hero_pos="BTN", situation="vs3bet", villain_pos="BB", stack_bb=20, my_stack=17.8, call=17.8,
+          pot_total=23.825, ante=1.125, facing_allin=True, can_check=False)
+check("B: BTN AJo vs BB 3벳 잼 20BB → 콜", dict(J3, hero=["Ac", "Jd"]), "콜", 17.8, detail_has="오픈 ∩ 상위")
+check("B: BTN JTs vs BB 3벳 잼 20BB → 폴드", dict(J3, hero=["Jh", "Th"]), "폴드")
+check("B: BTN A5s vs BB 3벳 잼 20BB → 폴드", dict(J3, hero=["Ah", "5h"]), "폴드")
+check("B: BTN A9o vs SB 3벳 잼 20BB → 콜", dict(J3, hero=["Ac", "9d"], villain_pos="SB"), "콜", 17.8)
+check("B: BTN A9o vs BB 3벳 잼 20BB → 폴드", dict(J3, hero=["Ac", "9d"]), "폴드")
+# A) <=15BB 잼 콜 폭: 콜하는 자리별 (BB >= SB >= 그 밖)
+w = pf.range_pct(pf.ranges("jamcall", "BB", "UTG", 9, 15, True)[0][1])
+results.append((14.5 <= w <= 17.5, "A: BB vs UTG 잼 15BB 앤티 폭 16±1.5%", {"action": "-", "size_text": f"{w:.1f}%", "confidence": "-", "reason": ""}))
+w1 = pf.range_pct(pf.ranges("jamcall", "BB", "SB", 9, 15, True)[0][1])
+results.append((abs(w1 - 38.6) < 0.5, "A: BB vs SB 잼 15BB 앤티 폭 38.6% (이전과 같음)", {"action": "-", "size_text": f"{w1:.1f}%", "confidence": "-", "reason": ""}))
+wb, ws, wt = (pf.range_pct(pf.ranges("jamcall", h, "UTG", 9, 10, True)[0][1]) for h in ("BB", "SB", "BTN"))
+results.append((wb >= ws >= wt and wb > wt, "A: 같은 잼 상대 BB >= SB >= BTN", {"action": "-", "size_text": f"{wb:.1f}/{ws:.1f}/{wt:.1f}%", "confidence": "-", "reason": ""}))
+# C) 23~30BB 잼 아닌 3벳 대응: 9인, BB 가 7.7BB 까지 3벳, 콜 5.5
+V3 = dict(PF, players=9, hero_pos="BTN", situation="vs3bet", villain_pos="BB", stack_bb=25, my_stack=25, call=5.5, pot_total=11.8,
+          ante=1.125, can_check=False)
+check("C: BTN ATo vs BB 3벳 25BB → 올인 25", dict(V3, hero=["Ac", "Td"]), "올인", 25)
+check("C: BTN A5s vs SB 3벳 25BB → 폴드", dict(V3, hero=["Ah", "5h"], villain_pos="SB"), "폴드")
+check("C: CO QQ vs BTN 3벳 100BB 그대로 → 레이즈", dict(PF, hero=["Qh", "Qd"], players=9, hero_pos="CO", situation="vs3bet",
+                                                   villain_pos="BTN", stack_bb=100, my_stack=100, call=5, pot_total=9.1,
+                                                   can_check=False), "레이즈")
+# D-short) SB 첫 진입 푸시/폴드 상한 20BB
+SB18 = dict(PF, players=9, hero_pos="SB", situation="open", stack_bb=18, my_stack=18, call=0.5, pot_total=2.6, ante=1.125,
+            can_check=False)
+acts, bad = set(), []
+for i in range(169):
+    h = pf.DATA["G"][i]
+    r1, r2 = h[0], h[1]
+    su = "h" if h.endswith("s") else None
+    c1 = r1 + "h"
+    c2 = r2 + ("h" if su else "d") if r1 != r2 or su else r2 + "d"
+    if r1 == r2:
+        c2 = r2 + "d"
+    a = recommend(dict(SB18, hero=[c1, c2]))["action"]
+    acts.add(a)
+    if a not in ("올인", "폴드"):
+        bad.append((h, a))
+results.append((not bad, f"D: SB 18BB 169핸드 모두 올인/폴드 (나온 행동 {sorted(acts)})",
+                {"action": "-", "size_text": str(bad[:3]), "confidence": "-", "reason": ""}))
+check("D: SB 18BB AA → 올인 18", dict(SB18, hero=["Ah", "Ad"]), "올인", 18)
+check("D: BTN 18BB AA → 레이즈", dict(PF, hero=["Ah", "Ad"], players=9, hero_pos="BTN", situation="open", stack_bb=18,
+                                     my_stack=18, call=1, pot_total=2.6, ante=1.125, can_check=False), "레이즈")
 
 # --- 결과 -----------------------------------------------------------------------
 failed = 0

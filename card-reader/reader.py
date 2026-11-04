@@ -1343,8 +1343,17 @@ def equity_opponents(ts, nboard):
             parts.append("림프한 사람")
         bb = next((s for s in live if s.get("pos") == "BB" or (s.get("key") and s.get("key") == blinds.get("bb"))), None)
         if bb is not None and bb.get("key") not in keys:
+            pure_first_in = not keys   # 림퍼 없이 BB 만 더하는 순수 첫 진입
             keys.append(bb.get("key"))
             parts.append("BB")
+            if pure_first_in:   # 표시 메모만 (n·keys 는 그대로): 내 뒤에 아직 행동 안 한 사람 수
+                try:
+                    behind_me = pf.after(ts["hero_pos"], int(_number(ts.get("pos_players"))))
+                    n_behind = sum(1 for s in live if s.get("pos") in behind_me)
+                except (KeyError, TypeError, ValueError):
+                    n_behind = 0
+                if n_behind > 0:
+                    parts[-1] = f"BB · 뒤 {n_behind}명 미행동"
     if not keys:
         return {"n": 1, "keys": [], "basis": "최소 1명 (돈을 넣은 상대를 못 찾음)", "dropped": dropped}
     return {"n": len(keys), "keys": keys, "basis": " + ".join(parts), "dropped": dropped}

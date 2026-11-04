@@ -169,7 +169,7 @@ CARD_READER_DIR=<card-reader 저장소 폴더>
 - 상대 패 예상: `handread.py` (행동·성향 기반 범위), 행동 기록 `handlog.py`, 성향 DB `profiles.py`, 게임 '유저 정보' 팝업 읽기 `userinfo.py`
 - 테스트: `python test_advisor.py`, `test_rangeq.py`, `test_handread.py`, `test_handlog.py`, `test_solverlib.py`
 - 상대 패 예상 전환 스위치 (`handread.py`): `MULT_SET`(기본 "prev" = b538c3d 이전 배율, "current" = 그 이후 배율; 신뢰구간이 0을 포함해 기본을 prev 로 되돌림), `PRE_FLOOR`(0.07, 0 이면 차트 밖 패 가중치 없음), `STYLE_STRENGTH`(유형 보정 세기). `hr.configure(...)` / `with hr.switches(...)` 로 바꾸고 복원한다. `score_reads.py` 는 이 스위치로 기여를 하나씩 켜 보고(`--boot B`, `--no-ablation`) 부트스트랩 구간으로 유지/되돌림을 권고한다.
-- 추천 비교 (`compare_advice.py <데이터 폴더>`): 실제 결정 기록을 두 handread 스위치 설정(기본 current 대 prev)으로 재생해 추천이 바뀐 건수·(스트리트, 이전→새 행동) 표만 출력한다(닉네임·pid·카드 없음, `--json`). 데이터 폴더는 인자 또는 `CARD_READER_DATA`, advisor 가 numpy 를 써서 앱 실행 환경에서만 돈다. 커밋 대 커밋: `--a-rev REV --b-rev REV` (그 커밋의 advisor.py, 스위치는 두 쪽 같게), `--opponents voluntary` 는 프리플랍 상대 수를 reader.equity_opponents 로 다시 세고 `opponents_basis` 를 넣어 재생한다. BB 방어는 `preflop.DEPTH_*_BB/SPEC_DROP/ANTE_RAMP`(BB 전용, 20BB 부터 넓게)와 advisor 의 BB 깊이 할인 제외로 처리한다.
+- 추천 비교 (`compare_advice.py <데이터 폴더>`): 실제 결정 기록을 두 handread 스위치 설정(기본 current 대 prev)으로 재생해 추천이 바뀐 건수·(스트리트, 이전→새 행동) 표만 출력한다(닉네임·pid·카드 없음, `--json`). 데이터 폴더는 인자 또는 `CARD_READER_DATA`, advisor 는 numpy 없이도 임포트되지만(icm 지연 import, 11명 초과 ICM 만 numpy 필요) 실제 재생은 앱 실행 환경에서 한다. 커밋 대 커밋: `--a-rev REV --b-rev REV` (그 커밋의 advisor.py, 스위치는 두 쪽 같게), `--opponents voluntary` 는 프리플랍 상대 수를 reader.equity_opponents 로 다시 세고 `opponents_basis` 를 넣어 재생한다. BB 방어는 `preflop.DEPTH_*_BB/SPEC_DROP/ANTE_RAMP`(BB 전용, 20BB 부터 넓게)와 advisor 의 BB 깊이 할인 제외로 처리한다.
 - 동작 변경: `STYLE_STRENGTH` 기본값이 0.5 라서 상대 유형(LAG/LP/TAG/TP) 보정이 e815500(1.0)보다 절반 세기로 적용된다. 앱의 상대 패 예상이 e815500 과 달라진다 (`STYLE_STRENGTH=1.0` 으로 되돌릴 수 있음). `handlog.derive` 의 3벳 집계는 정리된 프리플랍(`clean_preflop`)을 쓴다.
 
 ### GTO 데이터
@@ -179,3 +179,7 @@ CARD_READER_DIR=<card-reader 저장소 폴더>
 - 토너먼트 상황 라이브러리: [TexasSolver](https://github.com/bupticybee/TexasSolver) (AGPL-3.0, 별도 설치)로 직접 풀어
   `gto_lib/`에 저장 (`python build_gto_lib.py`, `--status`, `--stop`, `--set-mode low|full`). 생성물이라 저장소에는 넣지 않는다.
   헤즈업 플랍·턴에서 같거나 아주 비슷한 상황이면 GTO 빈도를 주 추천으로, 아니면 'GTO 참고'로 보여준다.
+
+## 얕은 스택 프리플랍 (2026-11-05)
+- 잼 콜 폭 `preflop.jamcall_pct` (Bs 재조정 + 콜하는 자리 배수 BB 1.0 / SB 0.96 / 그 밖 0.92). 16~22BB 블라인드의 3벳 잼 대응 `vs3bet_jam_call` (오픈 ∩ 상위 X%), 23~35BB 잼 아닌 3벳 대응은 `ranges("vs3bet")` 의 `VS3BET_SHALLOW_X`. SB 첫 진입 푸시/폴드 상한은 `advisor.PUSHFOLD_BB_SB_OPEN`(20BB). 오픈 레인지·BB 방어는 그대로(test_solverlib 의 range_hash 고정값).
+- 프리플랍 에쿼티 상대 근거 표시: 순수 첫 진입은 `BB · 뒤 N명 미행동` (표시 메모, 상대 수 n 은 그대로).

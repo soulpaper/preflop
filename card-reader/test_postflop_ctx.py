@@ -377,7 +377,7 @@ jam["allin"] = True
 r = eqopp(pre_table([jam, seat("seat_B", "HJ", bet=25.0, bubble="call"), seat("seat_E", "BB", bet=1.0)], "BTN", raises=1))
 test("올인 + 올인 콜 → 2명", r["n"] == 2 and set(r["keys"]) == {"seat_A", "seat_B"}, str(r))
 r = eqopp(pre_table([seat("seat_A", "UTG"), seat("seat_S", "SB", bet=0.5), seat("seat_E", "BB", bet=1.0)], "CO"))
-test("CO 언오픈 (오픈 결정) → BB 1명", r["n"] == 1 and r["keys"] == ["seat_E"] and r["basis"] == "BB", str(r))
+test("CO 언오픈 (오픈 결정) → BB 1명", r["n"] == 1 and r["keys"] == ["seat_E"] and r["basis"] == "BB · 뒤 2명 미행동", str(r))
 r = eqopp(pre_table([seat("seat_A", "UTG", bet=1.0), seat("seat_S", "SB", bet=0.5), seat("seat_E", "BB", bet=1.0)], "CO"))
 test("CO 림프 팟 → 림퍼 + BB = 2명", r["n"] == 2 and r["keys"] == ["seat_A", "seat_E"] and r["basis"] == "림프한 사람 + BB", str(r))
 r = eqopp(pre_table([seat("seat_A", "UTG", bet=1.0, bubble="fold"), seat("seat_B", "HJ", bet=3.0, bubble="raise")], "BTN",

@@ -78,7 +78,7 @@ DATA = {'G': ['AA', 'KK', 'QQ', 'JJ', 'TT', '99', '88', 'AKs', '77', 'AQs', 'AJs
                'ip': {'fb': 'QQ+, AKs, AKo, A5s, A4s', 'call': 'JJ-88, AQs, AJs, KQs, KJs, QJs, AQo'}}},
  'os': {'jam': 'KK+, AKs, A5s', 'call': 'QQ, AKo'},
  'ts': [5, 8, 12, 16, 20],
- 'hs': {'1': [72, 60, 50, 42, 38],
+ 'hs': {'1': [72, 64, 56, 50, 44],
         '2': [58, 44, 35, 28, 23],
         '3': [45, 34, 26, 20, 16],
         '4': [38, 29, 22, 17, 14],
@@ -88,7 +88,7 @@ DATA = {'G': ['AA', 'KK', 'QQ', 'JJ', 'TT', '99', '88', 'AKs', '77', 'AQs', 'AJs
         '8': [19, 15, 12, 10, 8],
         '9': [17, 13, 11, 9, 7]},
  'xs': [52, 46, 38, 32, 28],
- 'Bs': {'1': 1, '2': 0.9, '3': 0.82, '4': 0.75, '5': 0.7, '6': 0.66, '7': 0.63, '8': 0.6, '9': 0.58},
+ 'Bs': {'1': 1.0, '2': 0.80, '3': 0.68, '4': 0.59, '5': 0.53, '6': 0.49, '7': 0.45, '8': 0.42, '9': 0.40},
  'vs': 20}
 
 RANKS = "AKQJT98765432"  # app.js 와 같은 순서 (A가 0)
@@ -449,17 +449,75 @@ def ranges(situation, hero, villain, players, stack_bb=100.0, ante=False, style=
         ip = postflop_order(hero, players) > postflop_order(villain, players)
         table = DATA["ys"][group(hero, players)]
         r = table.get("ip" if ip else "oop") or table.get("oop") or table.get("ip")
-        return [("4벳", parse_range(r["fb"]), "aggro"), ("콜", parse_range(r["call"]), "call")]
+        fb, call = parse_range(r["fb"]), parse_range(r["call"])
+        if hero in ("CO", "BTN", "SB") and villain in ("BB", "SB") and stack_bb and stack_bb <= VS3BET_SHALLOW_MAX:
+            xs = VS3BET_SHALLOW_X.get((hero, villain))
+            if xs:
+                x = _interp(float(stack_bb), VS3BET_SHALLOW_ANCHORS, xs)
+                fb = set(fb) | (top_pct(x) & set(open_range(hero, players, ante, style, stack_bb)))
+            call = set(call) - fb
+            if villain == "SB":
+                fb = set(fb) - {"A5s", "A4s"}
+        return [("4벳", fb, "aggro"), ("콜", call, "call")]
     if situation == "vs4bet":
         return [("5벳 잼", parse_range(DATA["os"]["jam"]), "jam"), ("콜", parse_range(DATA["os"]["call"]), "call")]
     if situation == "jam":
         pct = min(_interp(stack_bb, DATA["ts"], DATA["hs"][str(behind(hero, players))]) * (1.2 if ante else 1), 92)
         return [("잼 (올인)", top_pct(pct), "jam")]
     if situation == "jamcall":
-        pct = _interp(stack_bb, DATA["ts"], DATA["xs"]) * DATA["Bs"][str(behind(villain, players))]
-        pct = min(pct * (1.15 if ante else 1), 90)
+        pct = min(jamcall_pct(stack_bb, hero, villain, players, ante), 90)
         return [("잼 콜", top_pct(pct), "call")]
     return []
+
+
+# --- 숏스택 잼 대응 폭 ---------------------------------------------------------------------
+# 잼을 받는 쪽: BB 는 이미 낸 돈이 있어 가장 넓고, SB 는 조금 좁고, 그 밖의 자리는 뒤에 사람이 남아 더 좁다.
+CALLER_MULT = {"BB": 1.0, "SB": 0.96}
+CALLER_MULT_OTHER = 0.92
+
+
+def jamcall_pct(depth, hero, villain, players, ante=False):
+    """잼 콜 폭 (콤보 %, 상한 없음 — 호출하는 쪽에서 min(.., 90)).  depth: 유효 스택 BB, hero: 콜하는 자리 (모르면 None → 1.0),
+    villain: 잼 낸 자리 (모르면 None → 뒤 2명 가정).  ranges("jamcall") 과 advisor._commit_range 가 같이 쓴다."""
+    try:
+        b = behind(villain, players) if villain else 2
+    except (ValueError, KeyError):
+        b = 2
+    b = min(9, max(1, b))
+    pct = _interp(depth, DATA["ts"], DATA["xs"]) * DATA["Bs"][str(b)]
+    if ante:
+        pct *= 1.15
+    if hero:
+        pct *= CALLER_MULT.get(hero, CALLER_MULT_OTHER)
+    return pct
+
+
+# 16~22BB 블라인드가 3벳 잼을 받을 때 콜 폭 = 상위 X% ∩ 내 오픈 레인지.  X 는 스택 앵커 [16, 20, 22]BB 에서 보간, 22BB 초과는 22BB 값.
+VS3BET_JAM_ANCHORS = [16, 20, 22]
+VS3BET_JAM_X = {
+    ("BTN", "BB"): [12, 11, 10], ("BTN", "SB"): [18, 14, 14],
+    ("CO", "BB"): [9, 9, 9], ("CO", "SB"): [8, 8, 8],
+    ("SB", "BB"): [13, 11, 11],
+}
+
+
+def vs3bet_jam_call(hero, villain, players, stack_bb, ante=False, style="standard"):
+    """3벳 잼에 대한 콜 범위 (오픈 ∩ 상위 X%).  표에 없는 자리 조합이면 None."""
+    xs = VS3BET_JAM_X.get((hero, villain))
+    if xs is None:
+        return None
+    x = _interp(float(stack_bb), VS3BET_JAM_ANCHORS, xs)
+    return top_pct(x) & set(open_range(hero, players, ante, style, stack_bb))
+
+
+# 23~35BB 잼 아닌 3벳 대응: 4벳 올인 폭에 (상위 X% ∩ 오픈) 를 더한다.  앵커 [25, 30, 35]BB, 23BB 미만은 25BB 값, 35BB 에서 0.
+VS3BET_SHALLOW_ANCHORS = [25, 30, 35]
+VS3BET_SHALLOW_MAX = 35
+VS3BET_SHALLOW_X = {
+    ("BTN", "BB"): [10, 12, 0], ("BTN", "SB"): [10, 11, 0],
+    ("CO", "BB"): [8, 11, 0], ("SB", "BB"): [7, 7, 0],
+    ("CO", "SB"): [0, 0, 0],
+}
 
 
 def decide(hand, action_ranges):

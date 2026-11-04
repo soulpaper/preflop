@@ -48,6 +48,22 @@ inp = sl.solver_input("BTN_BB", 40, "AsJh7d", "x.json", 4, r40)
 test("솔버 입력: 팟/스택/보드/벳 크기", "set_pot 602.50" in inp and "set_effective_stack 3780.00" in inp
      and "set_board As,Jh,7d" in inp and "set_bet_sizes ip,flop,bet,33,75" in inp and "set_bet_sizes oop,river,allin" in inp)
 
+# --- 레인지 해시 고정 ----------------------------------------------------------------------
+# 얕은 스택 프리플랍 변경(2026-11-05)이 오픈/BB 방어를 건드리지 않았는지 고정한다.
+# 의도적으로 오픈/방어를 바꾸면 이 값을 갱신하고, 재솔브가 영향받음 (build_gto_lib 가 range_hash 달라진 스팟을 다시 푼다).
+EXPECT_HASH = {
+    "BTN_BB": ("4711eb537905", "ed691352e60b", "ee3b97c3bcca", "c729ae76302b"),
+    "CO_BB": ("457462fadf56", "e9113e24d745", "d86326da594d", "c8bd0fd23b2b"),
+    "HJ_BB": ("00abbb9ffa83", "22c942ccf728", "88a9efd36f8f", "3b04e9807fa5"),
+    "UTG_BB": ("72fc47b3ac6f", "8082fce87e40", "56b707b4ffb6", "b4e8c24a8759"),
+    "SB_BB": ("b040c1a015d4", "874f3c14a964", "c0a3746830d6", "f3d143f575b8"),
+    "BTN_SB": ("b7e0c2728b11", "9724555021f6", "1955cf289b23", "b8f01e79208a"),
+}
+test("STACKS 20/30/40/60", tuple(sl.STACKS) == (20, 30, 40, 60), str(sl.STACKS))
+for _spot, _want in EXPECT_HASH.items():
+    _got = tuple(sl.range_hash(sl.spot_ranges(_spot, _k)) for _k in sl.STACKS)
+    test(f"range_hash 고정 {_spot}", _got == _want, f"{_got} != {_want}" if _got != _want else "")
+
 # --- 플랍 정규화 --------------------------------------------------------------------------
 rng = random.Random(3)
 ok = True

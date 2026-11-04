@@ -297,6 +297,7 @@ def _hu_margin(T, street, bet_frac, allin, pot_bb=None):
 
 STYLE_ALIAS = {"tight": -0.6, "standard": 0.0, "aggressive": 0.6}
 STYLE_LABEL = {"tight": "타이트", "standard": "표준", "aggressive": "공격적"}
+PUSHFOLD_BB_SB_OPEN = 20   # SB 첫 진입(오픈/잼)만 푸시/폴드 상한이 20BB (솔버: SB 는 20BB 까지 림프/푸시 위주)
 PUSHFOLD_BB = 15          # 이 이하 유효 스택은 푸시/폴드 (jam/jamcall).  그 위는 깊이에 따라 연속 보정된 일반 레인지
 DEFENCE_ITER = 2000        # BB/SB 방어 인라인 에쿼티 반복 수 (내 차례에만 실행, 약 0.2~0.4초)
 DEPTH_R = ([15, 20, 25, 35], [0.85, 0.90, 0.95, 1.0])   # 얕은 스택은 에쿼티 실현율이 낮다 (포스트플랍 플레이 여지 부족)
@@ -1103,16 +1104,9 @@ def _resolve_players(c):
 def _commit_range(c, hand, players, villain, call, eff):
     """큰 금액을 걸어야 할 때 들어갈 범위 (숏스택 잼콜 표 기반). (포함 여부, 범위 %)"""
     depth = min(call, eff) if eff else call
-    try:
-        b = pf.behind(villain, players) if villain else 2
-    except (ValueError, KeyError):
-        b = 2
-    b = min(9, max(1, b))
-    pct = pf._interp(depth, pf.DATA["ts"], pf.DATA["xs"]) * pf.DATA["Bs"][str(b)]
+    pct = pf.jamcall_pct(depth, c.hero_pos, villain, players, c.ante)   # 콜하는 자리(BB>SB>그 밖)별 폭 포함
     if depth > pf.SHORT_STACK_BB:
         pct *= pf.SHORT_STACK_BB / depth
-    if c.ante:
-        pct *= 1.15
     if c.opp > 1:  # 여러 명이 걸려 있으면 더 좁게
         pct *= 0.7 ** (min(c.opp, 3) - 1)
     pct = min(pct, 90)
@@ -1414,7 +1408,8 @@ def _preflop_core(c, state):
         conf = "medium"
     elif sit in ("open", "jam") and not unopened and call + posted >= 2.0:
         sit, conf = "vsopen", "medium"  # 상황 정보가 늦게 갱신된 경우
-    short = eff is not None and eff <= PUSHFOLD_BB
+    cap = PUSHFOLD_BB_SB_OPEN if pos == "SB" and sit in ("open", "jam") else PUSHFOLD_BB
+    short = eff is not None and eff <= cap
     if short and sit in TO_SHORT:
         sit = TO_SHORT[sit]
     elif not short and sit in TO_DEEP:
@@ -1504,12 +1499,22 @@ def _preflop_core(c, state):
 
     # 큰 금액 압박: 콜 범위라도 잼 또는 폴드
     allin_call = bool(c.facing_allin) or (eff is not None and call >= 0.95 * eff)
-    if sit in ("vsopen", "vs3bet", "vs4bet") and eff and call > PRESSURE * eff and name != "폴드":
-        ok, pct = _commit_range(c, hand, players, villain, call, eff)
+    jam3 = None
+    if sit == "vs3bet" and eff and call > PRESSURE * eff and eff <= 30:   # 16~22BB 블라인드의 3벳 잼 대응 (오픈 ∩ 상위 X%)
+        jam3 = pf.vs3bet_jam_call(pos, villain, players, eff, c.ante, c.loose)
+    if sit in ("vsopen", "vs3bet", "vs4bet") and eff and call > PRESSURE * eff and (name != "폴드" or jam3 is not None):
         need = call / ((pot_total or call) + call)
-        ok, pct, icm_line = _icm_commit_range(c, hand, ok, pct, call, eff, pot_total, allin_call)
+        if jam3 is not None:
+            ok, pct = hand in jam3, pf.range_pct(jam3)
+            ok1, pct, icm_line = _icm_commit_range(c, hand, ok, pct, call, eff, pot_total, allin_call)
+            ok = ok and ok1
+            range_txt = "오픈 ∩ 상위"
+        else:
+            ok, pct = _commit_range(c, hand, players, villain, call, eff)
+            ok, pct, icm_line = _icm_commit_range(c, hand, ok, pct, call, eff, pot_total, allin_call)
+            range_txt = "상위"
         info = [head, icm_line or f"콜 {_bb(call)} = 유효 스택의 {_pct(call / eff)}",
-                f"상위 {pct:.0f}% 만 승부 · 필요 승률 {_pct(need)}" + (f" · 상대 {c.opp}명 기준" if c.opp > 1 else "")]
+                f"{range_txt} {pct:.0f}% 만 승부 · 필요 승률 {_pct(need)}" + (f" · 상대 {c.opp}명 기준" if c.opp > 1 else "")]
         if not ok:
             return _out(FOLD, reason=f"{where}: 큰 금액 — 승부 범위 밖이라 폴드", detail=info, confidence=conf)
         if allin_call:
@@ -2331,14 +2336,15 @@ def _preflop_plan(c, r):
     if pos is None:
         return []
     eff = c.eff
-    if eff is not None and eff <= PUSHFOLD_BB:
-        return []
     hand = pf.hand_code(c.hero)
     posted = _posted(c, pos)
     unopened = c.call + posted <= 1.0 + 1e-6
     sit = c.situation if c.situation in DEEP_SITUATIONS else ("open" if unopened else "vsopen")
     if sit == "open" and not unopened and c.call + posted >= 2.0:
         sit = "vsopen"
+    cap = PUSHFOLD_BB_SB_OPEN if pos == "SB" and sit == "open" else PUSHFOLD_BB
+    if eff is not None and eff <= cap:
+        return []
     act = r["action"]
     stack = eff or 100.0
     if sit == "open":
