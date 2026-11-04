@@ -1,0 +1,4 @@
+# 설치: ~/.config/systemd/user/records-pull.service.d/inbox.conf 로 복사하고 <...> 를 바꾼다
+# (설치 안 함. pull.json 의 inbox 와 같은 파일이어야 한다)
+[Service]
+ReadWritePaths=-%h/<작업 폴더>/<수신함 파일>

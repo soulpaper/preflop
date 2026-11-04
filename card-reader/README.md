@@ -183,3 +183,21 @@ CARD_READER_DIR=<card-reader 저장소 폴더>
 ## 얕은 스택 프리플랍 (2026-11-05)
 - 잼 콜 폭 `preflop.jamcall_pct` (Bs 재조정 + 콜하는 자리 배수 BB 1.0 / SB 0.96 / 그 밖 0.92). 16~22BB 블라인드의 3벳 잼 대응 `vs3bet_jam_call` (오픈 ∩ 상위 X%), 23~35BB 잼 아닌 3벳 대응은 `ranges("vs3bet")` 의 `VS3BET_SHALLOW_X`. SB 첫 진입 푸시/폴드 상한은 `advisor.PUSHFOLD_BB_SB_OPEN`(20BB). 오픈 레인지·BB 방어는 그대로(test_solverlib 의 range_hash 고정값).
 - 프리플랍 에쿼티 상대 근거 표시: 순수 첫 진입은 `BB · 뒤 N명 미행동` (표시 메모, 상대 수 n 은 그대로).
+
+## 기록 업로드와 수신 (sharebox 기록 공간)
+
+설계와 명세는 sharebox 저장소의 `docs/records-impl-spec.md`(13절이 최신)에 있다.
+
+- **PC 업로더** `records_sync.py --base <폴더> --once`: `<base>/hands/`의 `YYYY-MM-DD.jsonl`, `decisions_YYYY-MM-DD.jsonl`만 읽는다. 키 허용 목록에 없는 키는 버리고(`records_state.json`의 `dropped_keys`, `dropped_paths`), 이름처럼 보이는 키나 닉네임 모양 값이 있으면 `disabled`로 멈춘다(`--reset-disabled`로 해제). 모든 줄의 `redacted`는 필터 판 번호(`3`)이며 닉네임이 없다는 증명이 아니다.
+- **설정 파일 권한 (Windows)**: `records_upload.json`은 사용자 프로필 아래 CardReader 폴더에만 둔다(공용 폴더, 동기화 폴더 금지). 만든 뒤 PowerShell에서 상속을 끊고 본인만 남긴다.
+  1. `icacls records_upload.json /inheritance:r /grant:r "${env:USERNAME}:(R,W)"`
+  2. `icacls records_upload.json`을 실행해 출력에 본인 계정만 있는지 확인한다(값은 어디에도 적지 않는다).
+  리눅스에서는 코드가 검사한다(파일 0600, 폴더 그룹·타인 쓰기 금지, 링크 금지).
+- **리눅스 수신기** `records_pull.py --config <pull.json>`: `records_check.py`와 함께 `~/.local/lib/holdem-records/`에 두고 `deploy/records-pull.service`와 `.timer`로 돌린다. 설치 절차:
+  1. `install -d -m 700 ~/.local/share/holdem-records`
+  2. `pull.json`(0600, 폴더 0700)에 `url`, `token`, `data_dir`, **`work_dir`**(필수, 작업 폴더 절대 경로. 데이터 폴더가 그 안이나 그 바깥이면 거부), `inbox`(보고를 덧붙일 파일, 작업 폴더 안이어도 된다)를 적는다. 모든 경로 이름은 `<작업 폴더>` 자리표시로 문서에 적는다.
+  3. `deploy/records-pull.inbox.conf.example`을 `~/.config/systemd/user/records-pull.service.d/inbox.conf`로 복사해 `<작업 폴더>`, `<수신함 파일>`을 바꾼다(없으면 수신함 쓰기는 EROFS로 실패하고 보고는 저널로 간다).
+  4. `systemctl --user daemon-reload`
+- **백필 전 점검** `records_sync.py --base <폴더> --audit [--from 날짜] [--to 날짜] [--accept-check] [--json]`: 네트워크 없이 과거 파일의 값 형식과 자유 텍스트 낱말을 점검한다. 출력에는 필드 경로와 개수만 있고 값은 없다. OK(0), CHECK(1), STOP(2). 점검 기록(`records_state.json`의 `audit`)이 없는 날짜(어제까지)의 파일은 `audit_required`로 올라가지 않는다. CHECK는 직접 확인한 뒤 `--accept-check`로 받아들인다.
+- 판을 올릴 때 배포 순서: 리눅스 수신기, sharebox 서버, PC 업로더.
+- 시험: `RECORDS_TEST_SHAREBOXD=<shareboxd 바이너리> python3 -I test_records.py` (바이너리가 없으면 실서버 시험은 SKIP).

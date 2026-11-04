@@ -1,0 +1,17 @@
+[Unit]
+Description=Pull card-reader records from local sharebox
+
+[Service]
+Type=oneshot
+UMask=0077
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 %h/.local/lib/holdem-records/records_pull.py --config %h/.config/holdem-records/pull.json
+Nice=19
+CPUQuota=100%
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+ReadWritePaths=%h/.local/share/holdem-records
+RestrictAddressFamilies=AF_INET AF_UNIX
+TimeoutStartSec=15min

@@ -29,3 +29,10 @@ gto_dist_*.json
 *.pem
 *.key
 *.crt
+
+# 기록 업로드/수신: 설정(토큰)·상태·잠금
+records_upload.json
+records_state.json
+.records-sync.lock
+records_pull*.json
+records_state.json.tmp

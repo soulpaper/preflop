@@ -1,0 +1,10 @@
+[Unit]
+Description=Pull card-reader records hourly
+
+[Timer]
+OnCalendar=*-*-* *:10:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
