@@ -170,6 +170,105 @@ else:
     test("advisor: 실제 recommend 로 재생 (프리플랍은 MULT 와 무관 → 안 바뀜; 복원 부족이면 건너뜀으로 셈)",
          len(r_) + sum(s_.values()) == 1 and all(x["a"] == x["b"] for x in r_), str((r_, dict(s_))))
 
+# --- 7. 커밋 대 커밋 / 프리플랍 상대 수 다시 세기 ------------------------------------------------------------
+# 프리플랍: UTG 폴드, MP 오픈 3, CO 콜 3, BTN 아직 안 함, SB 0.5 냄, BB 1 냄, 나(BTN 뒤 가정: HJ) 차례
+PRE_SEATS = {"U": {"pos": "UTG", "hero": False, "folded": "preflop", "acts": {"preflop": [{"act": "fold"}]}},
+             "M": {"pos": "MP", "hero": False, "folded": None, "acts": {"preflop": [{"act": "raise", "to": 3.0}]}},
+             "C": {"pos": "CO", "hero": False, "folded": None, "acts": {"preflop": [{"act": "call", "to": 3.0}]}},
+             "B": {"pos": "BTN", "hero": False, "folded": None, "acts": {}},
+             "S": {"pos": "SB", "hero": False, "folded": None, "acts": {"preflop": [{"act": "post", "to": 0.5}]}},
+             "G": {"pos": "BB", "hero": False, "folded": None, "acts": {"preflop": [{"act": "post", "to": 1.0}]}},
+             "hero": {"pos": "HJ", "hero": True, "folded": None, "acts": {"preflop": [{"act": "call", "to": 1.0}]}}}
+PRE_HAND = {"id": "h-0002", "start": 1.0, "players": 7, "pos_players": 7, "hero_cards": ["Ah", "Kd"], "board": [],
+            "actions": {"preflop": [A("S", "post", to=0.5), A("G", "post", to=1.0), A("U", "fold"),
+                                    A("M", "raise", to=3.0), A("C", "call", to=3.0, rb=1)],
+                        "flop": [], "turn": [], "river": []},
+            "seats": {k: {"pos": v["pos"], "hero": v["hero"], "folded": v["folded"]} for k, v in PRE_SEATS.items()},
+            "confidence": "ok"}
+
+
+def pdec(**over):
+    d = dec(id="h-0002/1", hand_id="h-0002", street="preflop", board=[], hero_pos="HJ", situation="vsopen",
+            villain_pos="MP", call=2.0, pot_total=8.5, opponents=5, equity=0.2, seats=PRE_SEATS)
+    d.update(over)
+    return d
+
+
+ts = ca.table_state_from(pdec())
+by = {s["key"]: s for s in ts["seats"]}
+test("table_state_from: 바닥 칩·블라인드·핸드 안/밖",
+     by["M"]["bet"] == 3.0 and by["C"]["bet"] == 3.0 and by["B"]["bet"] == 0.0 and by["S"]["bet"] == 0.5
+     and not by["U"]["in_hand"] and by["hero"]["bet"] == 1.0 and ts["blind_seats"] == {"sb": "S", "bb": "G"}
+     and ts["preflop"]["raises"] == 1, str(ts))
+ctxp, _ = ca.restore_ctx(pdec())
+test("restore_ctx: 프리플랍 hero_bet = 내 좌석 기록의 낸 칩", ctxp.get("hero_bet") == 1.0, str(ctxp.get("hero_bet")))
+test("restore_ctx: 포스트플랍엔 hero_bet 없음", "hero_bet" not in ca.restore_ctx(dec())[0])
+calls = []
+
+
+def fake_eo(ts_, nboard):
+    calls.append((ts_, nboard))
+    return {"n": 2, "keys": ["M", "C"], "basis": "x", "dropped": []}
+
+
+test("voluntary_opponents: (n, keys, 'voluntary')", ca.voluntary_opponents(pdec(), fake_eo) == (2, ["M", "C"], "voluntary")
+     and calls[-1][1] == 0)
+test("voluntary_opponents: 포스트플랍은 None (기록값)", ca.voluntary_opponents(dec(), fake_eo) is None)
+test("voluntary_opponents: 정할 수 없음 → None", ca.voluntary_opponents(pdec(), lambda t, n: None) is None)
+test("voluntary_opponents: 9명 넘으면 잘리고 basis 없음 (reader 와 같은 조건)",
+     ca.voluntary_opponents(pdec(), lambda t, n: {"n": 12, "keys": [], "basis": "", "dropped": []}) == (5, [], None))
+try:
+    from reader import equity_opponents as real_eo
+except ImportError as e:
+    print(f"[SKIP] reader 임포트 불가({e.name}) — 실제 equity_opponents 시험 건너뜀")
+else:
+    test("voluntary_opponents: 실제 reader.equity_opponents (오프너 + 콜러, 뒤 BTN·블라인드 제외)",
+         ca.voluntary_opponents(pdec(), real_eo) == (2, ["M", "C"], "voluntary"), str(ca.voluntary_opponents(pdec(), real_eo)))
+seen_a, seen_b = [], []
+hands2 = {"h-0002": PRE_HAND}
+res7, sk7 = ca.replay([pdec()], hands2, {}, {}, lambda c: seen_a.append(c) or {"action": "call"}, iters=300,
+                      recommend_b=lambda c: seen_b.append(c) or {"action": "fold"}, opponents="voluntary",
+                      equity_opponents=lambda t, n: {"n": 5, "keys": ["C"], "basis": "x", "dropped": []})
+ca_, cb_ = (seen_a or [{}])[0], (seen_b or [{}])[0]
+test("replay(voluntary): 상대 수·basis 를 다시 넣고 두 쪽 ctx 가 같음",
+     ca_.get("opponents_in_hand") == 5 and ca_.get("opponents_basis") == "voluntary" and ca_ == cb_, str((ca_.keys(), dict(sk7))))
+test("replay(voluntary): keys 좌석 레인지 먼저, 모자라면 랜덤 핸드로 채움 (reader.range_analyze)",
+     len(ca_.get("villain_ranges") or []) == 5 and ca_["villain_ranges"][-1] == rq.random_range() and ca_["villain_ranges"][0] != rq.random_range(), str(len(ca_.get("villain_ranges") or [])))
+test("replay(voluntary): recommend_b 로 B 쪽 → 바뀐 추천 1 (결과에 번호 i)",
+     len(res7) == 1 and res7[0]["a"] == "call" and res7[0]["b"] == "fold" and res7[0]["i"] == 0, str(res7))
+seen_a.clear()
+ca.replay([pdec()], hands2, {}, {}, lambda c: seen_a.append(c) or {"action": "call"}, iters=300)
+test("replay(logged): 기록된 상대 수 그대로, basis 없음",
+     seen_a and seen_a[0].get("opponents_in_hand") == 5 and "opponents_basis" not in seen_a[0], str(seen_a[:1]))
+try:
+    ca.load_advisor("no-such-rev-xyz")
+    bad = False
+except SystemExit:
+    bad = True
+test("load_advisor: 없는 커밋 → 오류로 끝남", bad)
+try:
+    import advisor as _adv
+except ImportError as e:
+    print(f"[SKIP] advisor 임포트 불가({e.name}) — load_advisor 시험 건너뜀")
+else:
+    rec_head = ca.load_advisor("HEAD")
+    cx = {"hero": ["Ah", "Kd"], "board": [], "street": "preflop", "players": 6, "hero_pos": "BTN", "situation": "open",
+          "stack_bb": 100, "call": 1.0, "pot_total": 1.5, "equity": 0.6, "opponents_in_hand": 1}
+    test("load_advisor: HEAD 의 advisor 를 따로 불러 같은 추천 (작업 트리와 별개 모듈)",
+         rec_head is not _adv.recommend and rec_head(dict(cx))["action"] == _adv.recommend(dict(cx))["action"])
+    tmp = tempfile.mkdtemp(prefix="cmp-adv-")
+    with open(os.path.join(tmp, "2026-01-02.jsonl"), "w", encoding="utf-8") as f:
+        f.write(json.dumps(PRE_HAND) + "\n")
+    with open(os.path.join(tmp, "decisions_2026-01-02.jsonl"), "w", encoding="utf-8") as f:
+        f.write(json.dumps(pdec()) + "\n")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        s3 = ca.main([tmp, "--a-rev", "HEAD", "--b-rev", "HEAD", "--opponents", "voluntary", "--iters", "300"])
+    out3 = buf.getvalue()
+    test("main --a-rev/--b-rev: 같은 커밋 둘이면 바뀐 것 0, 스위치는 두 쪽 같게",
+         s3["replayed"] + s3["skipped"] == 1 and s3["changed"] == 0 and "B=mult_set=current advisor@HEAD" in out3, out3)
+    shutil.rmtree(tmp, ignore_errors=True)
+
 failed = 0
 for ok, name, info in results:
     failed += not ok
