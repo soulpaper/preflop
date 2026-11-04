@@ -176,6 +176,14 @@ def narrow_spots(rs):
     return out
 
 
+def order_queue(fresh, stale):
+    """작업 큐: 단계(tier) 순, 같은 단계 안에서는 fresh(새로 풀 것) 먼저 stale(레인지가 바뀐 재솔브) 다음.
+    각 목록 안의 원래 순서(jobs() 순서)는 유지하는 안정 정렬. job = (tier, spot, stack, flop)."""
+    tagged = [(j[0], 0, j) for j in fresh] + [(j[0], 1, j) for j in stale]
+    tagged.sort(key=lambda x: (x[0], x[1]))   # sort 는 안정 정렬 → 같은 (단계, 종류) 안에서 입력 순서 유지
+    return [j for _t, _k, j in tagged]
+
+
 def is_done(spot, stack, flop, rh):
     c = read_json(compact_path(spot, stack, flop))
     return bool(c) and c.get("rh") == rh and c.get("th") == sl.tree_hash()
@@ -692,7 +700,7 @@ def run(args, only=None):
     if skip:
         print("레인지가 너무 좁아 건너뜀:", ", ".join(f"{s} {k}BB" for s, k in sorted(skip)))
     js = [j for j in js if (j[1], j[2]) not in skip]
-    # 새로 풀 것 (우선순위 순) → 그 다음 레인지가 바뀐(stale) 예전 솔브 재솔브 (그동안 예전 결과를 계속 쓴다)
+    # 단계 순, 같은 단계에서는 새로 풀 것 → 레인지가 바뀐(stale) 예전 솔브 재솔브 (그동안 예전 결과를 계속 쓴다)
     fresh, stale, cs = [], [], []
     for j in js:
         c = read_json(compact_path(j[1], j[2], j[3]))
@@ -702,7 +710,7 @@ def run(args, only=None):
         cs.append(((j[1], j[2]), c))
         if c.get("rh") != rs[(j[1], j[2])][1]:
             stale.append(j)
-    queue = fresh + stale
+    queue = order_queue(fresh, stale)
     mem = MemModel(cs)
     pr = load_progress()
     nmax = max(mode()[2], getattr(args, "workers", None) or 1)

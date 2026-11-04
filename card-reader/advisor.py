@@ -1285,7 +1285,7 @@ def _preflop_math(c, hand, strength, name, pos, players, call, eff, pot_total, c
     allin = bool(c.facing_allin) or (eff is not None and call >= 0.95 * eff) or         (c.my_stack is not None and call >= c.my_stack)
     spec = _speculative(hand)
     R = _realization(hand, strength, pos, allin)
-    if not allin and eff:
+    if not allin and eff and pos != "BB":   # BB 는 차트가 이미 깊이를 반영 (할인하면 경계 콜이 다시 폴드로 뒤집힘)
         R *= pf._interp(eff, *DEPTH_R)
     pad = 0.0
     if not allin and not c.closing and pos not in (None, "BB"):

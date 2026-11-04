@@ -41,6 +41,18 @@ import build_gto_lib as bl   # noqa: E402
 test("모듈 경로가 임시 PREFLOP_TOOLS 아래", all(os.path.realpath(p).startswith(os.path.realpath(TMP)) for p in (bl.SOLVES, bl.PROGRESS, bl.LOCK, bl.CONTROL, bl.STOP_FILE)))
 test("임포트가 임시 폴더에도 아무것도 만들지 않음", not os.path.exists(bl.SOLVES))
 
+# --- 큐 순서 (order_queue) ---
+_f = [(0, "A", 30, "f1"), (1, "B", 30, "f1"), (1, "B", 30, "f2"), (2, "C", 20, "f1")]
+_s = [(0, "X", 30, "f1"), (0, "X", 30, "f2"), (1, "Y", 20, "f1")]
+_q = bl.order_queue(_f, _s)
+test("큐: 같은 단계의 fresh 가 stale 보다 앞", _q.index(_f[0]) < _q.index(_s[0]) and _q.index(_f[2]) < _q.index(_s[2]))
+test("큐: 앞 단계 stale 이 뒷 단계 fresh 보다 앞", _q.index(_s[0]) < _q.index(_f[1]) and _q.index(_s[1]) < _q.index(_f[3]))
+test("큐: 단계 안 순서 유지 + 항목 보존",
+     _q == [_f[0], _s[0], _s[1], _f[1], _f[2], _s[2], _f[3]] and bl.order_queue([], []) == [] and bl.order_queue(_f, []) == _f)
+_rs = bl.current_ranges()
+_narrow = bl.narrow_spots(_rs)
+test("좁은 스팟: BB 방어 수정 뒤 BTN_SB 20BB 만 남음", _narrow == {("BTN_SB", 20)}, str(sorted(_narrow)))
+
 if bl.WINDOWS or not os.path.isdir("/proc/self"):
     print("[SKIP] /proc 없음")
     sys.exit(0)

@@ -354,8 +354,9 @@ _j40 = hr.estimate({"X": {"pos": "SB", "preflop": ["blind", "jam"]}}, [], 9, sta
 test("올인 범위는 상대의 올인 금액(12BB)으로 — 내 스택(100BB)보다 훨씬 넓다", _j12["width_pct"] > _j100["width_pct"] + 10,
      f"{_j100['width_pct']} → {_j12['width_pct']}")
 test("올인 금액이 내 스택보다 크면 유효 스택(내 스택)으로", abs(_j300["width_pct"] - _j40["width_pct"]) < 1e-6)
-_xbase = one({"pos": "CO", "preflop": ["open"]}, ["Kd", "8h", "3c"])
-_xchk = one({"pos": "CO", "preflop": ["open"], "flop": ["check"]}, ["Kd", "8h", "3c"])
+with hr.switches(mult_set="current"):   # 이 기대값은 current 배율 기준 (기본은 prev)
+    _xbase = one({"pos": "CO", "preflop": ["open"]}, ["Kd", "8h", "3c"])
+    _xchk = one({"pos": "CO", "preflop": ["open"], "flop": ["check"]}, ["Kd", "8h", "3c"])
 test("체크: 탑페어+ 비중이 확실히 줄어듦 (체크한 상대의 탑페어+ 실측 13% vs 예측 25%)",
      cl(_xchk, "탑페어+") < cl(_xbase, "탑페어+") * 0.75, f"{cl(_xbase, '탑페어+'):.0f}% → {cl(_xchk, '탑페어+'):.0f}%")
 test("요약: 표기한 핸드의 모델 확률과 화면 확률(실측 보정, 5% 단위)",
@@ -439,38 +440,38 @@ _sw_style.__exit__(None, None, None)
 
 # --- 전환 스위치 (MULT_SET / PRE_FLOOR / STYLE_STRENGTH) ---------------------------------------------
 _orig_mult = {k: (list(v[0]), v[1]) for k, v in hr.MULT.items()}
-_cb_cur = hr._kind_mults_base("cbet_med", 0.0, 0.0)
-with hr.switches(mult_set="prev"):
-    _cb_prev = hr._kind_mults_base("cbet_med", 0.0, 0.0)
-    _prev_mid = hr.MULT["bet_med"]
+_cb_prev = hr._kind_mults_base("cbet_med", 0.0, 0.0)   # 기본이 prev
+_prev_mid = hr.MULT["bet_med"]
+with hr.switches(mult_set="current"):
+    _cb_cur = hr._kind_mults_base("cbet_med", 0.0, 0.0)
 _cb_back = hr._kind_mults_base("cbet_med", 0.0, 0.0)
 test("스위치: prev 로 바꾸면 cbet_med 가 다시 계산되고 (M 0.50 기준), 돌아오면 MULT 가 원본과 같다",
      _prev_mid == ([1.00, 1.00, 1.00, 0.50, 0.30], 0.90) and abs(_cb_prev[0][3] - 0.50 * 1.15) < 1e-12
-     and _cb_prev != _cb_cur and _cb_back == _cb_cur and hr.MULT == _orig_mult and hr.MULT_SET == "current",
+     and _cb_prev != _cb_cur and _cb_back == _cb_prev and hr.MULT == _orig_mult and hr.MULT_SET == "prev",
      f"{_cb_prev[0]} / {_cb_cur[0]}")
-hr.MULT_SET = "prev"        # 직접 대입도 동작
+hr.MULT_SET = "current"     # 직접 대입도 동작
 _direct = hr._kind_mults_base("bet_big", 0.0, 0.0)[0][3]
-hr.MULT_SET = "current"
-test("스위치: MULT_SET 직접 대입도 반영", abs(_direct - 0.18) < 1e-12 and abs(hr._kind_mults_base("bet_big", 0, 0)[0][3] - 0.35) < 1e-12)
-_old = hr.configure(mult_set="prev", pre_floor=0.2, style_strength=0.3)
+hr.MULT_SET = "prev"
+test("스위치: MULT_SET 직접 대입도 반영", abs(_direct - 0.35) < 1e-12 and abs(hr._kind_mults_base("bet_big", 0, 0)[0][3] - 0.18) < 1e-12)
+_old = hr.configure(mult_set="current", pre_floor=0.2, style_strength=0.3)
 _mid = (hr.MULT_SET, hr.PRE_FLOOR, hr.STYLE_STRENGTH)
 hr.configure(**_old)
 test("스위치: configure 는 이전 값을 돌려주고 switches/configure 후 복원",
-     _old == {"mult_set": "current", "pre_floor": 0.07, "style_strength": 0.5} and _mid == ("prev", 0.2, 0.3)
-     and (hr.MULT_SET, hr.PRE_FLOOR, hr.STYLE_STRENGTH) == ("current", hr.PRE_FLOOR_DEFAULT, 0.5))
+     _old == {"mult_set": "prev", "pre_floor": 0.07, "style_strength": 0.5} and _mid == ("current", 0.2, 0.3)
+     and (hr.MULT_SET, hr.PRE_FLOOR, hr.STYLE_STRENGTH) == ("prev", hr.PRE_FLOOR_DEFAULT, 0.5))
 _bad = 0
 for kw in ({"mult_set": "x"}, {"pre_floor": -1}, {"style_strength": -0.1}, {"pre_floor": "a"}):
     try:
         hr.configure(**kw)
     except ValueError:
         _bad += 1
-test("스위치: 잘못된 값은 ValueError, 상태는 그대로", _bad == 4 and hr.MULT_SET == "current" and hr.STYLE_STRENGTH == 0.5)
+test("스위치: 잘못된 값은 ValueError, 상태는 그대로", _bad == 4 and hr.MULT_SET == "prev" and hr.STYLE_STRENGTH == 0.5)
 try:
-    with hr.switches(mult_set="prev", style_strength=0):
+    with hr.switches(mult_set="current", style_strength=0):
         raise RuntimeError
 except RuntimeError:
     pass
-test("스위치: 예외가 나도 복원", hr.MULT_SET == "current" and hr.STYLE_STRENGTH == 0.5 and hr.PRE_FLOOR == 0.07)
+test("스위치: 예외가 나도 복원", hr.MULT_SET == "prev" and hr.STYLE_STRENGTH == 0.5 and hr.PRE_FLOOR == 0.07)
 
 _pre_open = {"pos": "CO", "preflop": ["open"]}
 _r_floor = one(_pre_open, [])

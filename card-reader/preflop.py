@@ -267,6 +267,11 @@ def style_params(style):
 DEPTH_OPEN = ([15, 20, 25, 30], [0.90, 0.94, 0.98, 1.0])                          # 첫 진입 폭 배수
 DEPTH_CALL = ([12, 15, 20, 25, 30, 40, 60, 100], [0.40, 0.50, 0.70, 0.86, 0.96, 1.0, 1.07, 1.12])   # vs 오픈 콜 폭 배수
 DEPTH_3BET = ([15, 20, 25, 30, 40, 60, 100], [1.25, 1.20, 1.12, 1.05, 1.0, 0.96, 0.92])             # 3벳(잼) 폭 배수
+# BB 전용 (BB 는 이미 블라인드를 냈고 닫는 자리라 얕아도 방어가 넓다): 20BB 부터 투기 핸드를 빼고, 앤티 확장은 8BB 에서 20BB 사이에 전부 반영.
+DEPTH_CALL_BB = ([12, 15, 20, 25, 30, 40, 60, 100], [0.40, 0.85, 0.88, 0.95, 1.0, 1.0, 1.07, 1.12])
+DEPTH_3BET_BB = ([15, 20, 25, 30, 40, 60, 100], [1.25, 1.25, 1.12, 1.05, 1.0, 0.96, 0.92])
+SPEC_DROP = {"BB": (20, 8)}   # 투기 핸드 콜 제거 (시작 BB, 전부 제거되는 BB). 기본값 (30, 18)
+ANTE_RAMP = {"BB": (8, 20)}   # 앤티 확장 반영 (0 반영 BB, 전부 반영 BB). 기본값 (20, 35)
 DEPTH_SPEC = ([15, 30, 40, 100], [1.0, 0.5, 0.0, -0.4])                           # 투기 핸드 우선순위 가감 (1 = 맨 먼저 제거, -0.4 = 먼저 추가)
 
 
@@ -353,8 +358,11 @@ def _defend_class(hero, players):
 
 def defend_ranges(tb, call, hero, villain, players, ante=False, style="standard", stack_bb=None):
     """vsopen 의 (3벳 집합, 콜 집합) 을 앤티·느슨함·스택 깊이에 맞게 넓히거나 줄인다. 넓힐 때 기존 핸드는 빠지지 않는다.
-    깊이: 콜 폭 × DEPTH_CALL, 3벳 폭 × DEPTH_3BET; 얕을수록 콜에서 투기 핸드(소형 페어·수딧 커넥터)부터 빠지고, 깊을수록 먼저 추가된다."""
+    깊이: 콜 폭 × DEPTH_CALL, 3벳 폭 × DEPTH_3BET (BB 는 DEPTH_*_BB, 투기 핸드 제거 20→8BB, 앤티 확장 8→20BB); 얕을수록 콜에서 투기 핸드(소형 페어·수딧 커넥터)부터 빠지고, 깊을수록 먼저 추가된다."""
     sp = style_params(style)
+    d_call, d_3bet = (DEPTH_CALL_BB, DEPTH_3BET_BB) if hero == "BB" else (DEPTH_CALL, DEPTH_3BET)
+    s_hi, s_lo = SPEC_DROP.get(hero, (30, 18))
+    a_lo, a_hi = ANTE_RAMP.get(hero, (20, 35))
     tb, call = set(tb), set(call) - set(tb)
     cur_tb, cur_all = range_pct(tb), range_pct(tb | call)
     t_tb, t_all = cur_tb, cur_all
@@ -364,7 +372,7 @@ def defend_ranges(tb, call, hero, villain, players, ante=False, style="standard"
             t_all += sp["ante_defend"] * max(0.0, tgt[0] - cur_all)
             t_tb += sp["ante_defend"] * max(0.0, tgt[1] - cur_tb)
     t_all *= sp["defend"]
-    t_tb = min(t_tb * sp["defend"] * sp["threebet"] * (depth_mult(DEPTH_3BET, stack_bb) if stack_bb else 1.0), t_all)
+    t_tb = min(t_tb * sp["defend"] * sp["threebet"] * (depth_mult(d_3bet, stack_bb) if stack_bb else 1.0), t_all)
     moved = set()
     if abs(t_tb - cur_tb) > 1e-9:
         new_tb = _fit(tb, t_tb, _hand_key_3bet)
@@ -377,8 +385,8 @@ def defend_ranges(tb, call, hero, villain, players, ante=False, style="standard"
     key = _hand_key_call
     call = call - tb
     if stack_bb:
-        # 1) 얕은 스택(30BB 아래부터 연속, 18BB 이하 전부): 투기 핸드를 콜 범위에서 약한 것부터 뺀다 (내재 배당이 없다)
-        f = min(1.0, max(0.0, (30 - stack_bb) / 12))
+        # 1) 얕은 스택(s_hi 아래부터 연속, s_lo 이하 전부; BB 는 20BB→8BB, 나머지 30BB→18BB): 투기 핸드를 콜 범위에서 약한 것부터 뺀다 (내재 배당이 없다)
+        f = min(1.0, max(0.0, (s_hi - stack_bb) / (s_hi - s_lo)))
         if f > 0:
             spec_hands = sorted((h for h in call if is_speculative(h)), key=lambda h: (_hand_key_call(h), _RANK[h]),
                                 reverse=True)
@@ -388,11 +396,11 @@ def defend_ranges(tb, call, hero, villain, players, ante=False, style="standard"
                     break
                 call.discard(h)
                 removed += combos(h)
-        # 2) 콜 폭 배수. 앤티 확장(넓히기)은 20BB 에서 0 → 35BB 에서 전부 반영, 확장 시 투기 핸드는 맨 나중/깊을수록 먼저
-        call_t *= depth_mult(DEPTH_CALL, stack_bb)
+        # 2) 콜 폭 배수. 앤티 확장(넓히기)은 a_lo 에서 0 → a_hi 에서 전부 반영 (BB 는 8→20BB, 나머지 20→35BB), 확장 시 투기 핸드는 맨 나중/깊을수록 먼저
+        call_t *= depth_mult(d_call, stack_bb)
         cur = range_pct(call)
         if call_t > cur:
-            call_t = cur + min(1.0, max(0.0, (stack_bb - 20) / 15)) * (call_t - cur)
+            call_t = cur + min(1.0, max(0.0, (stack_bb - a_lo) / (a_hi - a_lo))) * (call_t - cur)
         spec = depth_mult(DEPTH_SPEC, stack_bb)
         key = lambda h: _hand_key_call(h) + (60 * spec if is_speculative(h) else 0.0)
     base_key = key

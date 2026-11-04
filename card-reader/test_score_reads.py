@@ -267,16 +267,15 @@ rows_a, _, _ = sr.score_hands([TYP, OLD, OLD2], [DEC_T], ablation=True)
 ba = {(r["hand"], r["street"]): r for r in rows_a}
 test("abl: 모든 행에 변형 5개 (순서 고정)", all(list(r["abl"]) == list(sr.ABL_NAMES) and len(r["abl"]) == 5 for r in rows_a)
      and sr.ABL_NAMES == ("base", "+tail", "+mult", "+style", "+style1"))
-test("abl: 재생 뒤 스위치 복원", (hr.MULT_SET, hr.PRE_FLOOR, hr.STYLE_STRENGTH) == ("current", 0.07, 0.5))
+test("abl: 재생 뒤 스위치 복원", (hr.MULT_SET, hr.PRE_FLOOR, hr.STYLE_STRENGTH) == ("prev", 0.07, 0.5))
 test("abl: 유형 없는 행은 +style == +mult == +style1",
      all(r["abl"]["+style"] == r["abl"]["+mult"] == r["abl"]["+style1"] for r in rows_a if r["type"] == "없음"))
 test("abl: 프리플랍 행은 +mult == +tail, +style == +mult (MULT/유형은 프리플랍에 안 쓰임)",
      all(r["abl"]["+mult"] == r["abl"]["+tail"] and r["abl"]["+style"] == r["abl"]["+mult"]
          for r in rows_a if r["street"] == "preflop"))
-test("abl: 유형 있는 포스트플랍 행은 +style != +mult, 0.5 와 1.0 이 다르고 +style == live",
+test("abl: 유형 있는 포스트플랍 행은 +style != +mult, 0.5 와 1.0 이 다르다 (live 는 기본 prev 라 +style 과 다를 수 있음)",
      ba[("t-0001", "flop")]["abl"]["+style"]["p"] != ba[("t-0001", "flop")]["abl"]["+mult"]["p"]
-     and ba[("t-0001", "flop")]["abl"]["+style1"]["p"] != ba[("t-0001", "flop")]["abl"]["+style"]["p"]
-     and ba[("t-0001", "flop")]["abl"]["+style"]["p"] == ba[("t-0001", "flop")]["live"]["p"])
+     and ba[("t-0001", "flop")]["abl"]["+style1"]["p"] != ba[("t-0001", "flop")]["abl"]["+style"]["p"])
 test("abl: base 는 차트 밖 꼬리가 없어 +tail 과 프리플랍에서 다름",
      any(r["abl"]["base"]["p"] != r["abl"]["+tail"]["p"] for r in rows_a if r["street"] == "preflop"))
 test("abl: 기본 호출은 abl 없음 (기존 JSON 형태)", all("abl" not in r for r in rows_t))

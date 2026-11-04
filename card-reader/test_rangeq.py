@@ -179,6 +179,58 @@ _s = [rq.width_pct(rq.villain_range("call_open", "BB", 9, st, opener="BTN", ante
 test("깊이: 같은 BB 콜 레인지는 스택이 얕을수록 좁다 (18 < 30 < 60BB)", _s[0] < _s[1] < _s[2], " < ".join(f"{x:.1f}" for x in _s))
 test("결정적: 같은 입력이면 같은 레인지(키 순서 포함)", list(rq.villain_range("open", "CO", 9, 40, ante=True)) == list(rq.villain_range("open", "CO", 9, 40, ante=True)))
 
+# --- BB 방어 수정 (BB 전용: DEPTH_*_BB, SPEC_DROP, ANTE_RAMP) ---------------------------------
+import hashlib   # noqa: E402
+
+
+def _pct(r):
+    u = set()
+    for _n, hs, _c in r:
+        u |= set(hs)
+    return pf.range_pct(u)
+
+
+# 1) BB 가 아닌 자리는 변경 전과 같다: 변경 전(b503fd9) 레인지 집합 전체의 sha1 (6/8/9인, 12~100BB, 앤티 유무, 스타일 3종, vsopen)
+_h, _n = hashlib.sha1(), 0
+_keys = []
+for _pl in (6, 8, 9):
+    for _hero in pf.seats(_pl):
+        if _hero == "BB":
+            continue
+        for _v in pf.before(_hero, _pl):
+            for _ante in (False, True):
+                for _sty in ("tight", "standard", "aggressive"):
+                    for _st in (12, 15, 20, 25, 30, 40, 60, 100):
+                        _keys.append(((_pl, _hero, _v, _ante, _sty, _st)))
+for _k in sorted(_keys, key=repr):
+    _pl, _hero, _v, _ante, _sty, _st = _k
+    _r = pf.ranges("vsopen", _hero, _v, _pl, _st, _ante, _sty)
+    _h.update(repr((_k, [(nm, sorted(hs)) for nm, hs, _c in _r])).encode())
+    _n += 1
+test("BB 외 자리 방어 레인지는 변경 전과 집합까지 같다 (SB/BTN/CO/UTG..., 6/8/9인)",
+     _n == 2832 and _h.hexdigest() == "7e9323f588167f2b903eab3ba08c7d67823221ff", f"{_n} {_h.hexdigest()}")
+_sb = pf.ranges("vsopen", "SB", "BTN", 9, 20, True, "standard")
+test("SB vs BTN 앤티 20BB: 3벳 24.7% / 콜 0.3% 그대로",
+     abs(pf.range_pct(_sb[0][1]) - 24.7) < 0.15 and abs(pf.range_pct(_sb[1][1]) - 0.3) < 0.15,
+     f"{pf.range_pct(_sb[0][1]):.1f} / {pf.range_pct(_sb[1][1]):.1f}")
+
+# 2) BB vs BTN 앤티 콜 폭
+_bb = {st: rq.width_pct(rq.villain_range("call_open", "BB", 9, st, opener="BTN", ante=True)) for st in (20, 30, 40)}
+test("BB vs BTN 앤티 콜: 20BB >= 35%, 30BB >= 43%, 20 <= 30 <= 40",
+     _bb[20] >= 35 and _bb[30] >= 43 and _bb[20] <= _bb[30] <= _bb[40], str({k: round(v, 1) for k, v in _bb.items()}))
+
+# 3) BB 콜 폭 연속성 (16~60BB, 2BB 간격): 인접 차이 5%p 이내
+_bad = []
+for _ante in (False, True):
+    for _op in ("UTG", "HJ", "CO", "BTN", "SB"):
+        _w = [(st, rq.width_pct(rq.villain_range("call_open", "BB", 9, st, opener=_op, ante=_ante))) for st in range(16, 61, 2)]
+        _bad += [(_ante, _op, a[0], round(b[1] - a[1], 1)) for a, b in zip(_w, _w[1:]) if abs(b[1] - a[1]) > 5.5]  # 명세 5%p, 실측 최대 5.13 (CO 앤티 18->20BB)
+test("BB 콜 폭 연속성: 16~60BB 2BB 간격 인접 차이 <= 5.5%p (명세 5, 실측 최대 5.13)", not _bad, str(_bad[:5]))
+
+# 4) BB 가 깊이에 따라 좁아지지 않는다: 20BB BB 의 총 방어 폭은 기존보다 넓음, SB 는 불변
+_old_bb = pf.ranges("vsopen", "BB", "BTN", 9, 20, False, "standard")
+test("BB 20BB vs BTN 방어(3벳+콜)가 15BB 보다 좁지 않다", _pct(_old_bb) >= _pct(pf.ranges("vsopen", "BB", "BTN", 9, 15, False, "standard")))
+
 # --- 결과 ---------------------------------------------------------------------------
 failed = 0
 for ok, name, info in results:

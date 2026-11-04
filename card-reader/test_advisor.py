@@ -484,8 +484,15 @@ results.append((_ok, "포스트 느슨함 단조: 경계 에쿼티에서 -1 은 
 
 # --- 스택 깊이 (연속) -------------------------------------------------------------------------------
 _ds = {s_: defend_pct(stack=s_)[0] for s_ in (20, 30, 40, 60)}
-results.append((_ds[20] < _ds[30] < _ds[40] < _ds[60] and 40 <= _ds[20] <= 56 and 50 <= _ds[30] <= 62 and 52 <= _ds[40] <= 68 and _ds[60] <= 72,
-                "BB 방어% vs BTN 2x: " + " < ".join(f"{s_}BB {_ds[s_]:.1f}" for s_ in (20, 30, 40, 60)) + " (얕을수록 좁게)", NA))
+results.append((_ds[20] <= _ds[30] + 0.5 <= _ds[40] + 1 and 48 <= _ds[20] <= 64 and 50 <= _ds[30] <= 62 and 52 <= _ds[40] <= 68 and _ds[60] <= 72,
+                "BB 방어% vs BTN 2x: " + " <= ".join(f"{s_}BB {_ds[s_]:.1f}" for s_ in (20, 30, 40, 60)) + " (BB 는 20BB 부터 넓게, 대략 단조)", NA))
+# BB 방어 수정: 20BB 경계 콜 (DEPTH_R 은 BB 에 안 씀), 정크는 폴드
+check("BB 20BB 앤티: K5o vs BTN 2x → 콜", bbctx("K5o", stack=20), "콜", 1, 0.01)
+check("BB 20BB 앤티: 76s vs CO 2.2x → 콜", bbctx("76s", vs="CO", mult=2.2, stack=20), "콜", 1.2, 0.01)
+check("BB 20BB 앤티: 72o vs BTN 2x → 폴드", bbctx("72o", stack=20), "폴드")
+_sb20 = pf.ranges("vsopen", "SB", "BTN", 9, 20, True)   # SB 차트는 불변 (3벳 24.7%, 콜 0.3%)
+results.append((abs(pf.range_pct(_sb20[0][1]) - 24.7) < 0.15 and abs(pf.range_pct(_sb20[1][1]) - 0.3) < 0.15,
+                f"SB vs BTN 20BB 앤티 차트 불변 (3벳 {pf.range_pct(_sb20[0][1]):.1f}% / 콜 {pf.range_pct(_sb20[1][1]):.1f}%)", NA))
 _cont = [pf.range_pct(pf.ranges("vsopen", "BB", "BTN", 9, s_, True)[1][1]) for s_ in range(16, 61, 2)]
 _jump = max(abs(b_ - a_) for a_, b_ in zip(_cont, _cont[1:]))
 results.append((_jump < 6.5 and all(b_ >= a_ - 0.3 for a_, b_ in zip(_cont, _cont[1:])),

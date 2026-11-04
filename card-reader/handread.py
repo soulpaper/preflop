@@ -94,7 +94,7 @@ MULT_SETS["prev"]["bet_med"][0][2] = 1.00
 MULT_SETS["prev"]["bet_med"][0][3] = 0.50
 MULT_SETS["prev"]["bet_big"][0][3] = 0.18
 MULT_SETS["prev"]["check"][0][2] = 0.85
-MULT_SET = "current"
+MULT_SET = "prev"
 _MULT_BUILT = None
 # --- 주도권(이니셔티브)별 벳 --------------------------------------------------------------
 #   같은 크기의 벳도 '누가 벳했나'에 따라 범위가 다르다. 크기별 기본 행(bet_*)에 역할 보정 [N, W, T, M, A] 과 드로우 배율을 곱해
