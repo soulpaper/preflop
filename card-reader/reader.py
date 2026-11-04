@@ -104,12 +104,16 @@ DEFAULT_CONFIG = {
     "threshold": 0.95,  # 실측: 정답 카드 0.965 이상, 다른 카드 최대 0.923 (K♣ vs K♠)
     "iterations": 10000,
     "interval_ms": 400,
-    "ui_scale": 1.5,    # 처음 창 크기의 배율 (이후 배율은 창 크기에 맞춰 자동, A− / A+는 창 크기를 바꿈)
+    "ui_scale": 1.5,    # 마지막으로 쓴 배율 (창 위치가 저장돼 있지 않을 때 처음 창 크기를 정할 때만 씀. 실제 배율은 창에 맞춰 자동)
+    "ui_bias": 0.0,     # A− / A+ 로 정한 자동 배율 보정 (0.1 단위, -0.5 ~ +0.5)
     "explain": True,    # 용어 설명 표시
     "analysis_mode": "auto",  # "auto": 내 차례에 자동 분석 / "click": [지금 계산]을 누를 때만 무거운 분석
 }
-SCALE_MIN, SCALE_MAX, SCALE_STEP = 1.0, 2.0, 0.1  # A- / A+ 단계. 실제 배율은 창 크기에 맞춰 정해짐
+SCALE_MAX, SCALE_STEP = 2.0, 0.1  # 배율 상한 (A+ 보정 포함) / A− A+ 한 번에 바꾸는 보정
+AUTO_MIN, AUTO_MAX = 0.9, 1.6  # 자동 배율 범위: 창에 다 들어가는 가장 큰 배율을 이 안에서 (0.9 미만은 지금 내용이 안 들어갈 때만)
+BIAS_MIN, BIAS_MAX = -0.5, 0.5  # A− / A+ 보정 범위
 FIT_MIN = 0.5          # 창이 작으면 이 배율까지 줄여서라도 한 화면에 모두 보임 (스크롤 없음)
+REFIT_TOL = 0.04       # 새 핸드·스트리트에서 다시 맞춘 배율이 이보다 적게 달라지면 그대로 (글자 크기가 핸드마다 흔들리지 않게)
 MIN_WINDOW_SCALE = 0.6  # 창 최소 크기 = 3열 배치가 이 배율로 들어가는 크기
 
 # 화면 변화 판정: 반짝임·노이즈·은은한 글로우는 무시하고 숫자/카드가 바뀐 것만 잡는다
@@ -151,9 +155,10 @@ CHIP_HOVER = "#2c333d"
 F_UI = "Malgun Gothic"
 F_NUM = "Segoe UI"
 
-# 글자 크기 (pt, 배율 1.0 기준)
-FS_TITLE, FS_H, FS_BODY, FS_NOTE, FS_SMALL = 14, 13, 12, 11, 10
-FS_HAND, FS_EQ, FS_BIG, FS_ACTION = 16, 38, 30, 30
+# 글자 크기 (pt, 배율 1.0 기준). 작은 글자(상대 예상 줄·설명·버튼)는 고령 사용자에게 작아서 한 단계씩 키우고, 이미 충분히 큰
+# 숫자(에쿼티·SPR·M)는 조금 줄여 그 자리를 작은 글자에 줌 (같은 창에서 배율이 덜 내려가게)
+FS_TITLE, FS_H, FS_BODY, FS_NOTE, FS_SMALL = 14, 13, 12, 12, 11
+FS_HAND, FS_EQ, FS_BIG, FS_ACTION = 16, 36, 26, 30
 # 추천 박스 전용 글자 크기 (고령 사용자 가독성) - 다른 곳에는 쓰지 않는다
 FS_ADV_CAP, FS_ADV_REASON, FS_ADV_PLAN, FS_ADV_DETAIL, FS_ADV_STATUS = 12, 16, 15, 13, 15
 
@@ -184,7 +189,8 @@ PAD, GAP = 20, 16
 MIN_H_UNITS = 900      # 창 최소 높이 계산용 (3열 기준 대략 최대 높이)
 TABS = (("analysis", "분석"), ("inputs", "입력"))
 
-# 섹션 id (기본 순서). 한 섹션은 항상 같은 열·같은 순서에 놓이고, 내용이 없으면 한 줄로 접힌 제목만 남는다.
+# 섹션 id (기본 순서). 섹션은 제자리(DEFAULT_HOME 또는 사용자 배치) 열·순서에 놓이고, 내용이 없으면 한 줄로 접혀 그 열
+# 맨 아래로 간다. 열 높이가 많이 다르면 아래쪽 섹션을 짧은 열로 옮겨 맞춘다 (balance_cols).
 # 사용자가 제목줄을 끌어 옮긴 배치는 cfg["section_layout"] = {"cols": [[id, ...], ...], "hidden": [id, ...]}
 SECTION_IDS = ("top", "cards", "equity", "opp", "guide", "tabs", "pot", "implied", "spr", "fold", "m", "notes")
 ANALYSIS_IDS = ("pot", "implied", "spr", "fold", "m")  # 분석 탭에서만 있는 섹션
@@ -205,8 +211,70 @@ COLLAPSED_TEXT = {  # 해당 섹션이 비었을 때 한 줄로 접어 보여줄
 # 섹션이 채워졌을 때의 보통 최대 높이 (배율 1.0 기준 px, 측정값): 기본 배치와 배율을 정할 때 지금 작거나 접혀 있어도 이만큼 자리를 본다
 NOMINAL_UNITS = {"top": 450, "cards": 108, "equity": 250, "opp": 310, "guide": 520, "tabs": 126, "pot": 180,
                  "implied": 170, "spr": 175, "fold": 97, "m": 126, "notes": 35}
-RESERVE = 0.75  # 배치·배율을 정할 때 NOMINAL_UNITS 의 이 비율만큼은 늘 자리를 잡음 (다 잡으면 글자가 너무 작아짐. 넘치면 한 번 줄임)
+RESERVE = 0.75  # 높이 기록이 아직 적을 때(창 크기를 바꾼 직후 등) 배율을 정하며 섹션마다 NOMINAL_UNITS 의 이 비율만큼은 있다고 봄
+SEED_EPOCHS = 3       # 이만큼의 핸드·스트리트 높이 기록이 쌓이면 RESERVE 추정 대신 기록만 씀
+MEMORY_EPOCHS = 20    # 배율을 정할 때 보는 최근 핸드·스트리트 수 (섹션마다 그동안의 가장 큰 높이)
+HOLD_S = 4.0          # 섹션이 줄거나 접혀도 이 시간(초) 동안은 자리를 유지 (깜빡임에 배치가 흔들리지 않게). 지나면 빈자리를 없앰
+BAL_GAIN = 30         # 균형 맞추기: 가장 긴 열이 이만큼(배율 1.0 px) 이상 짧아질 때만 섹션을 옮김
+PINNED = ("top", "cards", "equity")  # 균형 맞추기로 옮기지 않는 섹션 (눈이 먼저 가는 곳: 추천·카드·에쿼티)
+# 기본 배치 (열 수별 '제자리'). 사용자가 끌어 옮긴 배치가 있으면 그것이 제자리
+DEFAULT_HOME = {
+    1: [list(SECTION_IDS)],
+    2: [["top", "cards", "equity", "opp", "notes"], ["guide", "tabs", "pot", "implied", "spr", "fold", "m"]],
+    3: [["top", "cards", "equity"], ["guide", "opp", "notes"], ["tabs", "pot", "implied", "spr", "fold", "m"]],
+}
 NODRAG_TAGS = ("btn_", "badge", "tab", "sum")  # 이 태그가 붙은 것을 누르면 끌기가 아니라 그 동작
+
+
+def cols_height(cols, units, gap=GAP):
+    """가장 긴 열의 높이 (섹션 높이 합 + 사이 간격)."""
+    return max((sum(units[i] for i in col) + gap * (len(col) - 1) for col in cols if col), default=0)
+
+
+def balance_cols(home, units, present, pinned=PINNED, gap=GAP, gain=BAL_GAIN):
+    """섹션 배치 규칙 (배율 1.0 기준 높이 units = {id: 높이}, 그려지지 않은 id 는 뺌):
+    1) 열마다 제자리(home) 순서. 단 내용이 없는(접힌 한 줄) 섹션은 그 열 맨 아래로 — 빈 섹션이 중간에서 자리를 잡지 않음.
+    2) 균형: 가장 긴 열에서 섹션 하나를 다른 열 아래로 옮겨 가장 긴 열이 gain 이상 짧아지면 옮기고, 더 안 될 때까지 반복.
+       옮기는 섹션은 아래쪽부터 고르고 (같은 효과면 더 아래 것), 내용 있는 섹션은 받는 열의 내용 있는 섹션들 바로 아래
+       (접힌 줄들 위)에, 접힌 섹션은 맨 아래에. 열 맨 위 섹션과 pinned (추천·카드·에쿼티, 사용자가 직접 옮긴 것)는 안 옮김.
+    매번 제자리에서 다시 계산하므로 같은 상태면 늘 같은 배치. 반환: 열마다 id 목록."""
+    cols = []
+    for col in home:
+        ids = [i for i in col if i in units]
+        cols.append([i for i in ids if i in present] + [i for i in ids if i not in present])
+    if len(cols) < 2:
+        return cols
+    heads = {col[0] for col in cols if col}
+
+    def tall(col):
+        return sum(units[i] for i in col) + gap * max(len(col) - 1, 0)
+
+    for _ in range(4 * len(units) + 4):
+        hs = [tall(col) for col in cols]
+        t = max(range(len(cols)), key=lambda j: (hs[j], -j))
+        best = None
+        for idx in range(len(cols[t]) - 1, 0, -1):
+            sid = cols[t][idx]
+            if sid in pinned or sid in heads:
+                continue
+            for j in range(len(cols)):
+                if j == t:
+                    continue
+                nh = list(hs)
+                nh[t] = hs[t] - units[sid] - gap
+                nh[j] = hs[j] + units[sid] + (gap if cols[j] else 0)
+                m = max(nh)
+                if m <= hs[t] - gain and (best is None or m < best[0] - 1e-6):
+                    best = (m, idx, j)
+        if best is None:
+            break
+        _, idx, j = best
+        sid = cols[t].pop(idx)
+        if sid in present:
+            cols[j].insert(sum(1 for i in cols[j] if i in present), sid)
+        else:
+            cols[j].append(sid)
+    return cols
 
 
 def load_config():
@@ -1421,9 +1489,16 @@ class App:
         self.set_k(float(self.cfg.get("ui_scale") or DEFAULT_CONFIG["ui_scale"]))
         x, y, w, h = self.initial_rect()
         self.win_w, self.win_h = w, h
-        self.layout_lock = None  # (창 w, h, 배율, 열 폭, 열 수): 창 크기가 그대로면 배율·배치 고정
-        self.slot_cols = None    # 고정된 섹션 배치: 열마다 섹션 id 목록 (잠금과 함께 정해지고 풀림)
-        self.sticky = {}         # {탭: {섹션 id: 본 적 있는 가장 큰 높이 (배율 1.0 기준)}} — 잠금 동안 자리 높이 유지
+        self.layout_lock = None  # (창 w, h, 배율, 열 폭, 열 수): 창 크기가 그대로면 열 폭·열 수 고정 (배율은 핸드마다 다시 봄)
+        self.slot_cols = None    # 지금 보이는 섹션 배치: 열마다 섹션 id 목록 (제자리 + 접힌 섹션 아래로 + 균형 맞추기)
+        self.sticky = {}         # {탭: {섹션 id: [자리 높이(배율 1.0 기준), 그 높이였던 마지막 시각, 내용 있음]}}
+        self.arr_key = None      # 배치를 정할 때의 (탭, 내용 있는 섹션들) — 바뀌면 다시 배치
+        self.epoch = None        # (내 카드, 보드 장수, 폴드, 탭): 바뀌면 배율·배치를 다시 봄
+        self.epoch_max = {}      # {탭: {섹션 id: 이번 핸드·스트리트에서 본 가장 큰 높이}}
+        self.height_memory = {}  # {탭: {섹션 id: 최근 MEMORY_EPOCHS 개 핸드·스트리트의 가장 큰 높이 목록}}
+        self.refit = False       # A− / A+ 뒤 다음 그리기에서 배율을 바로 다시 정함
+        self.wake_after = None   # 자리 유지 시간이 끝날 때 다시 그리기 예약
+        self.placed_secs = []
         self.drag = None         # 제목줄 끌기 상태
         self.handles, self.slot_rects, self.handle_local = [], [], {}
         self._cursor, self._sid = "", None
@@ -1513,10 +1588,13 @@ class App:
         return w
 
     def reset_lock(self):
-        """배율·열·섹션 배치·자리 높이 고정을 풀어 다음 그리기에서 한 번 새로 정하게 함."""
+        """열 폭·열 수·배율·섹션 배치·자리 높이·높이 기록을 모두 풀어 다음 그리기에서 새로 정하게 함 (창 크기/설명/배치 편집)."""
         self.layout_lock = None
         self.slot_cols = None
         self.sticky = {}
+        self.arr_key = None
+        self.epoch_max = {}
+        self.height_memory = {}
 
     # --- 창 크기 <-> 배율 ------------------------------------------------------
     def work_area(self, point=None):
@@ -1593,15 +1671,28 @@ class App:
             self.render(force=True)
 
     def change_scale(self, delta):
-        """A- / A+: 배율을 0.1씩. 창 크기를 같은 비율로 바꾸고(모니터 안에서), 배율은 창에 맞춰 다시 정해짐."""
-        steps = self.scale / SCALE_STEP
-        target = (math.floor(steps + 1e-6) + 1 if delta > 0 else math.ceil(steps - 1e-6) - 1) * SCALE_STEP
-        target = min(SCALE_MAX, max(FIT_MIN, target))
-        f = target / self.scale
+        """A− / A+: 자동 배율(창에 다 들어가는 가장 큰 배율)에 ±0.1 보정 — 같은 창에서 글자만 커지거나 작아진다.
+        A+ 인데 창에 더 큰 글자가 들어갈 자리가 없으면 창을 10% 키운다 (모니터 안에서)."""
+        old = self.bias()
+        new = round(min(BIAS_MAX, max(BIAS_MIN, old + delta)), 2)
+        before = self.scale
+        if new != old:
+            self.cfg["ui_bias"] = new
+            self.refit = True
+            self.render(force=True)
+            if abs(self.scale - before) > 0.005 or delta < 0:
+                self.save_later()
+                return
+            self.cfg["ui_bias"] = old   # 창에 자리가 없어 그대로 → 보정은 되돌리고 창을 키움
+            self.refit = True
+            self.render(force=True)
+        if delta < 0:
+            self.show_toast("가장 작은 글자입니다")
+            return
         r = self.root
-        x, y, w, h = self.clamp_rect(r.winfo_x(), r.winfo_y(), round(self.win_w * f), round(self.win_h * f))
+        x, y, w, h = self.clamp_rect(r.winfo_x(), r.winfo_y(), round(self.win_w * 1.1), round(self.win_h * 1.1))
         if (w, h) == (self.win_w, self.win_h):
-            self.show_toast("모니터 크기 안에서 가장 큰 크기입니다" if delta > 0 else "가장 작은 크기입니다")
+            self.show_toast("창에 더 큰 글자가 들어가지 않습니다 (모니터 안에서 가장 큰 창)")
             return
         self.win_w, self.win_h = w, h
         self.cfg["window"] = [x, y, w, h]
@@ -3474,9 +3565,14 @@ class App:
 
     # --- 그리기 -------------------------------------------------------------
     def render(self, force=False):
-        """화면 전체를 그림: 섹션들을 그려 높이를 재고, 고정된 열·순서대로 놓는다 (섹션은 높이에 따라 열을 옮겨 다니지
-        않는다. 기본 배치는 처음 한 번만 masonry 로 정하고, 사용자가 옮기면 cfg["section_layout"] 을 따른다).
-        창에 다 들어가는 가장 큰 배율·열 폭을 찾고 (열 폭은 CW_MIN~CW_MAX), 그 뒤로는 고정."""
+        """화면 전체를 그림: 섹션들을 그려 높이를 재고 열에 놓는다.
+        배치 (arrange_ids / balance_cols): 열마다 '제자리'(사용자가 끌어 옮긴 배치, 없으면 DEFAULT_HOME) 순서대로 놓되,
+        내용이 없는 섹션은 한 줄로 접혀 그 열 맨 아래로 가고 (빈자리를 잡지 않음), 가장 긴 열의 아래쪽 섹션을 가장 짧은 열
+        아래로 옮겨 열 높이를 맞춘다. 추천·카드·에쿼티(PINNED)와 열 맨 위 섹션, 사용자가 직접 옮긴 섹션은 옮기지 않는다.
+        배율: 창에 다 들어가는 가장 큰 배율 (AUTO_MIN~AUTO_MAX, A−/A+ 보정). 최근 핸드들의 섹션 높이 기록으로 정해서
+        핸드마다 흔들리지 않고, 핸드·스트리트가 바뀔 때만 다시 맞춘다 (REFIT_TOL 미만 차이는 무시). 그 사이에는 넘칠 때만 줄인다.
+        흔들림 방지: 섹션이 줄거나 접혀도 HOLD_S 초 동안은 자리를 유지. 배치는 핸드·스트리트가 바뀔 때, 내용 있는 섹션이
+        바뀔 때, 자리 유지가 끝날 때, 넘칠 때만 다시 정한다. 열 폭·열 수는 창 크기/설명/배치 편집 때만 새로 찾는다."""
         if self.drag is not None and self.drag.get("active"):  # 끄는 동안에는 화면을 건드리지 않음
             return
         st = self.preflop_state()
@@ -3488,81 +3584,118 @@ class App:
                self.result_stale(), self.heavy_allowed(), self.err_note, self.state_key, tuple(sorted(self.manual)),
                bool(self.cfg.get("auto_numbers")), repr(self.ocr_values), self.rec_on, self.rec_elapsed(),
                self.reads_sig(), repr((self.track or {}).get("names")), repr(self.cfg.get("section_layout")),
-               repr(self.tourney), repr(self.cfg.get("tourney")))
+               repr(self.tourney), repr(self.cfg.get("tourney")), self.cfg.get("ui_bias"))
         if key == self.last_render and not force:
             return
         self.last_render = key
         self.tip.hide()
-        # 0) 배율·열·배치 고정: 내용이 바뀔 때마다 새로 찾으면 글자가 커졌다 작아졌다, 섹션이 이리저리 옮겨 다녀서 눈이
-        #    아프다. 창 크기/A−A+/설명 토글/배치 편집 때만 새로 정하고, 그 외에는 고정. 넘칠 때만 줄이고 저절로 다시 키우지
-        #    않는다. 섹션 자리 높이도 본 적 있는 가장 큰 값으로 유지해서, 내용이 줄어도 아래 섹션이 올라오지 않는다.
         lock = self.layout_lock
-        if lock is not None and lock[:2] == (w, h) and self.slot_cols is not None:
+        if lock is None or lock[:2] != (w, h):
+            self.fit_window(st, w, h)
+        else:
             self.set_k(lock[2])
-            self.col_w, n = lock[3], lock[4]
-            secs = self.draw_sections(st)
-            for _ in range(12):
-                sized = self.apply_sticky(secs)
-                cols = self.arrange(sized)
-                if self.col_extent(cols, sized)[0] <= h or self.scale <= FIT_MIN + 1e-6:
-                    break
-                self.set_k(max(FIT_MIN, self.scale * 0.96))
-                secs = self.draw_sections(st)
-            else:
-                sized = self.apply_sticky(secs)
-                cols = self.arrange(sized)
-            self.layout_lock = (w, h, self.scale, self.col_w, n)
-            self.cols_used = n
-            self.place(sized, cols)
-            self.cfg["ui_scale"] = round(self.scale, 2)
-            return
-        self.slot_cols, self.sticky = None, {}
-        # 1) 열 폭 탐색: 폭이 좁으면 섹션이 길어지고 넓으면 짧아진다 (넓이 ≈ 일정). 가로/세로 어느 쪽이 먼저
-        #    차는지 보고 폭을 조절해 가며 가장 큰 배율을 찾는다 (실제로 그려서 높이를 잼).
-        #    지난번 폭에서 시작하고, 더 나아지지 않거나 거의 같으면 바로 멈춰 그리는 횟수를 줄인다
-        best, cw, drawn = None, self.col_w, None
+            self.col_w = lock[3]
+            self.relayout(st, w, h, lock[4])
+        self.cfg["ui_scale"] = round(self.scale, 2)
+
+    def fit_window(self, st, w, h):
+        """창 크기가 바뀌었을 때 (또는 처음): 열 폭·열 수·배율을 새로 찾는다. 폭이 좁으면 섹션이 길어지고 넓으면 짧아진다
+        (넓이 ≈ 일정). 가로/세로 어느 쪽이 먼저 차는지 보고 폭을 조절해 가며 가장 큰 배율을 찾는다 (실제로 그려서 높이를 잼)."""
+        self.slot_cols, self.sticky, self.arr_key = None, {}, None
+        self.epoch, self.refit = self.layout_epoch(), False
+        best, cw = None, self.col_w
         for _ in range(4):
             self.col_w = cw
-            secs = self.draw_sections(st)
-            drawn = (self.col_w, self.scale)
-            scale, n, ratio = self.pick_layout(secs, w, h)
-            if best is not None and scale <= best[0] + 1e-6:
+            raw = self.as_sized(self.draw_sections(st))
+            fit, n, ratio = self.pick_layout(raw, w, h)
+            if best is not None and fit <= best[0] + 1e-6:
                 break
-            best = (scale, cw, n)
+            best = (fit, cw, n)
             new_cw = min(CW_MAX, max(CW_MIN, cw * math.sqrt(ratio)))
             if abs(new_cw - cw) < 0.06 * cw:
                 break
             cw = new_cw
-        scale, self.col_w, n = best
-        # 2) 고른 폭·배율로 (필요하면 다시 그려) 실제 높이로 확인 (글자 폭이 정수라 한 번 더 재서 확인)
-        for attempt in range(4):
-            if drawn != (self.col_w, round(min(SCALE_MAX, max(FIT_MIN, scale)), 3)):
-                self.set_k(scale)
-                secs = self.draw_sections(st)
-                drawn = (self.col_w, self.scale)
-            scale2, n2, _ = self.pick_layout(secs, w, h)
-            n = n2 if abs(scale2 - scale) <= 0.03 else n
-            if abs(scale2 - scale) <= 0.005:
+        _, self.col_w, n = best
+        # 고른 폭에서 배율을 정하고, 그 배율로 다시 그려 잰 높이로 한 번 더 확인 (글자 폭이 정수라 조금 달라짐)
+        secs = self.draw_sections(st)
+        for _ in range(3):
+            target = self.target_scale(self.as_sized(secs), n, w, h)
+            if abs(target - self.scale) <= 0.005:
                 break
-            scale = scale2
-        # 3) 측정한 실제 높이가 창을 넘으면 조금씩 줄여서 반드시 한 화면에 들어가게
-        for _ in range(10):
-            self.slot_cols = self.make_slots(secs, n)
-            cols = self.arrange(secs)
-            if self.col_extent(cols, secs)[0] <= h or self.scale <= FIT_MIN + 1e-6:
-                break
-            self.set_k(max(FIT_MIN, self.scale * 0.96))
+            self.set_k(target)
             secs = self.draw_sections(st)
-        else:
-            self.slot_cols = self.make_slots(secs, n)
-            cols = self.arrange(secs)
-        sized = self.apply_sticky(secs)
+        sized, _ = self.apply_sticky(secs)
+        self.finish_layout(st, sized, w, h, n, repack=True)
+
+    def relayout(self, st, w, h, n):
+        """창 크기는 그대로: 핸드·스트리트가 바뀌었거나 A−/A+ 를 눌렀으면 배율을 다시 맞추고, 아니면 배율 그대로 배치만."""
+        epoch = self.layout_epoch()
+        refit, exact = self.refit, self.refit
+        self.refit = False
+        if epoch != self.epoch:
+            self.close_epoch()
+            self.epoch = epoch
+            self.sticky = {}   # 새 핸드·스트리트: 지난 내용의 빈자리는 바로 없앰 (화면이 어차피 바뀌는 순간)
+            refit = True
+        secs = self.draw_sections(st)
+        sized, released = self.apply_sticky(secs)
+        if refit:
+            target = self.target_scale(sized, n, w, h)
+            if abs(target - self.scale) >= (0.005 if exact else REFIT_TOL):
+                self.set_k(target)
+                self.sticky = {}   # 배율이 바뀌면 줄바꿈이 달라져 예전 높이는 맞지 않음
+                sized, _ = self.apply_sticky(self.draw_sections(st))
+                released = True
+        self.finish_layout(st, sized, w, h, n, repack=refit or released)
+
+    def finish_layout(self, st, sized, w, h, n, repack):
+        """배치를 (필요하면 새로) 정하고, 넘치면 먼저 다시 배치해 보고 그래도 넘치면 배율을 조금씩 줄여서 반드시 한 화면에."""
+        arr_key = (self.tab, frozenset(sec[0] for sec in sized if sec[4]))
+        if repack or self.slot_cols is None or arr_key != self.arr_key:
+            self.slot_cols = self.arrange_ids(sized, n)
+        cols = self.index_cols(sized)
+        for _ in range(14):
+            if self.col_extent(cols, sized)[0] <= h:
+                break
+            again = self.arrange_ids(sized, n)
+            if again == self.slot_cols:
+                if self.scale <= FIT_MIN + 1e-6:
+                    break
+                self.set_k(max(FIT_MIN, self.scale * 0.96))
+                self.sticky = {}
+                sized, _ = self.apply_sticky(self.draw_sections(st))
+                again = self.arrange_ids(sized, n)
+            self.slot_cols = again
+            cols = self.index_cols(sized)
+        self.arr_key = (self.tab, frozenset(sec[0] for sec in sized if sec[4]))
+        self.layout_lock = (w, h, self.scale, self.col_w, n)
         self.cols_used = n
         self.place(sized, cols)
-        self.cfg["ui_scale"] = round(self.scale, 2)
-        self.layout_lock = (w, h, self.scale, self.col_w, n)
 
-    # --- 섹션 배치 (고정) ------------------------------------------------------
+    def layout_epoch(self):
+        """핸드·스트리트 구분: 내 카드, 보드 장수, 폴드 뒤 복기 화면, 안내 글, 탭. 바뀌면 배율·배치를 다시 본다."""
+        v = self.view
+        return (tuple(v.get("hero") or ()), len(v.get("board") or ()), bool(v.get("folded")), bool(v.get("message")),
+                self.tab)
+
+    def close_epoch(self):
+        """끝난 핸드·스트리트에서 본 섹션별 가장 큰 높이를 기록에 넣음 (최근 MEMORY_EPOCHS 개)."""
+        for tab, seen in self.epoch_max.items():
+            mem = self.height_memory.setdefault(tab, {})
+            for sid, u in seen.items():
+                hist = mem.setdefault(sid, [])
+                hist.append(u)
+                del hist[:-MEMORY_EPOCHS]
+        self.epoch_max = {}
+
+    def bias(self):
+        """A− / A+ 로 정한 자동 배율 보정."""
+        try:
+            return min(BIAS_MAX, max(BIAS_MIN, float(self.cfg.get("ui_bias") or 0.0)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    # --- 섹션 배치 ------------------------------------------------------------
     def user_layout(self):
         """cfg["section_layout"] 을 검사·정리해서 ([[id...]...], [숨긴 id...]) — 없거나 잘못됐으면 None.
         알 수 없는 id 는 버리고, 빠진 섹션은 가장 적게 든 열 끝에 붙인다."""
@@ -3595,66 +3728,109 @@ class App:
             cols[0].insert(0, "top")
         return cols, hidden
 
+    def user_pins(self):
+        """사용자가 직접 끌어 옮긴 섹션 (균형 맞추기로 옮기지 않음)."""
+        raw = self.cfg.get("section_layout")
+        pins = raw.get("pin") if isinstance(raw, dict) else None
+        return [i for i in pins if i in SECTION_IDS] if isinstance(pins, list) else []
+
     def hidden_ids(self):
         user = self.user_layout()
         return set(user[1]) if user else set()
 
-    def pack_ids(self, items, n):
-        """masonry: [(id, 높이)] 를 순서대로 가장 짧은 열(동률이면 왼쪽)에 쌓는다. 반환: 열마다 id 목록."""
-        cols, used = [[] for _ in range(n)], [0.0] * n
-        for sid, hgt in items:
-            if hgt <= 0:
-                continue
-            j = min(range(n), key=lambda cj: (used[cj], cj))
-            used[j] += hgt + (GAP if cols[j] else 0)
-            cols[j].append(sid)
-        return cols
-
-    def est_units(self, secs):
-        """{id: 배율 1.0 기준 높이}: 배치·배율을 정할 때는 섹션마다 (접혔거나 작아도) 보통 최대 높이만큼 자리를 본다."""
-        est = {}
-        for sid, _f, _l, hgt, present in (sec[:5] for sec in secs):
-            u = hgt / self.k
-            est[sid] = max(u, RESERVE * NOMINAL_UNITS.get(sid, 60))  # 지금 작아도 나중에 커질 수 있으니 어느 정도는 잡아 둠
-        return est
-
-    def make_slots(self, secs, n):
-        """고정할 배치: 사용자 배치가 있으면 그것, 없으면 지금 높이로 한 번 masonry (이후 잠금이 풀릴 때까지 그대로).
-        숨기지 않은 모든 섹션이 들어간다 (지금 안 그려진 분석 섹션도 자리를 가짐)."""
+    def home_cols(self, n):
+        """열마다 제자리 순서: 사용자 배치가 있으면 그것 (열 수도 그대로), 없으면 DEFAULT_HOME[n]."""
         user = self.user_layout()
         if user:
             return [list(c) for c in user[0]]
-        est = self.est_units(secs)
-        hidden = self.hidden_ids()
-        items = []
-        for sid in SECTION_IDS:
-            if sid in hidden:
-                continue
-            u = est.get(sid, NOMINAL_UNITS[sid])
-            if sid == "tabs" and self.tab == "inputs":  # 입력칸이 열려 있는 높이로 정하면 안 됨
-                u = NOMINAL_UNITS[sid]
-            items.append((sid, u))
-        return self.pack_ids(items, n)
+        return [list(col) for col in DEFAULT_HOME[n]]
 
-    def arrange(self, secs):
-        """고정된 slot_cols 를 secs 의 인덱스 목록으로. 처음 보는 id 는 가장 짧은 열 끝에 붙이고 그대로 고정."""
-        pos = {sec[0]: i for i, sec in enumerate(secs)}
+    def arrange_ids(self, sized, n):
+        """지금 높이로 배치: 제자리 → 접힌 섹션은 열 맨 아래 → 균형 맞추기. 반환: 열마다 id 목록 (그려진 섹션만)."""
+        units = {sec[0]: sec[3] / self.k for sec in sized}
+        present = {sec[0] for sec in sized if sec[4]}
+        return balance_cols(self.home_cols(n), units, present, set(PINNED) | set(self.user_pins()))
+
+    def index_cols(self, sized):
+        """slot_cols 를 sized 의 인덱스 목록으로 (배치에 없는 섹션은 가장 짧은 열 끝에)."""
+        pos = {sec[0]: i for i, sec in enumerate(sized)}
         known = {sid for col in self.slot_cols for sid in col}
-        for sid in (sec[0] for sec in secs):
+        for sid in pos:
             if sid not in known:
-                tall = [sum(secs[pos[i]][3] for i in col if i in pos) for col in self.slot_cols]
+                tall = [sum(sized[pos[i]][3] for i in col if i in pos) for col in self.slot_cols]
                 self.slot_cols[tall.index(min(tall))].append(sid)
         return [[pos[i] for i in col if i in pos] for col in self.slot_cols]
 
+    @staticmethod
+    def as_sized(secs):
+        """draw_sections 결과 → (id, 첫, 끝, 자리 높이, 내용 있음, 실제 높이) (자리 유지 없이)."""
+        return [(sid, first, last, hgt, present, hgt) for sid, first, last, hgt, present in secs]
+
     def apply_sticky(self, secs):
-        """자리 높이 = 본 적 있는 가장 큰 높이 (탭마다). 반환: 높이가 고쳐진 새 목록 (5번째까지 같고, 6번째가 실제 높이)."""
+        """자리 높이: 섹션이 줄거나 접혀도 HOLD_S 초 동안은 이전 높이(와 '내용 있음')를 유지 — 깜빡임에 배치가 흔들리지 않게.
+        시간이 지나면 지금 높이로 (빈자리 없앰) → 그때 다시 배치. 반환: (새 목록, 이번에 자리 유지가 끝난 섹션이 있음)."""
+        now = time.monotonic()
         seen = self.sticky.setdefault(self.tab, {})
-        out = []
+        emax = self.epoch_max.setdefault(self.tab, {})
+        out, released, wake = [], False, None
         for sid, first, last, hgt, present in (sec[:5] for sec in secs):
-            u = seen.get(sid, 0.0)
-            seen[sid] = max(u, hgt / self.k)
-            out.append((sid, first, last, max(hgt, int(round(u * self.k))), present, hgt))
+            u = hgt / self.k
+            emax[sid] = max(emax.get(sid, 0.0), u)
+            rec = seen.get(sid)
+            if rec is None or u >= rec[0] - 0.5 or (present and not rec[2]):
+                rec = seen[sid] = [u, now, present]          # 처음 / 그대로거나 커짐 / 새로 내용이 생김
+            elif now - rec[1] >= HOLD_S:
+                rec = seen[sid] = [u, now, present]          # 오래 줄어 있었음 → 자리 놓음
+                released = True
+            else:
+                wake = rec[1] + HOLD_S if wake is None else min(wake, rec[1] + HOLD_S)
+            out.append((sid, first, last, max(hgt, int(round(rec[0] * self.k))), present or rec[2], hgt))
+        if wake is not None:
+            if self.wake_after is not None:
+                self.root.after_cancel(self.wake_after)
+            self.wake_after = self.root.after(max(50, int((wake - now) * 1000) + 30), self.wake_render)
+        return out, released
+
+    def wake_render(self):
+        self.wake_after = None
+        if not self.closed:
+            self.render(force=True)
+
+    def expected_units(self, sized):
+        """{id: 배율 1.0 기준 높이}: 배율을 정할 때 보는 섹션 높이 = 지금 높이와 최근 핸드·스트리트들에서 본 가장 큰 높이 중
+        큰 것 (기록이 적으면 NOMINAL_UNITS × RESERVE 도). 지금 접혀 있어도 곧 다시 커질 섹션 때문에 배율이 흔들리지 않게."""
+        mem = self.height_memory.get(self.tab, {})
+        emax = self.epoch_max.get(self.tab, {})
+        out = {}
+        for sec in sized:
+            sid = sec[0]
+            hist = mem.get(sid) or []
+            e = max([sec[3] / self.k, emax.get(sid, 0.0)] + hist)
+            if len(hist) < SEED_EPOCHS:
+                e = max(e, RESERVE * NOMINAL_UNITS.get(sid, 60))
+            out[sid] = e
         return out
+
+    def fit_scales(self, sized, n, w, h):
+        """(가로 한계 배율, 기록 기준 세로 한계 배율, 지금 내용 세로 한계 배율) — n 열, 균형 맞춘 배치 기준."""
+        pins = set(PINNED) | set(self.user_pins())
+        home = self.home_cols(n)
+        exp = self.expected_units(sized)
+        cur = {sec[0]: sec[3] / self.k for sec in sized}
+        present = {sec[0] for sec in sized if sec[4]}
+        pad = (PAD - 8) + PAD // 2
+        tall_exp = cols_height(balance_cols(home, exp, set(exp), pins), exp) + pad
+        tall_cur = cols_height(balance_cols(home, cur, present, pins), cur) + pad
+        wu = n * self.col_w + (n - 1)
+        return (w - 4) / (wu * self.dpi), h / (tall_exp * self.dpi), h / (tall_cur * self.dpi)
+
+    def target_scale(self, sized, n, w, h):
+        """쓸 배율: 기록 기준으로 다 들어가는 가장 큰 배율을 AUTO_MIN~AUTO_MAX 로 자르고, 가로 폭과 지금 내용은 반드시
+        들어가게 (그래서 AUTO_MIN 아래로도 내려감) 한 뒤 A−/A+ 보정을 더함 (A+ 도 폭·지금 내용은 넘지 않음). 0.02 단위로 내림."""
+        sw, sh, sc = self.fit_scales(sized, n, w, h)
+        base = min(max(AUTO_MIN, min(AUTO_MAX, sh)), sw, sc)
+        t = min(base + self.bias(), sw, sc, SCALE_MAX)
+        return max(FIT_MIN, math.floor(t * 50 + 1e-6) / 50)
 
     def col_extent(self, cols, secs):
         """(가장 긴 열의 높이 px, 열 폭 합 px) — 위아래 여백 포함."""
@@ -3665,31 +3841,22 @@ class App:
                 tall = max(tall, sum(secs[i][3] for i in col) + gap * (len(col) - 1))
         return tall + self.s(PAD - 8) + self.s(PAD // 2), len(cols) * self.s(self.col_w) + len(cols) - 1
 
-    def pick_layout(self, secs, w, h):
-        """(배율, 열 수, 폭 조절 비율): 섹션이 모두 들어가면서 배율이 가장 큰 열 수 (동률이면 열이 적은 쪽).
-        사용자 배치가 있으면 그 열 수·배치 그대로. 배율은 0.02 단위로 내림.
+    def pick_layout(self, sized, w, h):
+        """(가로·세로 모두 맞는 배율, 열 수, 폭 조절 비율): 기록 기준 높이로 균형 맞춘 배치가 가장 큰 배율로 들어가는 열 수
+        (동률이면 열이 적은 쪽). 사용자 배치가 있으면 그 열 수 그대로.
         폭 조절 비율 = (가로 한계 배율 / 세로 한계 배율) — 1보다 작으면 가로가 먼저 차서 열을 좁혀야 함."""
-        est = self.est_units(secs)
-        order = [sec[0] for sec in secs]
         user = self.user_layout()
         best = None
         for n in ((len(user[0]),) if user else (1, 2, 3)):
-            if user:
-                groups = [[i for i in col if i in est] for col in user[0]]
-            else:
-                groups = self.pack_ids([(i, est[i]) for i in order], n)
-            hu = max(sum(est[i] for i in g) + GAP * max(len(g) - 1, 0) for g in groups) + (PAD - 8) + PAD // 2
-            wu = n * self.col_w + (n - 1)
-            sw, sh = (w - 4) / (wu * self.dpi), h / (hu * self.dpi)
-            scale = min(sw, sh, SCALE_MAX)
-            if best is None or scale > best[0] + 1e-6:
-                best = (scale, n, min(max(sw, 0.01) / max(sh, 0.01), 4.0))
-        scale = max(FIT_MIN, math.floor(best[0] * 50 + 1e-6) / 50)
-        return scale, best[1], best[2]
+            sw, sh, _ = self.fit_scales(sized, n, w, h)
+            fit = min(sw, sh)
+            if best is None or fit > best[0] + 1e-6:
+                best = (fit, n, min(max(sw, 0.01) / max(sh, 0.01), 4.0))
+        return best
 
     def draw_sections(self, st):
         """섹션마다 (0, 0) 기준으로 그림 → [(id, 첫 id, 끝 id, 높이 px, 내용 있음)] (기본 순서). 내용이 없으면 한 줄로 접힌
-        제목만 그림 (자리는 그대로). 놓을 자리는 place() 가 옮김."""
+        제목만 그림 (빈자리 없이 그 열 맨 아래로). 놓을 자리는 place() 가 옮김."""
         c = self.canvas
         for i in c.find_all():
             if i != self.inputs_item:
@@ -3742,13 +3909,15 @@ class App:
         return plan
 
     def sec_collapsed(self, c, text):
-        """비어 있는 섹션: 한 줄로 접힌 제목 (자리는 유지. 끌어서 옮기거나 우클릭으로 숨길 수 있음)."""
+        """비어 있는 섹션: 한 줄로 접힌 제목. 빈자리를 잡지 않고 그 열 맨 아래로 간다 (balance_cols). 끌어서 옮기거나
+        우클릭으로 숨길 수 있음."""
         s, W, P = self.s, self.s(self.W), self.s(self.P)
         t = self.text(c, P, s(8), "▸ " + text, FS_NOTE, fill=TIE_C, width=W - 2 * P)
         return c.bbox(t)[3] + s(8)
 
     def place(self, secs, cols):
         c = self.canvas
+        self.placed_secs = secs   # (id, 첫, 끝, 자리 높이, 내용 있음, 실제 높이) — 시험·디버그용
         gap = self.s(GAP)
         cw = self.s(self.col_w)
         moves = {}
@@ -3900,8 +4069,9 @@ class App:
         t = self.text(c, gx + tw / 2, gy + th / 2, label, FS_SMALL, "bold", BG, anchor="center", tags="dragfx")
         c.tag_raise(t, bg)
 
-    def edit_layout(self, cols, hidden):
-        """배치를 저장하고 (빈 열은 없애고) 고정을 풀어 새 배치로 다시 그림."""
+    def edit_layout(self, cols, hidden, pin=None):
+        """배치를 저장하고 (빈 열은 없애고) 고정을 풀어 새 배치로 다시 그림. cols = 지금 보이는 배치에 사용자의 변경을 더한 것
+        (보이는 그대로가 새 제자리). pin = 사용자가 직접 옮긴 섹션 — 균형 맞추기가 다시 옮기지 않게 기억."""
         cols = [list(col) for col in cols if col]
         # 맨 위 칸(제목·버튼·추천)은 항상 첫 열 맨 위에 고정
         for col in cols:
@@ -3912,7 +4082,10 @@ class App:
             cols = [[]]
         cols[0].insert(0, "top")
         old = self.cfg.get("section_layout")
-        self.cfg["section_layout"] = {"cols": cols[:3], "hidden": list(hidden)}
+        pins = [i for i in self.user_pins() if i != pin and any(i in col for col in cols[:3])]
+        if pin is not None and pin not in PINNED and any(pin in col for col in cols[:3]):
+            pins.append(pin)
+        self.cfg["section_layout"] = {"cols": cols[:3], "hidden": list(hidden), "pin": pins}
         self.reset_lock()
         self.render(force=True)
         if self.scale <= FIT_MIN + 1e-6 and max(self.col_bottoms or [0]) > self.win_h + 1:  # 한 화면에 안 들어감 → 취소
@@ -3926,10 +4099,16 @@ class App:
         save_config(self.cfg)
 
     def current_layout(self):
-        """지금 고정된 배치 ([[id...]...], [숨긴 id...]) (사본)."""
+        """지금 보이는 배치 ([[id...]...], [숨긴 id...]) (사본). 끌어 옮기면 이것에 변경을 더해 새 제자리로 저장."""
         user = self.user_layout()
         hidden = list(user[1]) if user else []
         cols = [list(col) for col in (self.slot_cols or [])]
+        if cols:  # 지금 안 그려진 섹션 (입력 탭이라 빠진 분석 섹션 등)은 제자리 열 끝에 남김
+            shown = {sid for col in cols for sid in col}
+            for ci, col in enumerate(self.home_cols(len(cols))):
+                for sid in col:
+                    if sid not in shown and sid not in hidden:
+                        cols[min(ci, len(cols) - 1)].append(sid)
         return cols, hidden
 
     def move_section(self, sid, ci, idx):
@@ -3950,7 +4129,7 @@ class App:
             pos = len(dest)
         dest.insert(pos, sid)
         if [col for col in cols if col] != self.current_layout()[0]:
-            self.edit_layout(cols, hidden)
+            self.edit_layout(cols, hidden, pin=sid)
 
     def shift_section(self, sid, delta):
         """다음 열(+1) / 이전 열(-1)로. 마지막 열에서 +1 이면 (3열 미만일 때) 새 열."""
@@ -3966,7 +4145,7 @@ class App:
         while ni >= len(cols):
             cols.append([])
         cols[ni].insert(min(pos, len(cols[ni])), sid)
-        self.edit_layout(cols, hidden)
+        self.edit_layout(cols, hidden, pin=sid)
 
     def hide_section(self, sid):
         if sid in NO_HIDE:
@@ -3988,7 +4167,7 @@ class App:
         self.edit_layout(cols, hidden)
 
     def reset_layout(self):
-        """사용자 배치를 지우고 기본(자동) 배치로: 한 번 masonry 로 정한 뒤 다시 고정."""
+        """사용자 배치를 지우고 기본 배치(DEFAULT_HOME + 균형 맞추기)로."""
         self.cfg.pop("section_layout", None)
         save_config(self.cfg)
         self.reset_lock()
