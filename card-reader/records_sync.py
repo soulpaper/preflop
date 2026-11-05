@@ -188,15 +188,19 @@ class NameSet:
     mode "code" (코드·키 칸)에서는 앱 어휘(열거값)로만 이뤄진 이름은 건너뛴다 (닉네임 "fold" 대 행동 코드 "fold")."""
 
     def __init__(self, names=()):
-        self.sub = set()
+        self.sub = set()      # 3자 이상 한글·CJK 이름: 부분 일치
+        self.word = set()     # 2자 한글·CJK 이름: 낱말 경계 일치
         self.seq = {}
         for x in names or ():
-            if not isinstance(x, str) or len(norm_name(x)) < 4 or not any(c.isalpha() for c in norm_name(x)):
+            if not isinstance(x, str) or not any(c.isalpha() for c in norm_name(x)):
                 continue
             if _SPACELESS.search(_fold(x)):
                 q = _squash(x)
-                if q:
-                    self.sub.add(q)
+                if len(q) < 2 or any(q in ph for ph in _app_phrases()):
+                    continue    # 앱 고정 문구 안에 든 이름은 닉네임으로 보지 않는다 ("기타", "블라인드" ...)
+                (self.sub if len(q) >= 3 else self.word).add(q)
+                continue
+            if len(norm_name(x)) < 4:
                 continue
             t = tuple(_tokens(x))
             if not t:
@@ -205,7 +209,7 @@ class NameSet:
             self.seq["".join(t)] = bool(w) and w <= _code_vocab()
 
     def __len__(self):
-        return len(self.sub) + len(self.seq)
+        return len(self.sub) + len(self.word) + len(self.seq)
 
     def hit(self, mode, s):
         if type(s) is not str:
@@ -213,6 +217,10 @@ class NameSet:
         if self.sub:
             q = _squash(s)
             if any(n in q for n in self.sub):
+                return True
+        if self.word:
+            f = _fold(s)
+            if any(re.search("(?<![^\\W_])" + re.escape(n) + "(?![^\\W_])", f) for n in self.word):
                 return True
         if not self.seq:
             return False
@@ -230,6 +238,48 @@ class NameSet:
                     if not joined.startswith(acc):
                         break
         return False
+
+
+_AP = None
+# 소스를 못 읽을 때(exe 등)도 쓰는 기본 앱 고정 한글 문구. 출처: records_check.py ENUMS·CLASSES·HAND_NAME,
+# handread.py 의 그룹 이름 (탑페어, 오버페어, 포켓페어, 셋, 투페어, 드로우 ...), advisor.py 의 행동 문구
+_AP_BASE = ("기타", "수딧", "오프수딧", "올인", "블라인드", "브로드웨이", "중간", "탑페어", "오버페어", "포켓페어",
+            "포켓 페어", "투페어", "플러시 드로우", "스트레이트 드로우", "중간·약한 페어", "약한 페어", "원페어", "트리플",
+            "포카드", "풀하우스", "하이카드", "플러시", "스트레이트", "스트레이트 플러시", "폴드", "체크", "콜", "벳",
+            "레이즈", "대기", "드로우", "노페어", "셋", "셋/트립스", "탑페어+", "프리미엄 페어", "중간 페어", "작은 페어",
+            "수딧 커넥터", "오버카드", "포쁠", "양차", "빵꾸", "오픈엔디드", "것샷")
+_AP_RUN = re.compile(r"[가-힣](?:[가-힣 \u00b7/+()→]*[가-힣])?")
+
+
+def _app_phrases():
+    """앱이 고정으로 쓰는 한글 문구 (공백 뺀 형태). 기본 목록 + RC.ENUMS·CLASSES + 같은 폴더 앱 소스의 짧은 문자열 상수
+    (ast, import 안 함). 12자를 넘는 문구는 제외해 닉네임이 긴 문장 속에 우연히 들어 있다고 건너뛰지 않게 한다."""
+    global _AP
+    if _AP is None:
+        raw = set(_AP_BASE)
+        raw.update(getattr(RC, "CLASSES", ()))
+        for vs in RC.ENUMS.values():
+            raw.update(vs)
+        here = os.path.dirname(os.path.abspath(__file__))
+        try:
+            names = sorted(os.listdir(here))
+        except OSError:
+            names = []
+        for n in names:
+            if not n.endswith(".py") or n.startswith("test_") or n.startswith("records_"):
+                continue
+            try:
+                with open(os.path.join(here, n), encoding="utf-8") as f:
+                    tree = ast.parse(f.read())
+            except (OSError, SyntaxError, ValueError):
+                continue
+            skip = {id(nd.value) for nd in ast.walk(tree)
+                    if isinstance(nd, ast.Expr) and isinstance(nd.value, ast.Constant)}
+            for nd in ast.walk(tree):
+                if isinstance(nd, ast.Constant) and isinstance(nd.value, str) and id(nd) not in skip:
+                    raw.update(_AP_RUN.findall(nd.value))
+        _AP = frozenset(q for q in map(_squash, raw) if _SPACELESS.search(q) and len(q) <= 12)
+    return _AP
 
 
 _CV = None

@@ -2891,6 +2891,31 @@ class T62_NameHold(unittest.TestCase):
                 st = _state(base)
                 self.assertEqual((st["name_check"], st["name_count"]), (want, cnt))
 
+    def test_62_korean_names_vs_app_phrases(self):
+        # 합성 이름만. 앱 고정 문구와 겹치는 짧은 이름은 건너뛴다
+        txt = "SB 블라인드 방어, 플러시 드로우, 기타, 중간·약한 페어, 브로드웨이 올인"
+        base, up, code = _held_base("t62k1", ["블라인드", "플러시드로", "기타", "브로드웨이", "중간"], reason=txt)
+        self.assertEqual(code, 0)
+        self.assertEqual(_state(base)["held"], {})
+
+    def test_62_korean_short_names_word_boundary(self):
+        ns = RS.NameSet(["라마", "가나다", "바사아자"])
+        self.assertEqual(len(ns), 3)
+        self.assertTrue(ns.hit("text", "그 라마 가 말함"))
+        self.assertTrue(ns.hit("text", "라마"))
+        self.assertFalse(ns.hit("text", "올라마다"))
+        self.assertFalse(ns.hit("text", "라마가"))
+        self.assertTrue(RS.NameSet(["라마"]).hit("text", "[라마]"))
+        self.assertFalse(RS.NameSet(["라마"]).hit("text", "라마1"))
+
+    def test_62_korean_names_with_josa(self):
+        ns = RS.NameSet(["가나다", "바사아자"])
+        for t in ("가나다이", "가나다님이", "가나다의", "바사아자는 콜", "x 바사아자님"):
+            self.assertTrue(ns.hit("text", t), t)
+        base, up, code = _held_base("t62k2", ["바사아자"], reason="바사아자님이 레이즈")
+        self.assertEqual(code, 1)
+        self.assertEqual(_state(base)["held"][D0]["rule"], "known_name")
+
     def test_62_short_and_numeric_names_ignored(self):
         base, up, code = _held_base("t62o", ["abc", "12345", "ab"], reason="abc 12345 ab")
         self.assertEqual(code, 0)
