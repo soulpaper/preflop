@@ -24,8 +24,8 @@ TOP_KEY_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
 _STRUCT = re.compile(r'"(?:[^"\\]|\\.)*"|[\[\]{}]')
 
 
-FILTER_V = 4      # redacted 의 값 = 필터 판 번호 (명세 12.2, 13.2)
-ACCEPT_MIN = 4    # 리눅스 수신·--recheck 가 받는 가장 낮은 판 (명세 13.2-7)
+FILTER_V = 5      # redacted 의 값 = 필터 판 번호 (명세 12.2, 13.2)
+ACCEPT_MIN = 5    # 리눅스 수신·--recheck 가 받는 가장 낮은 판 (명세 13.2-7)
 
 SEAT_PAT = r"^(hero|opp[1-9][0-9]?|seat_[A-Z]{1,4})$"
 POS_PAT = r"^(UTG|U1|U2|U3|MP|LJ|HJ|CO|BTN|SB|BB)$"
@@ -91,13 +91,14 @@ _ENUMSET = {k: frozenset(v) for k, v in ENUMS.items()}
 
 # 값 형식 (명세 13.2-2). "X" 는 특수 잎(기존 규칙이 본다)이라 여기에 없다.
 TEXT_MAX = 400
+TEXT_ITEMS_MAX = 16      # TEXTS 배열 원소 상한 (명세 16.2)
 # 금지 코드 포인트 (명세 13.3)
 BADCP = ((0x00, 0x1F), (0x7F, 0x9F), (0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x206F), (0xD800, 0xDFFF),
          (0xE000, 0xF8FF), (0xFEFF, 0xFEFF), (0xFFF0, 0xFFFF))
 
 
-def _ty(j, re_="", en="", ref=0, text=0, nn=0):
-    return {"j": sorted(j.split()), "re": re_, "en": en, "ref": ref, "text": text, "nn": nn}
+def _ty(j, re_="", en="", ref=0, text=0, nn=0, lst=0):
+    return {"j": sorted(j.split()), "re": re_, "en": en, "ref": ref, "text": text, "nn": nn, "list": lst}
 
 
 TYPES = {
@@ -107,7 +108,7 @@ TYPES = {
     "CARDSTR": _ty("str", "CARDSTR"), "STREET": _ty("str", en="STREET"),
     "HID": _ty("str", "HID"), "SESSION": _ty("str", "SESSION"), "DID": _ty("str", "DID"), "DAY": _ty("str", "DAY"),
     "HAND_NAME": _ty("str", "HAND_NAME"), "SPOT": _ty("str", "SPOT"), "NODE": _ty("str", "NODE"),
-    "LINE": _ty("str", "LINE"), "TEXT": _ty("str", text=1),
+    "LINE": _ty("str", "LINE"), "TEXT": _ty("str", text=1), "TEXTS": _ty("str", text=1, lst=1),
     "WON": _ty("bool str", en="WON"), "PAYOUTS": _ty("num str", en="STRUCTURE"),
     "OUTS_GROUP": _ty("num str", en="OUTS_LABEL"),
 }
@@ -127,7 +128,7 @@ NICK_PATS = (r"[Uu][Ss][Ee][Rr][0-9]{2}", "[‥…]", r"[A-Za-z]{3}[0-9]{4}")
 NICK_RES = tuple(re.compile(p) for p in NICK_PATS)
 # 닉네임 모양 검사를 하는 잎 형식 (명세 14.1). 정규식이 빡빡하게 정해진 잎(pid, 카드, 좌석, 열거 등)은 검사하지 않는다.
 # 자유 텍스트 TEXT 와, 형식이 느슨해 닉네임이 들어갈 수 있는 LINE, NODE 와 "X"(issue code 등) 만 본다.
-NICK_TYPES = ("LINE", "NODE", "TEXT", "X")
+NICK_TYPES = ("LINE", "NODE", "TEXT", "TEXTS", "X")
 # "X" 잎 중 값이 엄격한 형식과 일치하면 검사하지 않는다 (pid, 좌석 type, type_src, 기록 type)
 _X_STRICT = (PID_RE, re.compile(r"LAG|LP|TAG|TP|popup|decision|resolution"))
 # 이름처럼 보이는 키 토큰 (ASCII 소문자 비교, 부분 문자열)
@@ -198,11 +199,11 @@ CLASSES_OBJ = _obj("CLASSES_OBJ", (), {c: "NUM" for c in CLASSES})
 READ = _obj("READ", [("NUM", "width"), ("TEXT", "summary line")], {"classes": CLASSES_OBJ})
 GTO = _obj("GTO", [("NUM", "ev stack_used distance exploitability pot behind"), ("CARDSTR", "mapped_flop actual_flop combo"),
                    ("BOOL", "exact_flop exact_spot combo_exact stale"), ("SPOT", "spot"), ("NODE", "node"),
-                   (E("ROLE"), "role"), ("TEXT", "notes"), ("STREET", "street"), ("LINE", "line"),
+                   (E("ROLE"), "role"), ("TEXTS", "notes"), ("STREET", "street"), ("LINE", "line"),
                    ("CARD", "mapped_turn actual_turn")],
            {"actions": _map("ACTKEY", "NUM"), "range_actions": _map("ACTKEY", "NUM"), "amounts": _map("ACTKEY", "NUM")})
 ADVICE = _obj("ADVICE", [(E("ADV_ACTION"), "action"), (E("ADV_ACTION_KO"), "action_ko"), ("NUM", "size_bb"),
-                         ("TEXT", "size_text reason detail plan gto_line"), (E("ADV_CONF"), "confidence"),
+                         ("TEXT", "size_text reason gto_line"), ("TEXTS", "detail plan"), (E("ADV_CONF"), "confidence"),
                          (E("COLOR_KEY"), "color_key"), (E("GTO_MODE"), "gto_mode")], {"gto": GTO})
 ICM = _obj("ICM", [("NUM", "icm chip eq_fold eq_win eq_lose")])
 TOURNEY = _obj("TOURNEY", [("NUMBOOL", "players_left my_rank bubble_factor bubble m_ratio payouts_left entrants paid "
@@ -276,7 +277,7 @@ def schema_dump():
     d = {"v": FILTER_V, "hands": SCHEMA_HANDS, "decision": SCHEMA_DECISION, "resolution": SCHEMA_RESOLUTION,
          "re": RE_PATS, "classes": list(CLASSES), "nick": list(NICK_PATS), "tokens": list(NAME_TOKENS),
          "retired": sorted(RETIRED), "types": TYPES, "enums": {k: sorted(v) for k, v in ENUMS.items()},
-         "nick_types": list(NICK_TYPES), "text_max": TEXT_MAX, "badcp": [list(x) for x in BADCP], "accept_min": ACCEPT_MIN}
+         "nick_types": list(NICK_TYPES), "text_max": TEXT_MAX, "text_items_max": TEXT_ITEMS_MAX, "badcp": [list(x) for x in BADCP], "accept_min": ACCEPT_MIN}
     return json.dumps(d, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -284,8 +285,20 @@ def schema_sha256():
     return hashlib.sha256(schema_dump().encode("utf-8")).hexdigest()
 
 
+def leaf_list_ok(typ, v):
+    """잎 자리의 배열 v 를 원소별로(투명하게) 볼 수 있으면 True (명세 16.2). 자유 텍스트 잎만 좁힌다:
+    TEXT 는 배열 불가, TEXTS 는 문자열만 든 평평한 배열 0~TEXT_ITEMS_MAX 개."""
+    t = TYPES.get(typ)
+    if t is None or not t["text"]:
+        return True
+    if not t["list"]:
+        return False
+    return len(v) <= TEXT_ITEMS_MAX and all(type(e) is str for e in v)
+
+
 def leaf_check(typ, v):
-    """값 형식 검사 (업로더 D2 와 판정 17·18 이 같은 함수를 쓴다): "ok" | "ref" | "bad"."""
+    """값 형식 검사 (업로더 D2 와 판정 17·18 이 같은 함수를 쓴다): "ok" | "ref" | "bad".
+    배열은 kind = "obj" 라 "bad" 가 나온다 (leaf_list_ok 가 거짓인 배열이 이 함수로 넘어온다)."""
     if v is None or typ == "X":
         return "ok"
     t = TYPES[typ]
@@ -498,6 +511,8 @@ def _scan(v, node, segs, ctx, on_key, on_str=None, on_leaf=None, on_ctxkey=None,
     on_key(키, 경로 조각, 허용 여부), on_str(문자열 값, 경로 조각), on_leaf(값, 잎 형식, 경로 조각)가 참을
     돌려주면 멈춘다. on_ctxkey(키, 맥락)은 모든 키에 불린다."""
     if isinstance(v, list):
+        if isinstance(node, str) and not leaf_list_ok(node, v):
+            return bool(on_leaf and on_leaf(v, node, segs))   # 배열 통째로 넘긴다: leaf_check 는 "bad"
         s = segs + ["[]"]
         for e in v:
             if _scan(e, node, s, "other", on_key, on_str, on_leaf, on_ctxkey, qmaps):
@@ -526,6 +541,8 @@ def _scan(v, node, segs, ctx, on_key, on_str=None, on_leaf=None, on_ctxkey=None,
 
 def _any_bad(typ, v):
     if isinstance(v, list):
+        if not leaf_list_ok(typ, v):
+            return True
         return any(_any_bad(typ, e) for e in v)
     return leaf_check(typ, v) == "bad"
 

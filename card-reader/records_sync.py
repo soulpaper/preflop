@@ -254,6 +254,8 @@ _KO_RUN = re.compile(r"[가-힣]{2,8}")
 _CARD_RE = re.compile(r"[2-9TJQKA][shdc]")
 _POS_RE = re.compile(r"\b(?:UTG|U1|U2|U3|MP|LJ|HJ|CO|BTN|SB|BB)\b")
 DISTINCT_CAP = 100000
+AUDIT_V = 2           # 점검 방식 판 (명세 16.6): 규칙이 바뀌면 올린다. 사전 sha 는 관문에 쓰지 않는다
+UNK_LINES_MAX = 10    # where 줄에 적는 줄 번호 수 (종류별)
 
 
 def load_vocab(here=None):
@@ -272,6 +274,56 @@ def load_vocab(here=None):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 words.update(re.findall(r"[가-힣]+", node.value))
     return words
+
+
+_EN_TOKEN = re.compile(r"[A-Za-z0-9]+")
+_EN_CHUNK = re.compile(r"[A-Za-z]+")
+_EN_CARDS = re.compile(r"(?:[2-9TJQKA][shdc])+")
+_EN_COMBO = re.compile(r"[2-9TJQKA]{2,5}[so]?")
+_EN_POS = frozenset(["UTG", "U1", "U2", "U3", "MP", "LJ", "HJ", "CO", "BTN", "SB", "BB"])
+
+
+def _en_words(text):
+    """문자열 하나에서 [A-Za-z]{2,} 덩어리를 소문자로 모은다."""
+    return {w.lower() for w in _EN_CHUNK.findall(text) if len(w) >= 2}
+
+
+def load_vocab_en(here=None):
+    """load_vocab 과 같은 파일 고르기. 문자열 상수의 영문 덩어리(2자 이상, 소문자)를 모은다. 독스트링과 맨 문자열 문은 뺀다.
+    RC.ENUMS 의 값에서 뽑은 덩어리를 더한다 (명세 16.6)."""
+    here = here or os.path.dirname(os.path.abspath(__file__))
+    words = set()
+    for n in sorted(os.listdir(here)):
+        if not n.endswith(".py") or n.startswith("test_") or n.startswith("records_"):
+            continue
+        try:
+            with open(os.path.join(here, n), encoding="utf-8") as f:
+                tree = ast.parse(f.read())
+        except (OSError, SyntaxError, ValueError):
+            continue
+        skip = {id(node.value) for node in ast.walk(tree)
+                if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in skip:
+                words |= _en_words(node.value)
+    for vals in RC.ENUMS.values():
+        for v in vals:
+            words |= _en_words(v)
+    return words
+
+
+def _unknown_en(text, vocab_en):
+    """자유 텍스트 문자열의 낯선 영숫자 토큰 식별자 집합 (명세 16.6). 값은 돌려주지 않는다."""
+    out = set()
+    for tok in _EN_TOKEN.findall(unicodedata.normalize("NFKC", text)):
+        if not any(c.isalpha() for c in tok):
+            continue
+        if _EN_CARDS.fullmatch(tok) or _EN_COMBO.fullmatch(tok):
+            continue
+        if all(len(c) < 2 or c in _EN_POS or c.lower() in vocab_en for c in _EN_CHUNK.findall(tok)):
+            continue
+        out.add(hashlib.blake2b(tok.lower().encode("utf-8"), digest_size=8).digest())
+    return out
 
 
 def _unknown_ko(text, vocab):
@@ -426,7 +478,7 @@ class Uploader:
         if d is not None and d > through:
             return True
         ent = (a.get("files") or {}).get(n)
-        if a.get("filter_v") != RC.FILTER_V or not isinstance(ent, dict):
+        if a.get("filter_v") != RC.FILTER_V or a.get("audit_v") != AUDIT_V or not isinstance(ent, dict):
             return False
         if ent.get("sha256") != hashlib.sha256(raw).hexdigest():
             return False
@@ -552,11 +604,14 @@ class Uploader:
         names = self.targets(lo, through)
         vocab = load_vocab()
         vocab_sha = hashlib.sha256("\n".join(sorted(vocab)).encode("utf-8")).hexdigest()
+        vocab_en = load_vocab_en()
+        vocab_en_sha = hashlib.sha256("\n".join(sorted(vocab_en)).encode("utf-8")).hexdigest()
         profiles = any(os.path.lexists(os.path.join(self.base, n))
                        for n in ("profiles.db", "profiles.db-wal", "profiles.db-shm", "profiles.db-journal"))
         n_path, typ_of = collections.Counter(), {}
         distinct, over = collections.defaultdict(set), set()
         skel, unk = collections.defaultdict(set), collections.defaultdict(set)
+        unk_en = collections.defaultdict(set)
         keyset = collections.defaultdict(set)
         fail_total = collections.Counter()
         blocked = collections.Counter()
@@ -568,14 +623,16 @@ class Uploader:
                 raw = self._open_checked(os.path.join(self.base, "hands", n), self.idents.get(n))
             except (FileError, OSError):
                 unreadable += 1
-                per_file.append({"file": n, "lines": 0, "blocked": 0, "fail": 0, "unk_ko": 0, "verdict": "CHECK"})
+                per_file.append({"file": n, "lines": 0, "blocked": 0, "fail": 0, "unk_ko": 0,
+                                 "unk_en": 0, "where": {}, "verdict": "CHECK"})
                 continue
             fblocked = ffail = 0
-            funk = set()
+            funk, funk_en = set(), set()
+            where = {"unk_ko": [], "unk_en": []}
             flines = 0
             cut = raw.rfind(b"\n")
             raw2 = raw[:cut + 1]
-            for ln in (raw2[:-1].split(b"\n") if raw2 else []):
+            for lineno, ln in enumerate(raw2[:-1].split(b"\n") if raw2 else [], 1):
                 if ln.endswith(b"\r"):
                     ln = ln[:-1]
                 if not ln:
@@ -632,18 +689,23 @@ class Uploader:
                         if len(d) > DISTINCT_CAP:
                             over.add(p)
                             distinct[p] = set()
-                    if typ == "TEXT" and type(val) is str:
+                    if RC.TYPES.get(typ, {}).get("text") and type(val) is str:
                         skel[p].add(hashlib.blake2b(_skeleton(val).encode("utf-8"), digest_size=8).digest())
                         u = _unknown_ko(val, vocab)
                         unk[p] |= u
-                        funk.update(u)
+                        e = _unknown_en(val, vocab_en)
+                        unk_en[p] |= e
+                        for kind_, ids, seen in (("unk_ko", u, funk), ("unk_en", e, funk_en)):
+                            if ids - seen and len(where[kind_]) < UNK_LINES_MAX and lineno not in where[kind_]:
+                                where[kind_].append(lineno)
+                            seen.update(ids)
                     return False
                 RC._scan(rec, RC.schema_for(kind, rec), [], "top", lambda k, s, ok: False, None, leaf,
                          lambda k, ctx: keyset[ctx].add(hashlib.blake2b(k.encode("utf-8"), digest_size=8).digest())
                          if ctx in ("seat", "posseat", "q") else None, True)
-            verdict = "STOP" if (fblocked or profiles) else ("CHECK" if (ffail or funk) else "OK")
+            verdict = "STOP" if (fblocked or profiles) else ("CHECK" if (ffail or funk or funk_en) else "OK")
             per_file.append({"file": n, "lines": flines, "blocked": fblocked, "fail": ffail, "unk_ko": len(funk),
-                             "verdict": verdict})
+                             "unk_en": len(funk_en), "where": where, "verdict": verdict})
             entries[n] = {"sha256": hashlib.sha256(raw).hexdigest(), "verdict": verdict,
                           "accepted": bool(accept and verdict == "CHECK")}
         if profiles:
@@ -658,18 +720,19 @@ class Uploader:
         for p in sorted(set(n_path) | set(fail_total)):
             row = {"path": p, "type": typ_of.get(p, "-"), "n": n_path.get(p, 0),
                    "distinct": ">%d" % DISTINCT_CAP if p in over else len(distinct.get(p, ())), "fail": fail_total.get(p, 0)}
-            if typ_of.get(p) == "TEXT":
-                row["skel"], row["unk_ko"] = len(skel[p]), len(unk[p])
+            if RC.TYPES.get(typ_of.get(p), {}).get("text"):
+                row["skel"], row["unk_ko"], row["unk_en"] = len(skel[p]), len(unk[p]), len(unk_en[p])
             paths.append(row)
         guide = {"OK": "값 형식과 낱말 점검을 통과했습니다. 이제 --backfill <시작> --to <끝> 으로 올릴 수 있습니다.",
-                 "CHECK": "자유 텍스트 칸에 앱 문구에 없는 한글 낱말이 있거나(unk_ko), 형식이 틀려 버려질 값(fail)이 있습니다. "
-                          "위 표의 경로와 파일에서 직접 확인하세요. 확인한 내용을 메시지나 문서에 옮기지 마세요. "
+                 "CHECK": "자유 텍스트 칸에 앱 문구에 없는 한글 낱말(unk_ko)이나 영문·숫자 낱말(unk_en)이 있거나, 형식이 틀려 버려질 값(fail)이 있습니다. "
+                          "where 줄의 파일과 줄 번호를 직접 열어 확인하세요. 확인한 내용을 메시지나 문서에 옮기지 마세요. "
                           "닉네임이 아니면 --audit --accept-check 로 다시 실행하고, 닉네임이면 그 날짜를 백필에서 빼세요"
                           "(CHECK 파일은 받아들이기 전까지 올라가지 않습니다).",
                  "STOP": "업로드를 멈출 내용이 있습니다(위 blocked 줄). profiles.db 가 있으면 scrub_names.py 를 먼저 "
                          "실행하세요. 그 밖이면 해당 날짜를 백필 범위에서 빼고 홀덤연구소에 경로와 규칙 이름만 알리세요."}[overall]
         head = {"base": os.path.basename(os.path.abspath(self.base)), "files": len(names), "lines": total_lines,
-                "unreadable": unreadable, "filter_v": RC.FILTER_V, "vocab": len(vocab)}
+                "unreadable": unreadable, "filter_v": RC.FILTER_V, "audit_v": AUDIT_V, "vocab": len(vocab),
+                "vocab_en": len(vocab_en)}
         kc = {k: len(v) for k, v in sorted(keyset.items())}
         brows = [{"rule": r, "path": p, "lines": c} for (r, p), c in sorted(blocked.items())]
         if as_json:
@@ -677,30 +740,36 @@ class Uploader:
                               "verdict": overall, "guide": guide}, ensure_ascii=False, sort_keys=True))
         else:
             print("records audit  base=%(base)s  files=%(files)d lines=%(lines)d unreadable=%(unreadable)d "
-                  "filter_v=%(filter_v)d vocab=%(vocab)d" % head)
+                  "filter_v=%(filter_v)d audit_v=%(audit_v)d vocab=%(vocab)d vocab_en=%(vocab_en)d" % head)
             print("path\ttype\tn\tdistinct\tfail\textra")
             for r in paths:
-                extra = "skel=%d unk_ko=%d" % (r["skel"], r["unk_ko"]) if "skel" in r else ""
+                extra = "skel=%d unk_ko=%d unk_en=%d" % (r["skel"], r["unk_ko"], r["unk_en"]) if "skel" in r else ""
                 print("%s\t%s\t%d\t%s\t%d\t%s" % (r["path"], r["type"], r["n"], r["distinct"], r["fail"], extra))
             for k, c in kc.items():
                 print("keys\t%s\t%d" % (k, c))
             for r in brows:
                 print("blocked\t%s\t%s\t%d" % (r["rule"], r["path"], r["lines"]))
-            print("file\tlines\tblocked\tfail\tunk_ko\tverdict")
+            print("file\tlines\tblocked\tfail\tunk_ko\tunk_en\tverdict")
             for f in per_file:
-                print("%s\t%d\t%d\t%d\t%d\t%s" % (f["file"], f["lines"], f["blocked"], f["fail"], f["unk_ko"], f["verdict"]))
+                print("%s\t%d\t%d\t%d\t%d\t%d\t%s" % (f["file"], f["lines"], f["blocked"], f["fail"], f["unk_ko"],
+                                                       f["unk_en"], f["verdict"]))
+            for f in per_file:
+                for k in ("unk_ko", "unk_en"):
+                    if f["where"].get(k):
+                        print("where\t%s\t%s\t%s" % (f["file"], k, ",".join(str(x) for x in f["where"][k])))
             print("verdict: %s" % overall)
             print(guide)
         # 상태 기록 (값 없음)
         st = self.load_state()
         old = st.get("audit") if isinstance(st.get("audit"), dict) else {}
-        files = dict(old.get("files") or {}) if old.get("filter_v") == RC.FILTER_V else {}
+        same = old.get("filter_v") == RC.FILTER_V and old.get("audit_v") == AUDIT_V
+        files = dict(old.get("files") or {}) if same else {}
         files.update(entries)
         th = through.isoformat()
-        if old.get("filter_v") == RC.FILTER_V and old.get("through", "") > th:
+        if same and old.get("through", "") > th:
             th = old["through"]
-        st["audit"] = {"filter_v": RC.FILTER_V, "vocab_sha": vocab_sha, "at": int(time.time()), "through": th,
-                       "files": files}
+        st["audit"] = {"filter_v": RC.FILTER_V, "audit_v": AUDIT_V, "vocab_sha": vocab_sha, "vocab_en_sha": vocab_en_sha,
+                       "at": int(time.time()), "through": th, "files": files}
         try:
             self.save_state(st)
         except OSError:

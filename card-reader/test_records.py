@@ -36,9 +36,9 @@ import records_sync as RS  # noqa: E402
 
 FIXTURES = os.path.join(HERE, "testdata", "records_fixtures.jsonl")
 # sharebox server/testdata/records_fixtures.jsonl 과 바이트 동일해야 한다. 고치면 양쪽 상수와 사본을 같이 고친다.
-FIXTURES_SHA256 = "be5292b5c17a59f8014c255a0ea18855993ead65c1efdcf45ec607e95a613057"
+FIXTURES_SHA256 = "14a69b43907b8f04ef7c8bb58a5b5eb45fe0466ab5301fed16d3088e45cce3f6"
 # 스키마 정규화 덤프의 sha256. sharebox server/records_check_test.go 의 recordsSchemaSHA256 과 같아야 한다.
-RECORDS_SCHEMA_SHA256 = "f632c53a5616d24ed4972b51090de0397a726fe703c00b8bef64f12d5bf5e9fd"
+RECORDS_SCHEMA_SHA256 = "48ce811c3112c3b830ba56546e0b6bb91bad379bb8d208d67934de115054bbc5"
 BIN = os.environ.get("RECORDS_TEST_SHAREBOXD")
 TMP = tempfile.mkdtemp(prefix="records-test-")
 REAL_HOME = os.environ.get("HOME")
@@ -312,7 +312,7 @@ class T19_Deterministic(unittest.TestCase):
         lf = hline(1) + hline(2)
         crlf = lf.replace(b"\n", b"\r\n")
         self.assertEqual(RS.build_body(D1, lf)[0], RS.build_body(D1, crlf)[0])
-        self.assertTrue(all(b'"redacted":4' in l for l in RS.build_body(D1, lf)[0].splitlines()))
+        self.assertTrue(all(b'"redacted":5' in l for l in RS.build_body(D1, lf)[0].splitlines()))
 
     @need_real
     def test_19_real_second_cycle_no_put(self):
@@ -772,10 +772,10 @@ class T29_Fixtures(unittest.TestCase):
     def test_29_check_line_api(self):
         self.assertEqual(RC.file_kind("2026-02-30.jsonl"), None)
         self.assertEqual(RC.file_kind("decisions_2026-02-28.jsonl"), "decisions")
-        self.assertEqual(RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":4}').cls, "ok")
-        self.assertEqual(RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":5}', (4, 5)).cls, "ok")
-        self.assertEqual(RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":5}').rule, "filter_version")
-        self.assertEqual(RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":3}', (4, 4)).rule, "filter_version")
+        self.assertEqual(RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":5}').cls, "ok")
+        self.assertEqual(RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":5}', (5, 6)).cls, "ok")
+        self.assertEqual(RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":6}').rule, "filter_version")
+        self.assertEqual(RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":4}', (5, 5)).rule, "filter_version")
 
     def test_29_uploader_body_passes_check(self):
         body = RS.build_body(D1, hline(1) + hline(2))[0]
@@ -1007,7 +1007,7 @@ class T30_Pull(PullEnv, unittest.TestCase):
         self.assertEqual(self.inbox_text().count(" blocked "), 1)
 
     def test_30_check_failure_quarantine_metadata_only(self):
-        bad = ('{"id":"20261105_120000-0001","redacted":4,"seats":{"hero":{"name":"%s"}}}\n' % NICK).encode()
+        bad = ('{"id":"20261105_120000-0001","redacted":5,"seats":{"hero":{"name":"%s"}}}\n' % NICK).encode()
         self.fs.set("a", D1, bad)
         self.fs.set("a", D0, good_body(D0))
         self.assertEqual(self.pull(), 1)
@@ -1026,7 +1026,7 @@ class T30_Pull(PullEnv, unittest.TestCase):
         self.fs.set("a", D1, good_body(D1))
         self.pull()
         with open(os.path.join(self.data, "raw", "a", D1), "ab") as f:
-            f.write(b'{"id":"x","redacted":4,"name":"%s"}\n' % NICK.encode())
+            f.write(b'{"id":"x","redacted":5,"name":"%s"}\n' % NICK.encode())
         self.assertEqual(self.pull("--recheck"), 1)
         self.assertFalse(os.path.exists(os.path.join(self.data, "raw", "a", D1)))
 
@@ -1200,9 +1200,9 @@ class T37_PreCheck(unittest.TestCase):
 
     def test_37_shared_check_differs_for_fullwidth(self):
         for name in ("fullwidth_name", "zero_width_name", "fullwidth_nick"):
-            v = RC.check_line("hands", self.LINES[name].rstrip(b"\n").replace(b'"id":"20261105_120000-0001"', b'"id":"20261105_120000-0001","redacted":4'))
+            v = RC.check_line("hands", self.LINES[name].rstrip(b"\n").replace(b'"id":"20261105_120000-0001"', b'"id":"20261105_120000-0001","redacted":5'))
             self.assertEqual((v.cls, v.rule), ("block", "unknown_key"), name)
-        v = RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":4,"advice":{"players":1}}')
+        v = RC.check_line("hands", b'{"id":"20261105_120000-0001","redacted":5,"advice":{"players":1}}')
         self.assertEqual(v.rule, "forbidden_key")
 
 
@@ -1223,7 +1223,7 @@ class T38_NickValue(unittest.TestCase):
         with self.assertRaises(RS.Block) as cm:
             RS.build_body(D0, self.dec_reason(val))
         self.assertEqual(cm.exception.rule, "nick_value")
-        line = ('{"id":"%s","type":"decision","redacted":4,"advice":{"reason":"%s"}}' % (DID0, val)).encode()
+        line = ('{"id":"%s","type":"decision","redacted":5,"advice":{"reason":"%s"}}' % (DID0, val)).encode()
         self.assertTrue(RC.check_line("decisions", line).ok())            # 공용 판정은 통과 (업로더가 더 넓게 멈춘다)
 
     def test_38_false_positive_guard(self):
@@ -1295,9 +1295,9 @@ class T41_PullRange(unittest.TestCase):
         for n in ("", "data", "data/raw", "data/raw/a"):
             os.chmod(os.path.join(home, n), 0o700)
         good = RS.build_body(D1, hline(1))[0]
-        old = good.replace(b'"redacted":4', b'"redacted":3')
-        self.assertEqual(RC.ACCEPT_MIN, 4)
-        self.assertEqual(RC.FILTER_V, 4)
+        old = good.replace(b'"redacted":5', b'"redacted":4')
+        self.assertEqual(RC.ACCEPT_MIN, 5)
+        self.assertEqual(RC.FILTER_V, 5)
         wr(os.path.join(home, "data"), "raw/a/" + D1, good)
         wr(os.path.join(home, "data"), "raw/a/2026-11-02.jsonl", old)
         fd = os.open(os.path.join(home, "pull.json"), os.O_WRONLY | os.O_CREAT, 0o600)
@@ -2437,7 +2437,7 @@ class T59_ContainerType(unittest.TestCase):
         self.assertEqual(_capture(up.audit)[0], 0)
         p = os.path.join(base, RS.STATE_NAME)
         st = json.load(open(p))
-        self.assertEqual(st["audit"]["filter_v"], 4)
+        self.assertEqual(st["audit"]["filter_v"], RC.FILTER_V)
         st["audit"]["filter_v"] = 3
         json.dump(st, open(p, "w"))
         d = mk(base, fake_cfg(), fake=True, require_audit=True)
@@ -2464,6 +2464,268 @@ class T59_ContainerType(unittest.TestCase):
         self.assertGreaterEqual(len(nodes), 40)
         missing = [(n, ".".join(p)) for n, p in nodes if not covered(n, p)]
         self.assertEqual(missing, [], "컨테이너 노드에 거부 픽스처가 없음")
+
+
+def _fixture_by_prefix(*prefixes):
+    return [(c, b) for c, b in fixture_cases() if c["name"].startswith(prefixes)]
+
+
+class T60_TextShape(unittest.TestCase):
+    """명세 16.2~16.4: 자유 텍스트 잎의 모양 (TEXT 는 문자열만, TEXTS 는 평평한 문자열 배열)."""
+
+    def test_60_wrong_shape_dropped_not_blocked(self):
+        cases = [(c, b) for c, b in _fixture_by_prefix("text_shape_") if c["expect"]["class"] == "block"]
+        self.assertEqual(len(cases), 32)
+        for c, b in cases:
+            with self.subTest(c["name"]):
+                kind = RC.file_kind(c["file"])
+                st1, st2 = _stats(), _stats()
+                out1, dk = RC.filter_record(kind, RC.parse_line(b.decode("utf-8").splitlines()[0]), st1["paths"], st1)
+                out2, _ = RC.filter_record(kind, RC.parse_line(b.decode("utf-8").splitlines()[0]), st2["paths"], st2)
+                self.assertEqual(st1["values"], 1)                          # 그 키 하나만 버려짐
+                self.assertEqual(list(st1["vpaths"]), [c["expect"]["path"]])
+                self.assertEqual(dk, 1 if c["name"] == "text_shape_obj_elem" else 0)   # 객체 원소의 키 x 는 스키마 밖이라 먼저 버려진다
+                body = (RS._dump(out1) + "\n").encode("utf-8")
+                self.assertNotIn(KO.encode(), body)
+                self.assertNotIn(KO, json.dumps(dict(st1["vpaths"])))
+                self.assertEqual(body, (RS._dump(out2) + "\n").encode("utf-8"))   # 같은 원본 -> 같은 바이트
+                self.assertEqual(RC.check_line(kind, body.rstrip(b"\n")).cls, "ok")     # D2 뒤 본문은 18 에 안 걸림
+
+    def test_60_ok_cases_drop_nothing(self):
+        cases = _fixture_by_prefix("ok_text_flat_arrays", "ok_texts_bare_string")
+        self.assertEqual(len(cases), 2)
+        for c, b in cases:
+            with self.subTest(c["name"]):
+                st = _stats()
+                RC.filter_record(RC.file_kind(c["file"]), RC.parse_line(b.decode("utf-8").splitlines()[0]), st["paths"], st)
+                self.assertEqual(st["values"], 0)
+                self.assertEqual(dict(st["paths"]), {})
+
+    def test_60_leaf_list_ok_follows_type_table(self):
+        n17 = ["x"] * 17
+        self.assertFalse(RC.leaf_list_ok("TEXT", []))
+        self.assertFalse(RC.leaf_list_ok("TEXT", ["x"]))
+        self.assertTrue(RC.leaf_list_ok("TEXTS", []))
+        self.assertTrue(RC.leaf_list_ok("TEXTS", ["x"] * 16))
+        self.assertFalse(RC.leaf_list_ok("TEXTS", n17))
+        for bad in (["x", ["y"]], ["x", None], [1], [True], [{}]):
+            self.assertFalse(RC.leaf_list_ok("TEXTS", bad))
+        for typ, t in RC.TYPES.items():
+            if not t["text"]:
+                self.assertTrue(RC.leaf_list_ok(typ, [[["x"]]]), typ)
+        self.assertTrue(RC.leaf_list_ok("X", [None]))
+        self.assertEqual([k for k, t in RC.TYPES.items() if t["text"]], ["TEXT", "TEXTS"])
+
+    def test_60_every_text_leaf_has_shape_fixtures(self):
+        names = {c["name"] for c, _ in fixture_cases()}
+        leaves = []
+
+        def walk(node, name, path):
+            if isinstance(node, str):
+                if RC.TYPES.get(node, {}).get("text"):
+                    leaves.append((name, path, node))
+            elif "m" in node:
+                walk(node["v"], name, path + ("star",))
+            else:
+                for k, c in node["k"].items():
+                    walk(c, name, path + (k,))
+        for name, sch in (("hand", RC.HAND), ("dec", RC.DECISION), ("res", RC.RESOLUTION)):
+            walk(sch, name, ())
+        self.assertEqual(len(leaves), 8)
+        for name, path, typ in leaves:
+            base = "text_shape_%s_%s" % (name, "_".join(path))
+            want = [base + "_nested", base + "_nullelem"] + ([base + "_over"] if RC.TYPES[typ]["list"] else
+                                                             [base + "_list", base + "_emptylist"])
+            for w in want:
+                self.assertIn(w, names)
+
+    def test_60_dump_has_list_and_items_max(self):
+        d = json.loads(RC.schema_dump())
+        self.assertEqual(d["text_items_max"], 16)
+        self.assertEqual((d["v"], d["accept_min"]), (5, 5))
+        self.assertEqual(d["nick_types"], ["LINE", "NODE", "TEXT", "TEXTS", "X"])
+        self.assertEqual(d["types"]["TEXTS"]["list"], 1)
+        self.assertTrue(all(t["list"] == 0 for k, t in d["types"].items() if k != "TEXTS"))
+
+    def test_60_uploader_state_counts_dropped_paths(self):
+        raw = (('{"id":"%s","type":"decision","advice":{"reason":[["%s"]],"detail":["a",null],"plan":["ok"]},'
+                '"reads":{"hero":{"line":["%s"]}}}\n') % (DID0, KO, KO)).encode()
+        base = mkbase("t60u")
+        wr(base, "hands/" + D0, raw)
+        up = mk(base, fake_cfg(), fake=True)
+        self.assertEqual(run(up), 0)
+        st = json.load(open(os.path.join(base, RS.STATE_NAME)))
+        e = st["files"][D0]
+        self.assertEqual(e["dropped_values"], 3)
+        self.assertNotIn(KO, json.dumps(st))
+        self.assertEqual(sorted(e["dropped_value_paths"]), ["advice.detail", "advice.reason", "reads.hero.line"])
+
+
+class T61_AuditEnglish(unittest.TestCase):
+    """명세 16.6: --audit 의 unk_en, where 줄, AUDIT_V, 사전."""
+
+    def audit(self, base, **kw):
+        up = mk(base, {}, fake=True)
+        return _capture(lambda: up.audit(**kw))
+
+    def test_61_app_words_are_known(self):
+        texts = ["폴드 AhKd AKs T9o QQ BTN_BB x_bet33_c SPR 4.1", "4.2BB 3x UTG 레이즈 AKQ As 100 2026 GTO ICM",
+                 "bet raise call check fold flush top_heavy"]
+        base = _audit_base("t61a", {D0: _dec(1, advice={"reason": texts[0], "detail": texts[1:], "plan": [texts[2]]})})
+        code, out, err = self.audit(base, as_json=True)
+        self.assertEqual(code, 0, out)
+        j = json.loads(out)
+        self.assertEqual(j["files"][0]["unk_en"], 0, out)
+        self.assertTrue(all(r.get("unk_en", 0) == 0 for r in j["paths"]))
+
+    def test_61_unknown_token_check_and_no_value_output(self):
+        base = _audit_base("t61b", {D0: _dec(1, advice={"reason": "Tiger"})})
+        code, out, err = self.audit(base)
+        self.assertEqual(code, 1, out)
+        self.assertIn("unk_en=1", out)
+        for blob in (out, err, open(os.path.join(base, RS.STATE_NAME), encoding="utf-8").read()):
+            self.assertNotIn("Tiger", blob)
+            self.assertNotIn("tiger", blob)
+
+    def test_61_distinct_count_and_fullwidth(self):
+        def count(*texts):
+            base = _audit_base("t61c%d" % abs(hash(texts)), {D0: "".join(_dec(i + 1, advice={"reason": t}).decode()
+                                                                         for i, t in enumerate(texts)).encode()})
+            _, out, _ = self.audit(base, as_json=True)
+            return json.loads(out)["files"][0]["unk_en"]
+        self.assertEqual(count("kim12", "KIM12"), 1)
+        self.assertEqual(count("kim12", "kim13"), 2)
+        self.assertEqual(count("Ｔｉｇｅｒ"), 1)         # 전각 Tiger
+        self.assertEqual(count("Tiger", "tiger"), 1)
+
+    def test_61_list_elements_counted_on_their_row(self):
+        base = _audit_base("t61d", {D0: _dec(1, advice={"detail": ["폴드", "Tiger"], "gto": {"notes": ["Lion"]}})})
+        code, out, err = self.audit(base, as_json=True)
+        self.assertEqual(code, 1)
+        rows = {r["path"]: r for r in json.loads(out)["paths"]}
+        self.assertEqual(rows["advice.detail"]["unk_en"], 1)
+        self.assertEqual(rows["advice.detail"]["type"], "TEXTS")
+        self.assertEqual(rows["advice.gto.notes"]["unk_en"], 1)
+        self.assertNotIn("Tiger", out)
+
+    def test_61_vocab_en_sources(self):
+        d = tempfile.mkdtemp(prefix="rec61-")
+        try:
+            with open(os.path.join(d, "app.py"), "w", encoding="utf-8") as f:
+                f.write('"""moduledoc docword"""\nX = "constword Hello"\n\ndef f():\n    """fdoc"""\n    "baretext"\n    return f"fpart {X}"\n')
+            for n, w in (("test_x.py", "testword"), ("records_x.py", "recword")):
+                with open(os.path.join(d, n), "w", encoding="utf-8") as f:
+                    f.write('Y = "%s"\n' % w)
+            v = RS.load_vocab_en(here=d)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        for w in ("constword", "hello", "fpart", "bet", "raise", "flush", "top", "heavy"):
+            self.assertIn(w, v)
+        for w in ("moduledoc", "docword", "fdoc", "baretext", "testword", "recword"):
+            self.assertNotIn(w, v)
+
+    def test_61_where_lines_physical_and_capped(self):
+        lines = []
+        for i in range(1, 40):
+            if i == 5:
+                lines.append("\n")                                       # 빈 줄
+            else:
+                lines.append(_dec(i, advice={"reason": "Word%dxx" % i if i % 3 == 0 else "폴드"}).decode())
+        raw = "".join(lines).encode()
+        base = _audit_base("t61f", {D0: raw})
+        code, out, err = self.audit(base, as_json=True)
+        self.assertEqual(code, 1)
+        f = json.loads(out)["files"][0]
+        want = [i for i in range(1, 40) if i % 3 == 0][:10]          # 빈 줄(5번)도 물리 줄 번호로 센다
+        self.assertEqual(f["where"]["unk_en"], want)
+        self.assertEqual(f["where"]["unk_ko"], [])
+        code, out, err = self.audit(base)
+        self.assertIn("where\t%s\tunk_en\t%s" % (D0, ",".join(map(str, want))), out)
+        self.assertNotIn("Word3x", out + err)
+        # 빈 줄 뒤의 줄 번호가 밀리지 않음
+        raw2 = (_dec(1, advice={"reason": "폴드"}).decode() + "\n" + _dec(2, advice={"reason": "Tiger"}).decode()).encode() + b"\n"
+        base = _audit_base("t61g", {D0: raw2})
+        self.assertEqual(json.loads(self.audit(base, as_json=True)[1])["files"][0]["where"]["unk_en"], [3])
+
+    def test_61_no_network(self):
+        base = _audit_base("t61h", {D0: _dec(1, advice={"reason": "Tiger"})})
+        keep = socket.socket
+
+        def boom(*a, **k):
+            raise AssertionError("network")
+        socket.socket = boom
+        try:
+            code, out, err = self.audit(base)
+        finally:
+            socket.socket = keep
+        self.assertEqual(code, 1)
+
+    def test_61_state_and_gate(self):
+        base = _audit_base("t61i", {D1: hline(1)})
+        self.assertEqual(self.audit(base)[0], 0)
+        p = os.path.join(base, RS.STATE_NAME)
+        with open(p, encoding="utf-8") as f:
+            st = json.load(f)
+        a = st["audit"]
+        self.assertEqual(RS.AUDIT_V, 2)
+        self.assertEqual(a["audit_v"], RS.AUDIT_V)
+        self.assertEqual(len(a["vocab_en_sha"]), 64)
+        self.assertEqual(a["vocab_en_sha"], hashlib.sha256("\n".join(sorted(RS.load_vocab_en())).encode()).hexdigest())
+
+        def gate(mut):
+            with open(p, encoding="utf-8") as f:
+                s2 = json.load(f)
+            mut(s2["audit"])
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(s2, f)
+            d = mk(base, fake_cfg(), fake=True, require_audit=True)
+            run(d)
+            return d.files[D1]["result"]
+        self.assertNotEqual(gate(lambda a_: None), "audit_required")
+        # 사전 sha 는 관문에 쓰지 않는다
+        self.assertNotEqual(gate(lambda a_: a_.update(vocab_en_sha="0" * 64, vocab_sha="0" * 64)), "audit_required")
+        self.assertEqual(gate(lambda a_: a_.update(audit_v=1)), "audit_required")
+        self.assertNotEqual(gate(lambda a_: a_.update(audit_v=RS.AUDIT_V)), "audit_required")
+        self.assertEqual(gate(lambda a_: a_.pop("audit_v")), "audit_required")
+
+    def test_61_old_audit_not_merged(self):
+        base = _audit_base("t61j", {D1: hline(1)})
+        self.assertEqual(self.audit(base)[0], 0)
+        p = os.path.join(base, RS.STATE_NAME)
+        with open(p, encoding="utf-8") as f:
+            st = json.load(f)
+        st["audit"]["audit_v"] = 1
+        st["audit"]["files"]["2026-10-30.jsonl"] = {"sha256": "0" * 64, "verdict": "OK", "accepted": False}
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(st, f)
+        self.assertEqual(self.audit(base)[0], 0)
+        with open(p, encoding="utf-8") as f:
+            a = json.load(f)["audit"]
+        self.assertNotIn("2026-10-30.jsonl", a["files"])
+        self.assertEqual(a["audit_v"], RS.AUDIT_V)
+
+    def test_61_generated_lines_have_no_unknown_words(self):
+        TD, dl = T53_GeneratedValues._import_td()
+        import evaluator as ev
+        d = tempfile.mkdtemp(prefix="rec61g-")
+        try:
+            tb = TD.play_to_flop_bet(tag=None)
+            log = dl.DecisionLog(d)
+            name = ev.hand_name(ev.evaluate([ev.parse_card(c) for c in ("Ah", "Kd", "Ac", "7c", "2d")]))
+            log.record(TD.make_ctx(hand_name=name, outs=None), TD.make_advice(), state=tb.tr, t=time.time())
+            rec = TD.finish_call_to_showdown(tb)
+            log.link_hand(rec)
+            dec = b""
+            for f in sorted(glob.glob(os.path.join(d, "hands", "decisions_*.jsonl"))):
+                dec += open(f, "rb").read()
+            hand = (json.dumps(rec, ensure_ascii=False) + "\n").encode()
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        base = _audit_base("t61k", {D0: dec, D1: hand})
+        code, out, err = self.audit(base, as_json=True)
+        j = json.loads(out)
+        for f in j["files"]:
+            self.assertEqual((f["unk_ko"], f["unk_en"]), (0, 0), f)
 
 
 _MISSING = object()

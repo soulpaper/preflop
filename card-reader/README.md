@@ -188,7 +188,7 @@ CARD_READER_DIR=<card-reader 저장소 폴더>
 
 설계와 명세는 sharebox 저장소의 `docs/records-impl-spec.md`(13절이 최신)에 있다.
 
-- **PC 업로더** `records_sync.py --base <폴더> --once`: `<base>/hands/`의 `YYYY-MM-DD.jsonl`, `decisions_YYYY-MM-DD.jsonl`만 읽는다. 키 허용 목록에 없는 키는 버리고(`records_state.json`의 `dropped_keys`, `dropped_paths`), 이름처럼 보이는 키나 닉네임 모양 값이 있으면 `disabled`로 멈춘다(`--reset-disabled`로 해제). 모든 줄의 `redacted`는 필터 판 번호(`3`)이며 닉네임이 없다는 증명이 아니다.
+- **PC 업로더** `records_sync.py --base <폴더> --once`: `<base>/hands/`의 `YYYY-MM-DD.jsonl`, `decisions_YYYY-MM-DD.jsonl`만 읽는다. 키 허용 목록에 없는 키는 버리고(`records_state.json`의 `dropped_keys`, `dropped_paths`), 이름처럼 보이는 키나 닉네임 모양 값이 있으면 `disabled`로 멈춘다(`--reset-disabled`로 해제). 모든 줄의 `redacted`는 필터 판 번호(`5`)이며 닉네임이 없다는 증명이 아니다.
 - **설정 파일 권한 (Windows)**: `records_upload.json`은 사용자 프로필 아래 CardReader 폴더에만 둔다(공용 폴더, 동기화 폴더 금지). 만든 뒤 PowerShell에서 상속을 끊고 본인만 남긴다.
   1. `icacls records_upload.json /inheritance:r /grant:r "${env:USERNAME}:(R,W)"`
   2. `icacls records_upload.json`을 실행해 출력에 본인 계정만 있는지 확인한다(값은 어디에도 적지 않는다).
@@ -198,6 +198,6 @@ CARD_READER_DIR=<card-reader 저장소 폴더>
   2. `pull.json`(0600, 폴더 0700)에 `url`, `token`, `data_dir`, **`work_dir`**(필수, 작업 폴더 절대 경로. 데이터 폴더가 그 안이나 그 바깥이면 거부), `inbox`(보고를 덧붙일 파일, 작업 폴더 안이어도 된다)를 적는다. 모든 경로 이름은 `<작업 폴더>` 자리표시로 문서에 적는다.
   3. `deploy/records-pull.inbox.conf.example`을 `~/.config/systemd/user/records-pull.service.d/inbox.conf`로 복사해 `<작업 폴더>`, `<수신함 파일>`을 바꾼다(없으면 수신함 쓰기는 EROFS로 실패하고 보고는 저널로 간다).
   4. `systemctl --user daemon-reload`
-- **백필 전 점검** `records_sync.py --base <폴더> --audit [--from 날짜] [--to 날짜] [--accept-check] [--json]`: 네트워크 없이 과거 파일의 값 형식과 자유 텍스트 낱말을 점검한다. 출력에는 필드 경로와 개수만 있고 값은 없다. OK(0), CHECK(1), STOP(2). 점검 기록(`records_state.json`의 `audit`)이 없는 날짜(어제까지)의 파일은 `audit_required`로 올라가지 않는다. CHECK는 직접 확인한 뒤 `--accept-check`로 받아들인다.
+- **백필 전 점검** `records_sync.py --base <폴더> --audit [--from 날짜] [--to 날짜] [--accept-check] [--json]`: 네트워크 없이 과거 파일의 값 형식과 자유 텍스트 낱말(한글 `unk_ko`, 영문·숫자 `unk_en`)을 점검한다. 출력에는 필드 경로, 개수, CHECK 파일의 `where` 줄(줄 번호만)이 있고 값은 없다. 점검 방식 판 `AUDIT_V`(현재 `2`)를 상태에 적고, 필터 판이나 점검 방식 판이 다른 기록은 무효다(개정 6 판으로 다시 점검한다). OK(0), CHECK(1), STOP(2). 점검 기록(`records_state.json`의 `audit`)이 없는 날짜(어제까지)의 파일은 `audit_required`로 올라가지 않는다. CHECK는 직접 확인한 뒤 `--accept-check`로 받아들인다.
 - 판을 올릴 때 배포 순서: 리눅스 수신기, sharebox 서버, PC 업로더.
 - 시험: `RECORDS_TEST_SHAREBOXD=<shareboxd 바이너리> python3 -I test_records.py` (바이너리가 없으면 실서버 시험은 SKIP).
