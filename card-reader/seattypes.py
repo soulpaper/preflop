@@ -3,7 +3,7 @@
     types = seattypes.SeatTypes()
     types.observe(names, state, t)          # 매 프레임: 닉네임(names.NameReader 확정값)·빈자리로 좌석 주인이 바뀌었는지
     key = types.apply_popup(info, names, t)  # 사용자가 연 팝업(userinfo.PopupWatcher 결과) → 그 좌석에 타입 저장
-    types.prompt(state, live, t)             # 지금 눌러 달라고 할 좌석 하나 (내가 쉬는 동안만) 또는 None
+    types.prompt(state, live, t)             # 지금 눌러 달라고 할 좌석 하나 (항상; 내 차례엔 한 줄로) 또는 None
     types.for_log()                          # handlog.Tracker.update(types=...) 용 {seat: {type, type_src, type_stats}}
     types.profile(key, base)                 # handread / 화면용 프로필 (base 통계 + 팝업 통계 + style)
     types.reset()                            # 새 [자동 지정] / 테이블 이동·합치기
@@ -30,7 +30,7 @@
   3. 같은 사람(유사도 SAME_RATIO)인 좌석이 하나 → 그 좌석. 단 이미 다른 사람의 팝업 타입이 있는 좌석이면 옮기지 않음
   그 밖(모호/다른 좌석)이면 저장하지 않음.
 안내 (prompt) — 앱은 아무것도 클릭하지 않는다. 사용자에게 어느 캐릭터를 눌러 달라고 큰 글씨로 한 자리씩만.
-  - 내가 쉴 때만: 내 차례/예약(preaction)이 아니고, 폴드했거나 이번 핸드에 카드가 없을 때 (차례 시간 ~9.8초를 뺏지 않게)
+  - 풀어야 할 상대가 있으면 항상 보여 줌 (핸드 중·내 차례도). 내 차례/예약 중에는 compact=True (글 한 줄, 그림 없음) 로 한 화면에 맞춤
   - 타입을 모르는 상대만 (한 번 읽으면 그 좌석이 초기화되기 전까지 다시 묻지 않음)
   - 우선순위: 아직 핸드에 남은 상대 → 이번 핸드에 자발적으로 칩을 넣은(루즈/액티브) 상대 → 나보다 뒤에 행동하는 상대 → 자리 순
   - 문구: 닉네임이 확실할 때만(NameReader 확정 + 여러 전처리가 같은 글자 + NAME_STABLE 프레임 그대로) '닉네임 님을 눌러 주세요',
@@ -448,8 +448,8 @@ class SeatTypes:
         닉네임이 확실하면 '테스트닉… 님을 눌러 주세요', 아니면 화면 위치로 '오른쪽 위 사람을 눌러 주세요'.
         아래 줄은 늘 '(오른쪽 위 · CO · 타입 확인)' — 화면 위치를 먼저."""
         try:
-            if not self.idle(state):
-                return None  # 안 보여 줄 뿐, 고른 좌석은 기억 (쉬는 때 다시 같은 사람)
+            if not (isinstance(state, dict) and state.get("layout_ok") is not False and state.get("seats")):
+                return None  # 배치 실패·빈 프레임: 그 프레임만 건너뜀 (고른 좌석은 기억)
             cands = self.candidates(state, live)
             keys = [c[0] for c in cands]
             if self.prompt_seat is not None and self.prompt_seat not in keys and not self.known(self.prompt_seat):
@@ -473,7 +473,9 @@ class SeatTypes:
             else:
                 text = "상대 캐릭터를 눌러 주세요"
             out = {"seat": k, "pos": pos, "slot": slot, "text": text, "sub": sub}
-            if not nm:   # 이름을 확실히 못 부를 때: 그림으로 어디인지 보여 줌
+            # 내 차례·예약 중에는 한 줄(글만)로 줄여 한 화면에 맞춤 — 숨기지는 않음
+            out["compact"] = bool(state.get("to_act") or state.get("preaction"))
+            if not nm and not out["compact"]:   # 이름을 확실히 못 부를 때: 그림으로 어디인지 보여 줌
                 slots = [s.get("slot") for s in (state.get("seats") or [])
                          if s.get("key") and s.get("key") != "hero" and s.get("occupied") and s.get("slot")]
                 out["picture"], out["slots"] = True, slots

@@ -4078,7 +4078,7 @@ class App:
         plan = [("top", self.sec_top, None), ("cards", self.sec_cards, None),
                 ("equity", lambda c: self.sec_equity(c, st), None)]
         blocks = self.opp_blocks()  # 상대 예상: 상대마다 한 블록 (최대 3, 주 상대 먼저), 섹션은 하나
-        prompt = (self.track or {}).get("prompt")  # 쉬는 동안: 어느 캐릭터를 눌러 타입을 볼지 안내
+        prompt = (self.track or {}).get("prompt")  # 어느 캐릭터를 눌러 타입을 볼지 안내
         plan.append(("opp", (lambda c: self.sec_opp_all(c, blocks, prompt)) if blocks or prompt else None,
                      COLLAPSED_TEXT["opp"]))
         notes = []
@@ -4477,7 +4477,7 @@ class App:
 
     def sec_opp_all(self, c, blocks, prompt=None):
         """상대 예상: 상대마다 한 블록 (최대 3명)을 한 섹션 안에 쌓는다 (자리는 하나).
-        prompt: 내가 쉬는 동안 '어느 캐릭터를 눌러 타입을 확인할지' 안내 (seattypes.SeatTypes.prompt) — 크게, 맨 위."""
+        prompt: '어느 캐릭터를 눌러 타입을 확인할지' 안내 (seattypes.SeatTypes.prompt) — 크게, 맨 위."""
         y = self.s(8)
         if prompt:
             y = self.draw_type_prompt(c, y, prompt)
@@ -4497,6 +4497,12 @@ class App:
         y = self.section_title(c, y, W, P, "상대 타입 확인", "opp_type")
         top = y
         pad = s(12)
+        if prompt.get("compact"):  # 내 차례: 한 줄 (글만)
+            t = self.text(c, P + pad, y + s(6), prompt.get("text") or "", FS_BODY + 3, "bold", WARN, width=W - 2 * (P + pad))
+            bottom = c.bbox(t)[3] + s(6)
+            bg = round_rect(c, P, top, W - P, bottom, s(10), fill=PANEL, outline=WARN, width=max(1, int(s(2))))
+            c.tag_lower(bg, t)
+            return bottom + s(6)
         pic = bool(prompt.get("picture"))
         text = "그림의 빛나는 자리 사람을 눌러 주세요" if pic else (prompt.get("text") or "")
         t = self.text(c, P + pad, y + pad, text, FS_HAND + 6, "bold", WARN, width=W - 2 * (P + pad))

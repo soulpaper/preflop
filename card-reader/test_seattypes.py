@@ -259,12 +259,14 @@ def test_many_seats_changing_only_rechecks_those_seats():
     assert not st.seats and st.prompt_seat is None
 
 
-def test_prompt_idle_only():
+def test_prompt_always_shown():
     st = sty.SeatTypes()
     st.observe(NAMES, state(), 0.0)
-    assert st.prompt(state(), {}, 1.0) is None, "핸드 중(폴드 안 함)에는 묻지 않음"
-    assert st.prompt(state(hero_folded=True, to_act=True), {}, 1.0) is None, "내 차례"
-    assert st.prompt(state(hero_folded=True, preaction=True), {}, 1.0) is None, "예약 버튼(차례 직전)"
+    pr = st.prompt(state(), {}, 1.0)
+    assert pr is not None and pr["compact"] is False, "핸드 중에도 보임"
+    pr = st.prompt(state(to_act=True), {}, 1.0)
+    assert pr is not None and pr["compact"] is True and not pr.get("picture"), "내 차례: 한 줄(글만)"
+    assert st.prompt(state(hero_folded=True, preaction=True), {}, 1.0)["compact"] is True, "예약 버튼"
     assert st.prompt(state(hero_folded=True), {}, 1.0) is not None, "폴드 뒤"
     assert st.prompt(state(hero_in_hand=False), {}, 1.0) is not None, "핸드 사이"
     bad = state(hero_folded=True)
@@ -402,9 +404,9 @@ def test_prompt_sticky():
     assert st.candidates(s_b, live_b)[0][0] != "seat_TC", "우선순위는 실제로 바뀜"
     for t in (5.0, 9.5, 60.0, 600.0):
         assert st.prompt(s_b, live_b, t)["seat"] == "seat_TC", t
-    # (b) 내 차례/핸드 중이면 안 보이지만 기억은 유지 → 다시 쉬면 같은 사람
-    assert st.prompt(state(to_act=True, **fh), live_b, 601.0) is None
-    assert st.prompt(state(), live_b, 602.0) is None
+    # (b) 내 차례/핸드 중에도 같은 사람을 계속 안내
+    assert st.prompt(state(to_act=True, **fh), live_b, 601.0)["seat"] == "seat_TC"
+    assert st.prompt(state(), live_b, 602.0)["seat"] == "seat_TC"
     assert st.prompt_seat == "seat_TC"
     assert st.prompt(s_b, live_b, 603.0)["seat"] == "seat_TC"
     # (c) 팝업으로 해결되면 다음 후보

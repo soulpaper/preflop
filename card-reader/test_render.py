@@ -295,6 +295,19 @@ def type_cases(app):
         print("ok  " if ok else "FAIL", "타입 확인 안내 (그림)")
         if not ok:
             fails.append("type prompt picture")
+        layout_state(app, "flop")   # 내 차례 (버튼 있음) + 상대 예상
+        app.track["prompt"] = {"seat": "seat_UR", "pos": "CO", "slot": "UR", "text": "오른쪽 위 사람을 눌러 주세요",
+                               "sub": "(오른쪽 위 · CO · 타입 확인)", "compact": True}
+        try:
+            app.render(force=True)
+            app.root.update()
+            ok = "오른쪽 위 사람을 눌러 주세요" in canvas_text(app) and max(app.col_bottoms) <= app.win_h
+        except Exception as exc:
+            print("compact prompt raised", repr(exc))
+            ok = False
+        print("ok  " if ok else "FAIL", "타입 확인 안내 (내 차례, 한 줄)")
+        if not ok:
+            fails.append("type prompt my turn")
     finally:
         app.track, app.table_state = saved
     return fails
