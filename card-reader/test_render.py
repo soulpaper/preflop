@@ -363,9 +363,10 @@ def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     reader.save_config = lambda *a, **k: None   # 점검이 config.json 을 바꾸지 않게
+    # records_auto 도 끈다: 실제 card-reader 폴더(업로드 설정이 있는 곳)에서 점검해도 기록을 올리지 않게
     # 실제 화면을 읽는 스레드·주기 갱신(tick)을 꺼서 점검이 만든 상태만 남게 한다 (게임 중 화면이 view/table_state 를 덮어써 흔들리던 문제)
     real_optional = reader._optional
-    reader._optional = lambda name, *a, **k: None if name in ("tablestate", "gto_update") else real_optional(name, *a, **k)
+    reader._optional = lambda name, *a, **k: None if name in ("tablestate", "gto_update", "records_auto") else real_optional(name, *a, **k)
     reader.ocr.available = lambda *a, **k: False
     reader.App.tick = lambda self: None
     app = reader.App()
@@ -400,6 +401,37 @@ def main():
         traceback.print_exc()
         print("FAIL postflop_cases", repr(e))
         fails += 1
+    class _RS:  # 기록 전송 상태 글자 (헤더 제목 옆)
+        def __init__(self, t):
+            self.t = t
+
+        def status_text(self):
+            return self.t
+
+        def status_texts(self):
+            return [self.t, self.t.replace("기록 전송", "전송"), "전송: " + self.t.split(": ")[1][:2]] if self.t else []
+
+        def stop(self, wait=0):
+            pass
+    for t in ("기록 전송: 정상 · 21:15", "기록 전송: 대기(네트워크)", None):
+        try:
+            app.records_sync = _RS(t)
+            app.render(force=True)
+            app.root.update()
+            want = set(app.records_sync.status_texts())
+            drawn = [app.canvas.itemcget(i, "text") for i in app.canvas.find_all()
+                     if app.canvas.type(i) == "text" and app.canvas.itemcget(i, "text") in want]
+            if t is not None and not drawn:
+                print("FAIL records status not drawn", t)
+                fails += 1
+            else:
+                print("ok   records status", t, "->", drawn[:1])
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print("FAIL records status", repr(e))
+            fails += 1
+    app.records_sync = None
     app.root.destroy()
     print("render fails:", fails)
     sys.exit(1 if fails else 0)

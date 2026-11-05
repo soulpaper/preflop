@@ -62,7 +62,9 @@ def log_debug(title, ctx=None):
         if LOG_PATH.exists() and LOG_PATH.stat().st_size > LOG_MAX:
             os.replace(LOG_PATH, LOG_PATH.with_name("debug.log.1"))
         with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {title}\n{traceback.format_exc()}")
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {title}\n")
+            if sys.exc_info()[0] is not None:  # except 밖에서 부르면 (백그라운드 알림) traceback 없이 제목만
+                f.write(traceback.format_exc())
             if ctx is not None:
                 try:
                     f.write("ctx: " + json.dumps(ctx, ensure_ascii=False, default=str, separators=(",", ":"))[:3000] + "\n")
@@ -1652,6 +1654,13 @@ class App:
             threading.Thread(target=self.ocr_worker, daemon=True).start()
         if self.tablestate is not None:
             threading.Thread(target=self.state_worker, daemon=True).start()
+        self.records_sync = None     # 핸드·결정 기록 업로드 (records_upload.json 이 있고 enabled 일 때만, records_auto.py)
+        ra = _optional("records_auto")
+        if ra is not None:
+            try:
+                self.records_sync = ra.start(BASE, log=log_debug)
+            except Exception:
+                self.log_once("records_auto")
         self.gto_updater = None      # GTO 데이터 백그라운드 갱신 (gto_update.json 이 있을 때만)
         gu = _optional("gto_update")
         if gu is not None:
@@ -2596,8 +2605,13 @@ class App:
                 self.popup.reset()   # 같은 사람이 다시 앉아도 팝업을 다시 받아들이게
             log_names, log_types = types.full_names(names), types.for_log()
         shown = self.read_shown(img, calib, st, hero, board)
+        rs = getattr(self, "records_sync", None)
+        if rs is not None and log_names:  # 업로더의 닉네임 검사용 (메모리 전용, 잘리지 않은 이름만)
+            rs.add_names(nm[0] for nm in log_names.values() if nm and nm[0] and not nm[1])
         if self.tracker.update(st, hero, board, log_names, now, shown=shown, types=log_types):
             self.hands_done += 1   # 핸드가 끝남 → 카드 잠금을 푸는 새 핸드 신호
+            if rs is not None:
+                rs.hand_done()     # 기록 업로드 예약 (60초 묶음, 실제 전송은 업로더 스레드)
         profiles = self.store.get_for_table(names, session=self.tracker.session,
                                             tab=self.cfg.get("game_tab")) if self.store else {}
         live = self.tracker.live()
@@ -3762,7 +3776,7 @@ class App:
                bool(self.cfg.get("auto_numbers")), repr(self.ocr_values), self.rec_on, self.rec_elapsed(),
                self.reads_sig(), repr((self.track or {}).get("names")), repr(self.cfg.get("section_layout")),
                repr((self.track or {}).get("prompt")), repr((self.track or {}).get("types")),
-               repr(self.tourney), repr(self.cfg.get("tourney")), self.cfg.get("ui_bias"))
+               repr(self.tourney), repr(self.cfg.get("tourney")), self.cfg.get("ui_bias"), self.records_status())
         if key == self.last_render and not force:
             return
         self.last_render = key
@@ -4644,6 +4658,14 @@ class App:
         c.tag_bind(tag, "<Leave>", lambda e: self.root.config(cursor=""))
         return bottom + s(16)
 
+    def records_status(self):
+        """헤더용 기록 전송 상태 ('기록 전송: 정상 · 21:15' 등). 업로더가 없으면 None."""
+        rs = getattr(self, "records_sync", None)
+        try:
+            return rs.status_text() if rs is not None else None
+        except Exception:
+            return None
+
     def text(self, c, x, y, text, pt, weight="normal", fill=TEXT, family=F_UI, **kw):
         kw.setdefault("anchor", "nw")
         return c.create_text(x, y, text=text, font=self.font(pt, weight, family), fill=fill, **kw)
@@ -4665,6 +4687,22 @@ class App:
         pw = self.measure("200%", FS_SMALL, "bold") + s(6)
         self.text(c, x - pw / 2, y + h / 2, f"{round(self.scale * 100)}%", FS_SMALL, "bold", MUTED, anchor="center")
         x = self.header_button(c, "smaller", "A−", x - pw - s(6), y, h)
+        rs = self.records_status()
+        if rs:  # 기록 전송 상태: 제목 옆 작은 글자 (들어가는 가장 긴 표기, 안 되면 숨김). 정상·꺼짐은 회색, 그 밖은 노랑
+            tx = P + self.measure("Card Reader", FS_TITLE, "bold") + s(14)
+            try:
+                texts = self.records_sync.status_texts() or [rs]
+            except Exception:
+                texts = [rs]
+            fit = next((t for t in texts if tx + self.measure(t, FS_SMALL) <= x - s(8)), None)
+            if fit:
+                calm = "정상" in rs or "꺼짐" in rs
+                self.text(c, tx, y + h / 2, fit, FS_SMALL, fill=MUTED if calm else WARN, anchor="w", tags="rec_sync")
+                c.tag_bind("rec_sync", "<Enter>", lambda e: self.tip.show(
+                    f"{rs} · 핸드·결정 기록(닉네임 없음)을 분석용 서버로 보냅니다. 핸드가 끝나면 1분 뒤, 그 밖에는 "
+                    "15분마다 · 대기 = 네트워크가 안 돼 다음에 다시 보냄 · 멈춤 = 점검이 필요해 보내지 않음",
+                    e.x_root, e.y_root), add="+")
+                c.tag_bind("rec_sync", "<Leave>", lambda e: self.tip.hide(), add="+")
         y += h + s(8)
         # 헤더 버튼: 카드 = 카드 영역 지정, 숫자 = 숫자 영역 지정, 학습 = 카드 학습
         x = P
@@ -5571,6 +5609,11 @@ class App:
         self.closed = True
         if self.gto_updater is not None:
             self.gto_updater.stop()
+        if getattr(self, "records_sync", None) is not None:
+            try:  # 기다리는 중이면 바로, 올리는 중이면 최대 2초 기다린 뒤 버림 (데몬 스레드, 다음 실행이 이어 맞춤)
+                self.records_sync.stop(wait=2.0)
+            except Exception:
+                self.log_once("records_auto")
         self.rec_on = False
         try:
             if self.tracker is not None:

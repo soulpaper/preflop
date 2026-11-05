@@ -19,7 +19,7 @@ python reader.py
 ## exe 빌드
 
 ```
-pyinstaller --onefile --windowed --name CardReader --collect-all winrt --hidden-import masterlock --hidden-import masterlock_build --hidden-import names --hidden-import handlog --hidden-import profiles --hidden-import handread --hidden-import rangeq --hidden-import recorder --hidden-import userinfo --hidden-import advisor --hidden-import tablestate --hidden-import solverlib --hidden-import icm --hidden-import eqtable --hidden-import decisionlog --hidden-import showdown --hidden-import gto_update --hidden-import gto_dist_common --add-data "eqtable/preflop_random.json;eqtable" reader.py
+pyinstaller --onefile --windowed --name CardReader --collect-all winrt --hidden-import masterlock --hidden-import masterlock_build --hidden-import names --hidden-import handlog --hidden-import profiles --hidden-import handread --hidden-import rangeq --hidden-import recorder --hidden-import userinfo --hidden-import advisor --hidden-import tablestate --hidden-import solverlib --hidden-import icm --hidden-import eqtable --hidden-import decisionlog --hidden-import showdown --hidden-import gto_update --hidden-import gto_dist_common --hidden-import records_auto --hidden-import records_sync --hidden-import records_check --add-data "eqtable/preflop_random.json;eqtable" reader.py
 ```
 
 exe 옆에 `templates/`, `templates_shown/`, `font_glyphs/`, `gto_lib/` 를 둔다.
@@ -189,6 +189,7 @@ CARD_READER_DIR=<card-reader 저장소 폴더>
 설계와 명세는 sharebox 저장소의 `docs/records-impl-spec.md`(13절이 최신)에 있다.
 
 - **PC 업로더** `records_sync.py --base <폴더> --once`: `<base>/hands/`의 `YYYY-MM-DD.jsonl`, `decisions_YYYY-MM-DD.jsonl`만 읽는다. 키 허용 목록에 없는 키는 버리고(`records_state.json`의 `dropped_keys`, `dropped_paths`), 이름처럼 보이는 키나 닉네임 모양 값이 있으면 `disabled`로 멈춘다(`--reset-disabled`로 해제). 모든 줄의 `redacted`는 필터 판 번호(`5`)이며 닉네임이 없다는 증명이 아니다.
+- **앱 안에서 자동 업로드** (`records_auto.py`): `records_upload.json`이 있고 `enabled`이면 CardReader가 실행 중에 같은 업로더(`records_sync`)를 백그라운드 스레드에서 돌린다. 시작 15초 뒤 한 번(꺼져 있던 동안 쌓인 기록), 핸드가 끝나면 60초 뒤 한 번(그 사이 끝난 핸드는 묶음), 마지막 실행 뒤 `interval_sec`(기본 900초)마다. 설정이 없거나 꺼져 있으면 아무것도 하지 않는다. 실패는 같은 것은 `debug.log`에 한 번만 적고(토큰·값 없음), 헤더 제목 옆에 `기록 전송: 정상 · 21:15` / `대기(네트워크)` / `멈춤(점검 필요)` 같은 짧은 상태만 보인다. 이번 실행에서 읽은 전체 닉네임을 메모리에서만 `extra_names`로 넘긴다(`name_check=known_names`).
 - **설정 파일 권한 (Windows)**: `records_upload.json`은 사용자 프로필 아래 CardReader 폴더에만 둔다(공용 폴더, 동기화 폴더 금지). 만든 뒤 PowerShell에서 상속을 끊고 본인만 남긴다.
   1. `icacls records_upload.json /inheritance:r /grant:r "${env:USERNAME}:(R,W)"`
   2. `icacls records_upload.json`을 실행해 출력에 본인 계정만 있는지 확인한다(값은 어디에도 적지 않는다).
