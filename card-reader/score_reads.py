@@ -24,6 +24,8 @@
     0확률          실제 콤보가 범위에서 아예 빠졌나 (가중치 컷)
     요약 표기      재생 결과의 표기 핸드(summary_codes)에 실제 핸드가 들었나 vs 화면 확률(summary_hit_pct, 실측 보정) /
                    모델 확률(summary_pct) → handread.SUMMARY_CAL 을 다시 잴 때 쓴다
+                   포스트플랍은 표기가 보드 기준 묶음('Q 탑페어 …')이라 실제 콤보의 묶음(handread.combo_group)이 보인 묶음
+                   (summary_groups) 안에 있었나로 잰다 → handread.GROUP_CAL
   기록된 리딩(decisions_*.jsonl 의 reads: 결정 순간 사용자가 본 줄)도 따로 채점:
     표시된 상위 3분류 안에 실제 분류가 있었나 / 1순위였나 / 요약 표기에 실제 핸드가 들었나
     (예전 표기 'TT+, AJs+ 외 12%' 는 88% 를, 지금 표기 'TT+, AJs+ 중 하나일 확률 약 50%' 는 50% 를 주장 → 실제 포함률과 비교)
@@ -229,8 +231,8 @@ def _class_metrics(probs, y):
     return {"cls_p": py, "cls_rank": rank, "cls_top1": rank == 1, "brier": brier, "cls_ll": ll, "cls_probs": p}
 
 
-def score_result(res, key, code, y, n_live):
-    """handread 결과 하나 → 점수 dict."""
+def score_result(res, key, code, y, n_live, grp=None):
+    """handread 결과 하나 → 점수 dict. grp: 실제 콤보의 보드 기준 묶음 이름 (포스트플랍)."""
     rng = res.get("range") or {}
     p_raw = rng.get(key, 0.0)
     p = (1 - EPS) * p_raw + EPS / n_live
@@ -242,7 +244,11 @@ def score_result(res, key, code, y, n_live):
            "zero": p_raw <= 0, "top5": code in [c for c, _ in res.get("top_hands") or []],
            "width": res.get("width_pct")}
     named = res.get("summary_codes")
-    if named is None:   # 예전 결과: 표기 문자열에서
+    if res.get("summary_groups") is not None:   # 포스트플랍: 보인 묶음
+        named = res["summary_groups"]
+        code = grp
+        model, shown = res.get("summary_pct"), res.get("summary_hit_pct")
+    elif named is None:   # 예전 결과: 표기 문자열에서
         named, model = parse_summary(res.get("summary"))
         shown = model
     else:
@@ -349,23 +355,36 @@ def parse_summary(body):
 
 def parse_logged(line):
     """'BTN 오픈: 예상 상위 7% (66, A9s-A7s 외 8%) | 보드 기준: 탑페어+ 40% · 드로우 30%' →
-    {codes, covered(%), classes{이름: %}, board(bool), truncated}."""
-    out = {"codes": set(), "covered": None, "classes": {}, "board": None, "truncated": False}
+    {codes, covered(%), classes{이름: %}, groups{묶음: %}, board(bool), truncated}.
+    포스트플랍 새 표기 'BTN 오픈: 예상 상위 7% | 보드 기준: Q 탑페어 (AQ, KQ) 30% · 플러시 드로우 (AK) 20%' 는
+    groups 에 묶음 이름(예시 괄호 뺌)과 화면 확률, covered = 그 합."""
+    out = {"codes": set(), "covered": None, "classes": {}, "groups": {}, "board": None, "truncated": False}
     if not line:
         return out
     head, _, tail = line.partition(" | ")
     m = re.search(r"예상 상위 [\d.]+% \((.*)\)\s*$", head)
     if m:
         out["codes"], out["covered"] = parse_summary(m.group(1))
-    elif "예상 상위" in head:
+    elif "예상 상위" in head and not re.search(r"예상 상위 [\d.]+%\s*$", head):
         out["truncated"] = True
     if "기준:" in tail:
         kind, _, cls = tail.partition("기준:")
         out["board"] = kind.strip().startswith("보드")
-        for part in cls.split("·"):
+        known = set(hr.CLASSES_POST) | set(hr.CLASSES_PRE)
+        parts = []
+        for part in cls.split(" · "):   # "중간·약한 페어" 안의 · 로 자르지 않게 (예전엔 이 분류가 늘 빠졌다)
             mm = _CLS_RE.match(part.strip())
             if mm:
-                out["classes"][mm.group(1)] = float(mm.group(2))
+                parts.append((mm.group(1), float(mm.group(2))))
+        # 묶음 표기: 예시 괄호가 있거나 7분류에 없는 이름이 하나라도 있으면 전부 묶음 ('노페어' 는 둘 다에 있다)
+        grouped = any("(" in n or n not in known for n, _ in parts)
+        for n, v in parts:
+            if grouped:
+                out["groups"][re.sub(r"\s*\(.*\)$", "", n).strip()] = v
+            else:
+                out["classes"][n] = v
+        if out["groups"] and not m:
+            out["covered"] = min(100.0, sum(out["groups"].values()))
     return out
 
 
@@ -508,6 +527,7 @@ def score_hands(hands, decs, ok_only=False, ablation=False):
                 b = board[:n]
                 n_live = comb(52 - len(b) - len(dead), 2)
                 names, y = actual_class(b, hi, lo)
+                grp = hr.combo_group(b, hi, lo) if n >= 3 else None
                 ests = {}
                 for var, seat, stk in (("live", truncate(live_seats[k], st), stack),
                                        ("raw", truncate(raw[k], st), stack),
@@ -526,8 +546,9 @@ def score_hands(hands, decs, ok_only=False, ablation=False):
                                   conf=rec.get("confidence"),
                                   label=ests["live"].get("label"), label_raw=ests["raw"].get("label"),
                                   stack=stack, stack_jam=live_seats[k].get("stack_bb"), input_fixes=nfix)
+                row["actual_group"] = grp
                 for var in ("live", "raw", "pre", "notype"):
-                    row[var] = score_result(ests[var], key, code, y, n_live)
+                    row[var] = score_result(ests[var], key, code, y, n_live, grp)
                 row["uniform"] = score_uniform(b, dead, y, n_live)
                 if ablation:
                     row["abl"] = {}
@@ -535,18 +556,24 @@ def score_hands(hands, decs, ok_only=False, ablation=False):
                         with hr.switches(**cfg):
                             res = hr.estimate({k: truncate(live_seats[k], st)}, b, players, dead=dead,
                                               profiles=prof_arg, stack_bb=stack, ante=ante)[k]
-                        row["abl"][name] = score_result(res, key, code, y, n_live)
+                        row["abl"][name] = score_result(res, key, code, y, n_live, grp)
                 row["class_names"] = names
                 rows.append(row)
                 line = logged.get((rec.get("id"), st, k))
                 if line:
-                    lrows.append(score_logged(line, rec.get("id"), k, st, code, names[y], row))
+                    lrows.append(score_logged(line, rec.get("id"), k, st, code, names[y], row, grp))
     return rows, lrows, skipped
 
 
-def score_logged(line, hand, seat, street, code, cls, row):
+def score_logged(line, hand, seat, street, code, cls, row, grp=None):
     p = parse_logged(line)
     shown = p["classes"]
+    if p["groups"] and grp is not None:   # 포스트플랍 새 표기: 묶음으로 비교
+        g = p["groups"]
+        top = max(g.items(), key=lambda kv: kv[1])[0]
+        return OrderedDict(hand=hand, seat=seat, street=street, actual=code, actual_class=cls, kind=row["kind"],
+                           family=row["family"], in_top3=grp in g, top1=(top == grp), shown_p=g.get(grp, 0.0) / 100,
+                           in_summary=grp in g, covered=p["covered"], replay_cls_p=row["live"]["cls_p"])
     top = max(shown.items(), key=lambda kv: kv[1])[0] if shown else None
     return OrderedDict(hand=hand, seat=seat, street=street, actual=code, actual_class=cls, kind=row["kind"],
                        family=row["family"], in_top3=cls in shown, top1=(top == cls), shown_p=shown.get(cls, 0.0) / 100,

@@ -46,6 +46,14 @@ CALL_OPEN_FLOOR = 8.0
 # 콜 범위의 '3벳(4벳)할 만한 패' 가중치: 예전엔 0 (콜했으면 프리미엄 아님)이었지만 실제로는 슬로플레이·플랫이 섞인다
 # (쇼다운 채점 2026-11-05: 오픈에 콜한 상대의 실제 패가 대부분 범위 밖 = 0% 로 나왔다). 3벳 빈도보다는 낮게.
 CALL_TRAP = 0.3
+# 림프 범위 폭 (%): 예전 45% 는 이 풀의 림퍼보다 훨씬 좁았다 — 쇼다운 채점(2026-11-06, 림프 좌석 35명)에서 림프 범위가
+# 무작위보다 0.85bit 나빴다 (실제 패: 53o 94o 96o T4o Q4o J7o …). 45/55/60/70/90% 를 비교하면 콤보 로그손실은 넓을수록
+# 좋아지지만 7분류 Brier·로그손실은 55% 에서 가장 좋고 그 뒤로 나빠져서, 모든 지표가 45% 보다 나은 55% (꼬리는 handread._with_floor).
+LIMP_PCT = 55.0
+# 빅블라인드 체크(림프 팟에서 옵션 체크) 범위: 상위 BB_RAISE_PCT% 는 대개 레이즈했을 패라 BB_TRAP 만 남기고 나머지는 평평하게.
+# 예전 'blind' 는 강한 패일수록 가중치가 높아(AA 1.0 → 72o 0.4) 체크한 BB 의 범위 맨 앞에 'KK+' 가 나왔다 (2026-11-06 라이브).
+BB_RAISE_PCT = 10.0
+BB_TRAP = 0.25
 
 
 # --- 콤보 테이블 -------------------------------------------------------------------
@@ -257,7 +265,7 @@ def villain_range(action, pos, players, stack_bb, profile=None, *, opener=None, 
             base = chart[1][1] if chart else pf.top_pct(10) - pf.top_pct(2)
             exclude = chart[0][1] if chart else pf.top_pct(2)
     elif act == "limp":
-        base = pf.top_pct(45) - pf.top_pct(8)
+        base = pf.top_pct(LIMP_PCT) - pf.top_pct(8)
         chart_pct = pf.range_pct(base)
         extras = {h: 0.2 for h in pf.top_pct(8)}   # 프리미엄 림프(트랩)는 드물게
         if w and vpip is not None and pfr is not None:
@@ -266,9 +274,9 @@ def villain_range(action, pos, players, stack_bb, profile=None, *, opener=None, 
         base = pf.top_pct(_jam_pct(stack_bb, pos, players))
     elif act == "call_jam":
         base = pf.top_pct(_call_jam_pct(stack_bb))
-    elif act == "blind":
-        n = len(G)
-        return {h: 1.0 - 0.6 * i / n for i, h in enumerate(G)}
+    elif act == "blind":   # 빅블라인드 체크: 레이즈했을 상위 패는 트랩만, 나머지 평평
+        raised = set(pf.top_pct(BB_RAISE_PCT))
+        return {h: (BB_TRAP if h in raised else 1.0) for h in G}
     else:
         return random_range()
 

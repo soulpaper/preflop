@@ -21,10 +21,13 @@
   range        {콤보('AhKd'): 확률}  합 1
   width_pct    유효 폭(%) = 가중치 분포의 '유효 콤보 수' / 1326 — 프리플랍 레인지 폭과 같은 척도
   preflop_width_pct  프리플랍 액션만 반영한 폭
-  summary      "TT+, AJs+, KQs, AQo+ 외 12%"  (가장 가능성 높은 핸드 표기 + 표기에 빠진 확률)
+  summary      프리플랍: "TT+, AJs+, KQs, AQo+ 외 12%"  (가장 가능성 높은 핸드 표기 + 표기에 빠진 확률)
+               포스트플랍: "Q 탑페어 (AQ, KQ, QJ) 30% · 플러시 드로우 (A♥, J♥) 15% · 포켓페어 (JJ, 99) 10%"
+               (이 보드 기준 묶음 상위 3개, 예시 핸드, 화면 확률 = 모델 x GROUP_CAL)
+  groups       포스트플랍만: [{name, pct(모델 %), hands(예시), class(7분류)}, ...] 확률 순 / summary_groups = 화면에 보인 묶음 이름
   classes      {분류: 확률(%)}   보드 있음: 스트레이트 이상/셋·트립스/투페어/탑페어+/중간·약한 페어/드로우/노페어
                                  보드 없음(프리플랍): 프리미엄 페어/중간 페어/작은 페어/A-x 수딧/브로드웨이/수딧 커넥터/기타
-  top_hands    [(핸드코드, 확률%), ...] 최대 5개
+  top_hands    [(핸드코드, 확률%), ...] 최대 5개 — 포스트플랍은 보인 묶음 안에서 가장 가능성 높은 핸드 (정수 %, TOP_CAL_POST 보정)
   confidence   "low" | "medium" | "high"
   note         한 줄 한국어 설명
   그 밖에 pos, label(예: "CO 오픈→콜"), preflop_action, street(마지막 반영 스트리트)
@@ -371,7 +374,7 @@ _BOARD_CACHE = {}
 
 
 class _BoardInfo:
-    __slots__ = ("board", "score", "ranks", "rset", "rmax", "bmask", "suits", "cache", "n")
+    __slots__ = ("board", "score", "ranks", "rset", "rmax", "bmask", "suits", "cache", "gcache", "n")
 
     def __init__(self, board):
         self.board = list(board)
@@ -385,6 +388,7 @@ class _BoardInfo:
         for c in board:
             self.suits[c & 3] += 1
         self.cache = {}
+        self.gcache = {}
 
 
 def _board_info(board):
@@ -458,6 +462,68 @@ def _combo_class_pre(code):
     if suited and r1 - r2 <= 2:
         return 5
     return 6
+
+
+# --- 보드 기준 구체 묶음 (포스트플랍 화면) ----------------------------------------------------
+# 포스트플랍 '상대 예상'은 프리플랍 핸드코드 목록(예전: '22+, A9s+, KTs+ …' — 보드와 무관해 보였다) 대신 이 보드에서 상대가
+# 실제로 가진 것의 묶음으로 보여 준다: 'Q 탑페어 (AQ, KQ, QJ) 30% · 플러시 드로우 (AK, KJ) 20%'.
+# 묶음은 CLASSES_POST 한 칸(_classify 의 cls)을 랭크·드로우 종류로 더 나눈 것이라 분류 확률과 어긋나지 않는다.
+_MADE_KO = {4: "스트레이트", 5: "플러시"}
+
+
+def _flush_draw(bi, hi, lo):
+    s1, s2 = hi & 3, lo & 3
+    return bi.suits[s1] + 1 + (s1 == s2) == 4 or (s1 != s2 and bi.suits[s2] + 1 == 4)
+
+
+def _group(bi, hi, lo):
+    """콤보 → 보드 기준 묶음 이름 (스트레이트/플러시/풀하우스 이상/셋/트립스/투페어/오버페어/'Q 탑페어'/'T 페어'/포켓페어/
+    플러시 드로우/스트레이트 드로우/노페어)."""
+    key = (hi, lo)
+    g = bi.gcache.get(key)
+    if g is not None:
+        return g
+    cls = _classify(bi, hi, lo)[1]
+    r1, r2 = hi >> 2, lo >> 2
+    pocket = r1 == r2
+    if cls == 0:
+        cat = ev.evaluate([hi, lo] + bi.board)[0]
+        g = _MADE_KO.get(cat, "풀하우스 이상")
+    elif cls == 1:
+        g = "셋" if pocket else "트립스"
+    elif cls == 2:
+        g = "투페어"
+    elif cls == 3:
+        g = "오버페어" if pocket else f"{_RK[bi.rmax]} 탑페어"
+    elif cls == 4:
+        g = "포켓페어" if pocket else f"{_RK[max(r for r in (r1, r2) if r in bi.rset)]} 페어"
+    elif cls == 5:
+        g = "플러시 드로우" if _flush_draw(bi, hi, lo) else "스트레이트 드로우"
+    else:
+        g = "노페어"
+    bi.gcache[key] = g
+    return g
+
+
+_SUIT_SYM = tuple(ev.SUIT_SYMBOLS[x] for x in ev.SUITS)   # 카드 정수 & 3 → 무늬 기호
+
+
+def _ex_label(bi, g, hi, lo, code):
+    """묶음 예시 표기: 보통 'AQ'·'77' (수딧/오프 구분 없이), 플러시·플러시 드로우는 무늬 카드가 한 장이면 'K♥'."""
+    if g in ("플러시", "플러시 드로우"):
+        for s_ in range(4):
+            mine = [c for c in (hi, lo) if c & 3 == s_]
+            if mine and bi.suits[s_] + len(mine) >= 4:
+                if len(mine) == 1:
+                    return _RK[mine[0] >> 2] + _SUIT_SYM[s_]
+                break
+    return code if len(code) == 2 else code[:2]
+
+
+def combo_group(board, c1, c2):
+    """채점용: 보드(카드 정수 3~5장)에서 콤보의 묶음 이름."""
+    hi, lo = (c1, c2) if c1 > c2 else (c2, c1)
+    return _group(_board_info(list(board)), hi, lo)
 
 
 # --- 프리플랍 레인지 ----------------------------------------------------------------------
@@ -769,6 +835,64 @@ def _summary_hit(model_pct):
     return int(5 * round(model_pct * SUMMARY_CAL / 5))
 
 
+# 포스트플랍 묶음의 화면 확률 = 모델 확률 x GROUP_CAL (5% 단위, 5% 미만 묶음은 안 보임). 쇼다운 채점(2026-11-06 까지,
+# 포스트플랍 272지점, GROUP_CAL=1 로 재생)에서 보인 상위 3묶음: 모델 합 72% / 실제 58% (0.80), 순위별 1위 38%→32%, 2위 21%→15%,
+# 3위 13%→10% — 한 배율 0.8 이 세 순위 모두에 맞는다. 데이터가 쌓이면 score_reads 의 포스트플랍 '요약 표기' (화면 vs 실제)로 다시 잰다.
+GROUP_CAL = 0.8
+# 포스트플랍 카드 그림의 확률 = 모델 확률 x TOP_CAL_POST: 같은 채점에서 그림 5개 확률 합 21% / 실제로 그 안에 든 비율 12.5% (0.6).
+TOP_CAL_POST = 0.6
+GROUPS_SHOWN = 3
+_EXAMPLES = (3, 2, 2)    # 묶음별 예시 핸드 수 (첫 묶음 3개, 나머지 2개)
+
+
+def _groups(gmass, gex, total):
+    """묶음별 질량 → (묶음 목록 [{name, pct(모델 %), hands(예시 표기)}], 화면 문자열, 보인 묶음 이름, 모델 % 합, 화면 % 합)."""
+    order = sorted(gmass, key=lambda g: -gmass[g])
+    groups = []
+    for g in order:
+        exs = sorted(gex[g].items(), key=lambda kv: -kv[1])
+        groups.append({"name": g, "pct": round(gmass[g] / total * 100, 1), "hands": [e for e, _ in exs[:6]]})
+    parts, shown, model, disp = [], [], 0.0, 0
+    for gr in groups:
+        if len(shown) >= GROUPS_SHOWN:
+            break
+        hit = int(5 * round(gr["pct"] * GROUP_CAL / 5))
+        if hit < 5:
+            break
+        ex = gr["hands"][:_EXAMPLES[len(shown)]]
+        parts.append(f"{gr['name']} ({', '.join(ex)}) {hit}%" if ex else f"{gr['name']} {hit}%")
+        shown.append(gr["name"])
+        model += gr["pct"]
+        disp += hit
+    return groups, " · ".join(parts), shown, round(model, 1), min(disp, 100)
+
+
+def _top_post(gcode, shown, total, n=5, per=2):
+    """포스트플랍 카드 그림: 보인 묶음 안에서 가장 가능성 높은 구체 핸드 (묶음마다 최대 per개, 같은 핸드코드는 한 번).
+    예전엔 전체 핸드코드 질량 순이라 콤보가 많은 오프수트(AKo·AQo …)가 보드와 상관없이 늘 앞에 섰다."""
+    out, seen = [], set()
+    for g in shown:
+        k = 0
+        for c, m_ in sorted(gcode[g].items(), key=lambda kv: -kv[1]):
+            if k >= per or len(out) >= n:
+                break
+            if c in seen:
+                continue
+            seen.add(c)
+            out.append((c, round(m_ / total * 100, 1)))
+            k += 1
+    if len(out) < n:   # 보인 묶음이 적으면 나머지 묶음의 핸드로 채운다
+        rest = sorted(((c, m_) for g, d in gcode.items() if g not in shown for c, m_ in d.items()), key=lambda kv: -kv[1])
+        for c, m_ in rest:
+            if len(out) >= n:
+                break
+            if c not in seen:
+                seen.add(c)
+                out.append((c, round(m_ / total * 100, 1)))
+    out.sort(key=lambda t: -t[1])
+    return [(c, max(1, int(round(p * TOP_CAL_POST)))) for c, p in out]   # 실측 보정, 그림에 0% 가 안 뜨게 최소 1%
+
+
 # --- 한 좌석 추정 ---------------------------------------------------------------------------
 def _label(pos, pre_raw):
     acts = [PRE_KO.get(a, a) for a in pre_raw]
@@ -844,13 +968,28 @@ def _estimate_one(seat, board, players, dead, profile, stack_bb, ante=False):
     for code in mass:
         live[code] = sum(1 for a, b in rq.COMBOS[code] if a not in blocked and b not in blocked)
 
-    # 분류
+    # 분류 (+ 포스트플랍: 보드 기준 묶음)
+    gmass, gcode, gex, gcls = {}, {}, {}, {}
     if nb >= 3:
         names = CLASSES_POST
         bi = _board_info(board)
         acc = [0.0] * 7
         for (hi, lo), w in zip(combos, weights):
-            acc[_classify(bi, hi, lo)[1]] += w
+            k = _classify(bi, hi, lo)[1]
+            acc[k] += w
+            g = _group(bi, hi, lo)
+            gcls[g] = k
+            gmass[g] = gmass.get(g, 0.0) + w
+            d = gcode.get(g)
+            if d is None:
+                d = gcode[g] = {}
+            c = _combo_code(hi, lo)
+            d[c] = d.get(c, 0.0) + w
+            e = _ex_label(bi, g, hi, lo, c)
+            d = gex.get(g)
+            if d is None:
+                d = gex[g] = {}
+            d[e] = d.get(e, 0.0) + w
     else:
         names = CLASSES_PRE
         acc = [0.0] * 7
@@ -872,6 +1011,13 @@ def _estimate_one(seat, board, players, dead, profile, stack_bb, ante=False):
 
     width = _eff_width(weights)
     summ, summ_pct, summ_codes = _summary(mass, live)
+    summ_hit, groups, shown = _summary_hit(summ_pct), None, None
+    if gmass:   # 포스트플랍: 화면 요약·카드 그림을 이 보드 기준 묶음으로 (프리플랍 코드 목록은 보드와 무관해 보였다)
+        groups, summ, shown, summ_pct, summ_hit = _groups(gmass, gex, total)
+        for gr in groups:
+            gr["class"] = CLASSES_POST[gcls[gr["name"]]]
+        summ_codes = set()
+        top_hands = _top_post(gcode, shown, total)
     out = {
         "range": {ev.card_str(h) + ev.card_str(l): w / total for (h, l), w in zip(combos, weights)},
         "width_pct": round(width, 1),
@@ -879,7 +1025,7 @@ def _estimate_one(seat, board, players, dead, profile, stack_bb, ante=False):
         "summary": summ,
         "summary_codes": sorted(summ_codes),
         "summary_pct": summ_pct,
-        "summary_hit_pct": _summary_hit(summ_pct),
+        "summary_hit_pct": summ_hit,
         "classes": classes,
         "top_hands": top_hands,
         "confidence": confidence,
@@ -889,6 +1035,9 @@ def _estimate_one(seat, board, players, dead, profile, stack_bb, ante=False):
         "street": last_street,
         "n_actions": n_actions,
     }
+    if groups is not None:
+        out["groups"] = groups
+        out["summary_groups"] = shown
     out["note"] = _note(out, last_kind, last_street, recognized, skipped, bool(adj_f or afx))
     if style:   # 유형이 없으면 결과는 예전과 완전히 같다 (키도 추가하지 않음)
         out["style"] = style
@@ -961,12 +1110,22 @@ def describe(result):
     lines = []
     summ = result.get("summary") or ""
     hit = result.get("summary_hit_pct")
+    classes = result.get("classes") or {}
+    if result.get("summary_groups") is not None:
+        # 포스트플랍: '이 보드에서 무엇을 가졌나' 묶음 한 줄 (7분류 줄은 이 줄이 더 잘게 나눈 것이라 생략)
+        lines.append(f"{result.get('label', '?')}: 예상 상위 {result.get('width_pct', 0):.0f}%")
+        if summ:
+            lines.append("보드 기준: " + summ)
+        th = result.get("top_hands") or []
+        if th:
+            lines.append("가능성 높은 핸드: " + ", ".join(f"{c} {p:.0f}%" for c, p in th[:4]))
+        lines.append(f"{result.get('note', '')} (신뢰도 {_CONF_KO.get(result.get('confidence'), '낮음')})")
+        return lines[:4]
     if summ and hit is not None and result.get("summary_pct") is not None:
         # 표기한 핸드 + '그중 하나일 확률'(실측 보정). 예전 'TT+, AJs+ 외 12%' 는 88% 를 덮는다고 읽혔지만 실제로는 43% 만 맞았다
         summ = summ.rsplit(" 외 ", 1)[0] + (f" 중 하나일 확률 약 {hit}%" if hit < 100 else "")
     lines.append(f"{result.get('label', '?')}: 예상 상위 {result.get('width_pct', 0):.0f}%"
                  + (f" ({summ})" if summ else ""))
-    classes = result.get("classes") or {}
     shown = [(n, p) for n, p in sorted(classes.items(), key=lambda kv: -kv[1]) if p >= 5][:3]
     if shown:
         head = "보드 기준" if CLASSES_POST[0] in classes else "프리플랍 기준"

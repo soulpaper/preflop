@@ -37,8 +37,12 @@ test("AA 는 오픈/3벳/4벳/잼콜 레인지에 모두 있다",
      all("AA" in rq.villain_range(a, "CO", 6, 100) for a in ("open", "3bet", "4bet", "call_jam")))
 test("랜덤 레인지 = 169핸드, 100%", len(RANDOM) == 169 and abs(rq.width_pct(RANDOM) - 100) < 0.01)
 test("action None → 랜덤", rq.width_pct(rq.villain_range(None, "CO", 6, 100)) > 99.9)
-test("blind 레인지는 넓고 약한 핸드 가중치가 낮다",
-     rq.villain_range("blind", "BB", 6, 100)["72o"] < rq.villain_range("blind", "BB", 6, 100)["AA"])
+_bb = rq.villain_range("blind", "BB", 6, 100)
+test("blind(BB 체크) 레인지: 넓고 평평, 레이즈했을 프리미엄(AA·KK·AKs)은 낮다",
+     _bb["72o"] == 1.0 and _bb["AA"] < 0.5 and _bb["KK"] < 0.5 and _bb["AKs"] < 0.5 and len(_bb) == 169, _bb["AA"])
+_lp = rq.villain_range("limp", "CO", 6, 100)
+test("limp 레인지: 넓다 (림퍼 풀은 넓게 림프 — 상위 40% 넘게, J7o·Q5o 포함)",
+     rq.width_pct(_lp) > 40 and _lp.get("J7o", 0) > 0 and _lp.get("Q5o", 0) > 0, rq.width_pct(_lp))
 test("limp 레인지: 프리미엄은 낮은 가중치", rq.villain_range("limp", "CO", 6, 100)["AA"] < 0.5)
 test("모든 action 이 유효한 핸드코드/가중치 (0,1]",
      all(0 < w <= 1 and h in pf.DATA["G"]

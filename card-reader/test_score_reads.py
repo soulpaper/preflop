@@ -144,6 +144,21 @@ fake2 = dict(fake, summary_codes=["AKo", "QQ"], summary_pct=75.0, summary_hit_pc
 m2 = sr.score_result(fake2, "AsKd", "AKo", hr.CLASSES_POST.index("탑페어+"), n_live)
 test("score_result: 요약 포함 + 화면 확률(보정) / 모델 확률",
      m2["sum_in"] is True and m2["sum_claim"] == 0.6 and m2["sum_model"] == 0.75, str(m2))
+# 포스트플랍 새 표기: 보드 기준 묶음 — 실제 콤보의 묶음(grp)이 보인 묶음 안에 있었나
+fake3 = dict(fake, summary_codes=[], summary_groups=["A 탑페어", "노페어"], summary_pct=70.0, summary_hit_pct=55)
+m3 = sr.score_result(fake3, "AsKd", "AKo", hr.CLASSES_POST.index("탑페어+"), n_live, grp="A 탑페어")
+m4 = sr.score_result(fake3, "AsKd", "AKo", hr.CLASSES_POST.index("탑페어+"), n_live, grp="셋")
+test("score_result(묶음): 보인 묶음 포함 여부 + 화면/모델 확률",
+     m3["sum_in"] is True and m4["sum_in"] is False and m3["sum_claim"] == 0.55 and m3["sum_model"] == 0.70, str(m3))
+_B = [ev.parse_card(c) for c in ("Ah", "7d", "2s")]
+test("combo_group: A72 에서 AsKd = A 탑페어", hr.combo_group(_B, ev.parse_card("As"), ev.parse_card("Kd")) == "A 탑페어")
+p6 = sr.parse_logged("HJ 콜: 예상 상위 22% (99-55 중 하나일 확률 약 40%) | 보드 기준: 중간·약한 페어 37% · 노페어 25%")
+test("parse_logged: 분류 이름 안의 '·'(중간·약한 페어)로 자르지 않는다",
+     p6["classes"] == {"중간·약한 페어": 37.0, "노페어": 25.0} and not p6["groups"], str(p6))
+p5 = sr.parse_logged("BTN 오픈: 예상 상위 20% | 보드 기준: A 탑페어 (AK, AQ, AJ) 30% · 플러시 드로우 (K♥, Q♥) 15% · 노페어 (KQ, KJ) 10%")
+test("parse_logged(묶음 표기): 묶음 이름(예시 괄호 뺌)·화면 %, covered = 합, 잘림 아님",
+     p5["groups"] == {"A 탑페어": 30.0, "플러시 드로우": 15.0, "노페어": 10.0} and p5["covered"] == 55.0
+     and not p5["classes"] and p5["truncated"] is False and p5["board"] is True, str(p5))
 
 # --- 6. 끝까지: 합성 폴더로 실행 ---------------------------------------------------------------------
 DEC = {"type": "decision", "id": "s-0001/1", "t": 2.0, "hand_id": "s-0001", "street": "flop", "stack_bb": 100,

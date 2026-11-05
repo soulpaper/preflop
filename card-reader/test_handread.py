@@ -52,7 +52,8 @@ test("UTG 오픈+큰 c-bet: 노페어(에어) 급감", cb["classes"]["노페어"
 test("UTG 오픈+큰 c-bet: 중간·약한 페어 줄어듦", cb["classes"]["중간·약한 페어"] < base["classes"]["중간·약한 페어"] * 0.9,
      f"{base['classes']['중간·약한 페어']}% → {cb['classes']['중간·약한 페어']}%")
 test("UTG 오픈+큰 c-bet: 탑페어+ 가 최다 분류", max(cb["classes"], key=cb["classes"].get) == "탑페어+", str(cb["classes"]))
-test("UTG 오픈 summary 표준 표기 (AQo+ 포함, 외 N%)", "AQo" in cb["summary"] and "외" in cb["summary"], cb["summary"])
+test("UTG 오픈+c-bet 요약: 보드 기준 묶음 (A 탑페어 먼저, 예시에 AQ)",
+     cb["summary"].startswith("A 탑페어 (") and "AQ" in cb["summary"] and " 외 " not in cb["summary"], cb["summary"])
 
 # --- 2. BTN 림프/콜: 넓고 캡 ----------------------------------------------------------------
 limp = one({"pos": "BTN", "preflop": ["limp", "call"]}, [])
@@ -359,13 +360,73 @@ with hr.switches(mult_set="current"):   # 이 기대값은 current 배율 기준
     _xchk = one({"pos": "CO", "preflop": ["open"], "flop": ["check"]}, ["Kd", "8h", "3c"])
 test("체크: 탑페어+ 비중이 확실히 줄어듦 (체크한 상대의 탑페어+ 실측 13% vs 예측 25%)",
      cl(_xchk, "탑페어+") < cl(_xbase, "탑페어+") * 0.75, f"{cl(_xbase, '탑페어+'):.0f}% → {cl(_xchk, '탑페어+'):.0f}%")
-test("요약: 표기한 핸드의 모델 확률과 화면 확률(실측 보정, 5% 단위)",
-     cb["summary_pct"] is not None and cb["summary_hit_pct"] == int(5 * round(cb["summary_pct"] * hr.SUMMARY_CAL / 5))
-     and cb["summary_hit_pct"] < cb["summary_pct"], f"{cb['summary_pct']} / {cb['summary_hit_pct']}")
-_d0 = hr.describe(cb)[0]
-test("describe: '외 N%'(= 나머지 전부 덮는다는 오해) 대신 '중 하나일 확률 약 N%'",
-     "중 하나일 확률 약" in _d0 and " 외 " not in _d0 and f"약 {cb['summary_hit_pct']}%" in _d0, _d0)
-test("요약 코드 집합 = 표기 토큰을 펼친 것", set(cb["summary_codes"]) and all(len(c) in (2, 3) for c in cb["summary_codes"]))
+# 프리플랍 요약은 예전 그대로 (핸드코드 표기 + 실측 보정 확률). 포스트플랍은 아래 '보드 기준 묶음'.
+test("요약(프리플랍): 표기한 핸드의 모델 확률과 화면 확률(실측 보정, 5% 단위)",
+     p1["summary_pct"] is not None and p1["summary_hit_pct"] == int(5 * round(p1["summary_pct"] * hr.SUMMARY_CAL / 5))
+     and p1["summary_hit_pct"] < p1["summary_pct"], f"{p1['summary_pct']} / {p1['summary_hit_pct']}")
+_d0 = hr.describe(p1)[0]
+test("describe(프리플랍): '외 N%'(= 나머지 전부 덮는다는 오해) 대신 '중 하나일 확률 약 N%'",
+     "중 하나일 확률 약" in _d0 and " 외 " not in _d0 and f"약 {p1['summary_hit_pct']}%" in _d0, _d0)
+test("요약 코드 집합(프리플랍) = 표기 토큰을 펼친 것",
+     set(p1["summary_codes"]) and all(len(c) in (2, 3) for c in p1["summary_codes"]))
+
+# --- 포스트플랍: 보드 기준 묶음 (프리플랍 코드 목록 '22+, A9s+ …' 대신) -------------------------------------------
+_QT3 = ["Qh", "Th", "3d"]
+_c = lambda a, b: (ev.parse_card(a), ev.parse_card(b))
+_g = lambda b, a, c: hr.combo_group([ev.parse_card(x) for x in b], *_c(a, c))
+for _h, _want in ((("Ad", "Qs"), "Q 탑페어"), (("Kc", "Kd"), "오버페어"), (("3c", "3s"), "셋"), (("Qd", "Ts"), "투페어"),
+                  (("Jc", "Js"), "포켓페어"), (("Tc", "9s"), "T 페어"), (("3c", "As"), "3 페어"),
+                  (("Ah", "5h"), "플러시 드로우"), (("Kc", "Js"), "스트레이트 드로우"), (("9c", "8s"), "스트레이트 드로우"),
+                  (("5c", "4s"), "노페어")):
+    test(f"묶음 QT3 {_h[0]}{_h[1]} = {_want}", _g(_QT3, *_h) == _want, _g(_QT3, *_h))
+_P = ["3d", "Th", "Qh", "3h"]
+test("묶음: 페어 보드 3d Th Qh 3h — A3 = 트립스, AhKc = 플러시 드로우, AhKh = 플러시, Q9 = Q 탑페어",
+     _g(_P, "Ac", "3s") == "트립스" and _g(_P, "Ah", "Kc") == "플러시 드로우" and _g(_P, "Ah", "Kh") == "플러시"
+     and _g(_P, "Qd", "9c") == "Q 탑페어", (_g(_P, "Ac", "3s"), _g(_P, "Ah", "Kc"), _g(_P, "Ah", "Kh"), _g(_P, "Qd", "9c")))
+_RV = ["3d", "Th", "Qh", "3h", "Ah"]
+test("묶음(리버 4플러시): Kh 한 장 = 플러시, KK(하트 없음) = 오버페어가 아니라 '포켓페어'(A 아래), 리버엔 드로우 없음",
+     _g(_RV, "Kh", "2c") == "플러시" and _g(_RV, "Kc", "Kd") == "포켓페어" and _g(_RV, "Kc", "Jd") == "스트레이트",
+     (_g(_RV, "Kh", "2c"), _g(_RV, "Kc", "Kd"), _g(_RV, "Kc", "Jd")))
+_bycls = {}
+for _gr in cb["groups"]:
+    _bycls[_gr["class"]] = _bycls.get(_gr["class"], 0.0) + _gr["pct"]
+test("묶음은 7분류(CLASSES_POST)를 더 나눈 것: 묶음 확률을 분류별로 더하면 분류 확률",
+     all(abs(_bycls.get(n, 0.0) - p) < 0.5 for n, p in cb["classes"].items()), f"{_bycls} vs {cb['classes']}")
+_cbq = one({"pos": "CO", "preflop": ["open"], "flop": [{"a": "cbet", "size": 0.66}], "turn": [{"a": "cbet", "size": 0.66}]},
+           ["Qh", "Th", "3d", "3h"])
+_names = [g["name"] for g in _cbq["groups"]]
+test("포스트플랍 요약 = 이 보드의 묶음 이름 + 예시 + 화면 %, 최대 3묶음",
+     1 <= len(_cbq["summary_groups"]) <= hr.GROUPS_SHOWN and all(n in _cbq["summary"] for n in _cbq["summary_groups"])
+     and _cbq["summary_groups"] == _names[:len(_cbq["summary_groups"])], _cbq["summary"])
+test("묶음 예시는 그 묶음다운 패 (Q 탑페어 예시엔 Q, T 페어 예시엔 T)",
+     all("Q" in e for g in _cbq["groups"] if g["name"] == "Q 탑페어" for e in g["hands"])
+     and all("T" in e for g in _cbq["groups"] if g["name"] == "T 페어" for e in g["hands"]), str(_cbq["groups"][:4]))
+test("화면 묶음 확률 = 모델 x GROUP_CAL (5% 단위), 합이 summary_hit_pct",
+     _cbq["summary_hit_pct"] == sum(int(5 * round(g["pct"] * hr.GROUP_CAL / 5)) for g in _cbq["groups"]
+                                    if g["name"] in _cbq["summary_groups"]), _cbq["summary"])
+_dl = hr.describe(_cbq)
+test("describe(포스트플랍): 1줄 = 라벨+폭, 2줄 = '보드 기준: 묶음 …' (코드 목록·7분류 줄 없음)",
+     _dl[0].endswith("%") and "(" not in _dl[0] and _dl[1].startswith("보드 기준: ") and _cbq["summary"] in _dl[1]
+     and not any("중 하나일 확률" in ln for ln in _dl), "\n".join(_dl))
+_th = _cbq["top_hands"]
+_ex0 = set(_cbq["groups"][0]["hands"])
+test("포스트플랍 카드 그림: <=5, 정수 % >=1, 내림차순, 첫 묶음의 패가 들어 있다",
+     0 < len(_th) <= 5 and all(isinstance(p, int) and p >= 1 for _, p in _th)
+     and all(_th[i][1] >= _th[i + 1][1] for i in range(len(_th) - 1))
+     and any(c[:2] in _ex0 for c, _ in _th), f"{_th} / {_cbq['summary']}")
+test("포스트플랍 카드 그림 확률은 실측 보정 (TOP_CAL_POST < 1)", hr.TOP_CAL_POST < 1)
+
+# --- BB 체크(림프 팟 옵션) 범위: 레이즈했을 프리미엄은 거의 없다 (2026-11-06 라이브: 체크한 BB 에 'KK+' 가 맨 앞) ---------
+_bbx = one({"pos": "BB", "preflop": ["blind", "check"]}, [])
+test("BB 체크: AA·KK·QQ 비중 < 0.7% (균등이면 1.4%)", mass_of(_bbx, {"AA", "KK", "QQ"}) < 0.7,
+     f"{mass_of(_bbx, {'AA', 'KK', 'QQ'}):.2f}%")
+test("BB 체크: 요약 맨 앞이 KK+/AA 가 아니다", not _bbx["summary"].startswith(("KK", "AA", "QQ")), _bbx["summary"])
+_bbr = one({"pos": "BB", "preflop": ["blind", "check"], "flop": ["check"],
+            "turn": [{"a": "bet", "size": 1.4}, {"a": "call", "size": 0.55}], "river": ["check"]},
+           ["7d", "Jc", "9h", "5h", "Qd"], dead=["8c", "6c"])
+test("BB 체크 → 리버: 보인 묶음 예시에 KK/AA 없음, 오버페어가 1순위 아님",
+     "KK" not in _bbr["summary"] and "AA" not in _bbr["summary"] and _bbr["summary_groups"][0] != "오버페어",
+     _bbr["summary"])
 
 # --- 상대 유형(유저 정보 팝업 LAG/LP/TAG/TP) 포스트플랍 보정 -------------------------------------------------
 _sw_style = hr.switches(style_strength=1.0)   # 아래 유형 시험은 세기 1.0 (e815500) 기준
