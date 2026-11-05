@@ -652,7 +652,8 @@ def upload_failure_keeps_runner_safe():
             with open(cfg_path, "w") as f:
                 json.dump(cfg, f)
             return subprocess.run([sys.executable, "-I", os.path.join(HERE, "gto_dist_sync.py"), "--config", cfg_path],
-                                  capture_output=True, text=True, env=env, timeout=120)
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                  env={**env, "PYTHONUTF8": "1"}, timeout=120)
 
         st0 = tree_state(e.src)
         p = run_cli(e.up_cfg(url="http://127.0.0.1:%d" % closed_port()))
