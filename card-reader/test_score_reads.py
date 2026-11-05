@@ -548,6 +548,34 @@ _zsc = sr.score_result(_zres, _zk, "43s", _zy, 45 * 44 // 2)
 test("score_result: 긴 공격 라인에서 약한 페어 실제 패 zero=False, p>0",
      _zsc["zero"] is False and _zsc["p"] > 0 and hr.CLASSES_POST[_zy] == "중간·약한 페어", str(_zsc["p"]))
 
+# --- 8. 기록 줄 형식 판별·형식별 집계 (예전 7분류 vs 새 묶음) -----------------------------------------------
+_old = "CO 오픈: 예상 상위 12% | 보드 기준: 탑페어+ 40% · 중간·약한 페어 30% · 노페어 12%"
+_new = "BTN 오픈: 예상 상위 20% | 보드 기준: A 탑페어 (AK, AQ) 30% · 플러시 드로우 (K♥) 15%"
+_new1 = "BTN 오픈: 예상 상위 20% | 보드 기준: 오버페어 (AA, KK) 30%"
+_pre = "BB 블라인드: 예상 상위 87% (22+, A2s+) | 프리플랍 기준: 기타 68% · 브로드웨이 15%"
+test("parse_logged fmt: 예전 7분류 / 새 묶음 / 프리플랍 분류 / 기준 없음",
+     sr.parse_logged(_old)["fmt"] == "classes" and sr.parse_logged(_new)["fmt"] == "groups"
+     and sr.parse_logged(_new1)["fmt"] == "groups" and sr.parse_logged(_pre)["fmt"] == "classes"
+     and sr.parse_logged("BTN 오픈: 예상 상위 7%")["fmt"] is None and sr.parse_logged(None)["fmt"] is None)
+_row = {"kind": "cbet_big", "family": "bet", "live": {"cls_p": 0.3}}
+_lo = sr.score_logged(_old, "h1", "V", "flop", "AsKd", "탑페어+", _row, "A 탑페어")
+_ln = sr.score_logged(_new, "h2", "V", "flop", "AsKd", "탑페어+", _row, "A 탑페어")
+_ln2 = sr.score_logged(_new, "h3", "V", "turn", "2s3d", "노페어", _row, "노페어")
+test("score_logged: 줄마다 fmt 기록", _lo["fmt"] == "classes" and _ln["fmt"] == "groups" and _ln2["fmt"] == "groups")
+test("score_logged: 형식별 적중 판정", _lo["in_top3"] and _lo["top1"] and _ln["in_top3"] and _ln["top1"] and not _ln2["in_top3"])
+_lg = sr._logged_by_street([_lo, _ln, _ln2])
+_g = {f: sr._logged_by_street([x for x in [_lo, _ln, _ln2] if x["fmt"] == f]) for f in ("classes", "groups")}
+test("형식별 집계가 분리된다", _g["classes"]["flop"]["n"] == 1 and _g["groups"]["flop"]["n"] == 1
+     and "turn" not in _g["classes"] and _g["groups"]["turn"]["in_top3"] == 0.0
+     and _lg["flop"]["n"] == 2)
+_s8 = sr.summarize([], [_lo, _ln, _ln2], {})
+test("summarize: logged 는 형식 키 아래, 합산은 따로 표시",
+     list(_s8["logged"]) == ["classes", "groups"] and _s8["logged"]["groups"]["flop"]["n"] == 1
+     and "섞인 합산" in _s8["logged_mixed_total"]["_note"])
+_s8b = sr.summarize([], [_lo], {})
+test("summarize: 한 형식뿐이면 합산 없음", list(_s8b["logged"]) == ["classes"] and "logged_mixed_total" not in _s8b)
+test("summarize: top5 의미 표시", "top5" in _s8["top5_note"] and "f67f1b4" in _s8["top5_note"])
+
 # --- 결과 ---------------------------------------------------------------------------------------
 failed = 0
 for ok, name, info in results:
