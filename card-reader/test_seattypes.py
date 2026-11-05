@@ -273,7 +273,7 @@ def test_synthetic_run_writes_no_names():
                 tps.observe(self.names, snap, self.t)
                 orig = self.tr.update
 
-                def upd(state, hero, board, nm, t, shown=None):
+                def upd(state, hero, board, nm, t, shown=None, **kw):
                     return orig(state, hero, board, tps.full_names(nm), t, shown=shown, types=tps.for_log())
                 self.tr.update = upd
                 try:

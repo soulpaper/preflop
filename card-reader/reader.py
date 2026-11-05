@@ -4695,14 +4695,21 @@ class App:
             except Exception:
                 texts = [rs]
             fit = next((t for t in texts if tx + self.measure(t, FS_SMALL) <= x - s(8)), None)
+            calm = "정상" in rs or "꺼짐" in rs
+            col = MUTED if calm else WARN
+            tip = (f"{rs} · 핸드·결정 기록(닉네임 없음)을 분석용 서버로 보냅니다. 핸드가 끝나면 1분 뒤, 그 밖에는 "
+                   "15분마다 · 대기 = 네트워크가 안 돼 다음에 다시 보냄 · 멈춤 = 점검이 필요해 보내지 않음")
             if fit:
-                calm = "정상" in rs or "꺼짐" in rs
-                self.text(c, tx, y + h / 2, fit, FS_SMALL, fill=MUTED if calm else WARN, anchor="w", tags="rec_sync")
-                c.tag_bind("rec_sync", "<Enter>", lambda e: self.tip.show(
-                    f"{rs} · 핸드·결정 기록(닉네임 없음)을 분석용 서버로 보냅니다. 핸드가 끝나면 1분 뒤, 그 밖에는 "
-                    "15분마다 · 대기 = 네트워크가 안 돼 다음에 다시 보냄 · 멈춤 = 점검이 필요해 보내지 않음",
-                    e.x_root, e.y_root), add="+")
-                c.tag_bind("rec_sync", "<Leave>", lambda e: self.tip.hide(), add="+")
+                self.text(c, tx, y + h / 2, fit, FS_SMALL, fill=col, anchor="w", tags="rec_sync")
+            else:  # 제목 옆에 안 들어가면 버튼 줄 바로 아래 자기 줄에 전체 문구 (항상 보이게)
+                y += h + s(4)
+                dot = s(5)
+                c.create_oval(P, y + s(9) - dot, P + 2 * dot, y + s(9) + dot, fill=col, outline="", tags="rec_sync")
+                lt = next((t for t in texts if P + 2 * dot + s(6) + self.measure(t, FS_SMALL) <= W - P), texts[-1])
+                self.text(c, P + 2 * dot + s(6), y + s(9), lt, FS_SMALL, fill=col, anchor="w", tags="rec_sync")
+                y += s(22) - h - s(8)  # 이어지는 버튼 줄은 이 줄 아래에서 시작
+            c.tag_bind("rec_sync", "<Enter>", lambda e: self.tip.show(tip, e.x_root, e.y_root), add="+")
+            c.tag_bind("rec_sync", "<Leave>", lambda e: self.tip.hide(), add="+")
         y += h + s(8)
         # 헤더 버튼: 카드 = 카드 영역 지정, 숫자 = 숫자 영역 지정, 학습 = 카드 학습
         x = P

@@ -419,6 +419,8 @@ def main():
             app.render(force=True)
             app.root.update()
             want = set(app.records_sync.status_texts())
+            if t is not None:
+                want.add(t)  # 자리가 좁으면 전체 문구가 자기 줄에 그려진다
             drawn = [app.canvas.itemcget(i, "text") for i in app.canvas.find_all()
                      if app.canvas.type(i) == "text" and app.canvas.itemcget(i, "text") in want]
             if t is not None and not drawn:
