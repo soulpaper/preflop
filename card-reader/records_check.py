@@ -887,7 +887,9 @@ def check_body(name, body, accept=(FILTER_V, FILTER_V)):
     return check_bytes(kind, body, accept)
 
 
-def check_bytes(kind, body, accept=(FILTER_V, FILTER_V)):
+def check_bytes(kind, body, accept=(FILTER_V, FILTER_V), line_check=None):
+    """line_check: check_line 대신 쓸 함수 (같은 인자 → 같은 결과여야 함. 업로더가 이미 검사한 줄의 결과를 다시 쓸 때)."""
+    line_check = line_check or check_line
     if len(body) > MAX_BODY:
         return Verdict("too_large", "file_too_large")
     if len(body) == 0:
@@ -899,7 +901,7 @@ def check_bytes(kind, body, accept=(FILTER_V, FILTER_V)):
         return Verdict("too_large", "too_many_lines")
     first = None
     for i, line in enumerate(body[:-1].split(b"\n"), 1):
-        v = check_line(kind, line, accept)
+        v = line_check(kind, line, accept)
         v.line = i
         if v.cls == "block":
             v.lines = n

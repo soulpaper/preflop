@@ -123,7 +123,9 @@ CHANGE_TOL = 16.0      # stable.distance 허용치 (반짝임/1px 흔들림 < �
 SIG_SIDE = 64          # (stable.py가 없을 때) 축소 이미지 긴 변
 SIG_TOL = (6.0, 48, 0.006)  # (stable.py가 없을 때) (평균 차이, 픽셀 차이 기준, 그 기준을 넘는 픽셀 비율)
 SETTLE_MAX = 3         # 계속 움직이는 영역도 이 주기마다 한 번은 다시 읽음
-STATE_INTERVAL = 1.0   # 테이블 상태 읽기 주기 (초)
+STATE_INTERVAL = 1.0   # 테이블 상태 읽기 주기 (초): 읽기·추적에 걸린 시간을 빼고 잔다 (예전엔 주기가 1초 + 일한 시간)
+BAR_POLL = 0.08        # 기다리는 동안 액션 바 자리만 이 간격으로 찍어 봄 (버튼이 나타나면 1초를 기다리지 않고 바로 읽기)
+STATE_MIN_GAP = 0.25   # 액션 바 변화로 일찍 읽어도 지난 읽기에서 이만큼은 띄움
 STATE_REFRESH = 5.0    # 화면이 그대로여도 이 시간마다 다시 읽음
 TOURNEY_INTERVAL = 5.0  # 토너먼트 머리글(총 상금 / 내 순위) 읽기 주기 (초): 순위는 천천히 바뀜
 TOURNEY_REFRESH = 60.0  # 머리글 화면이 그대로여도 이 시간마다 다시 읽음
@@ -2463,19 +2465,23 @@ class App:
         같은 스레드에서 닉네임 읽기 · 핸드 기록 · 상대 통계 · (내 차례에만) 상대 핸드 리딩 · 기록 모드도 처리 — 실패해도 앱은 계속."""
         steady = Steady(settle=False)
         last, last_read, last_rect = None, 0.0, None
+        bar = {"t": None}
         self.init_tracking()
         with MSS() as sct:
             while not self.closed:
-                time.sleep(STATE_INTERVAL)
+                self.state_wait(sct, bar)
+                bar["t"] = time.perf_counter()
                 rect, calib = self.cfg.get("table"), self.cfg.get("layout")
                 if not (rect and calib):
                     last = None
+                    bar["box"] = None
                     continue
                 try:
                     if rect != last_rect:
                         steady.reset()
                         last, last_rect = None, list(rect)
                     img = grab(sct, rect)
+                    self.bar_ref(bar, rect, calib, img)
                     changed = steady.check("table", img)
                     now = time.time()
                     if changed or last is None or now - last_read > STATE_REFRESH:
@@ -2490,6 +2496,58 @@ class App:
                     self.track_frame(img, calib, last, now)
                 except Exception:
                     self.log_once("track_frame")
+
+    @staticmethod
+    def bar_ref(bar, rect, calib, img):
+        """방금 읽은 게임 창 이미지에서 액션 바(폴드·콜·레이즈 버튼 자리) 요약을 기준으로 기억 (state_wait 가 비교)."""
+        boxes = [b for b in ((calib.get("action_bar") or {}).get(k) for k in ("fold", "call", "raise"))
+                 if isinstance(b, (list, tuple)) and len(b) == 4]
+        if not boxes:
+            bar["box"] = None
+            return
+        H, W = img.shape[:2]
+        x0 = max(0, int(min(b[0] for b in boxes)))
+        y0 = max(0, int(min(b[1] for b in boxes)))
+        x1 = min(W, int(max(b[0] + b[2] for b in boxes)))
+        y1 = min(H, int(max(b[1] + b[3] for b in boxes)))
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            bar["box"] = None
+            return
+        bar["box"] = (rect[0] + x0, rect[1] + y0, x1 - x0, y1 - y0)
+        bar["ref"] = signature(img[y0:y1, x0:x1])
+        bar["prev"] = None
+
+    def state_wait(self, sct, bar):
+        """다음 테이블 읽기까지 기다림: 지난 읽기 시작에서 STATE_INTERVAL 뒤 (읽기·추적에 걸린 시간만큼 덜 잔다).
+        그 사이 액션 바 자리만 BAR_POLL 마다 찍어서, 지난 읽기와 '의미 있게' 달라진 뒤 멈추면 (버튼이 나타나거나 사라짐,
+        미리 선택 버튼) 바로 읽는다 → 내 차례가 최대 1초 늦게 잡히던 것을 줄임. 움직이는 중(나타나는 애니메이션)엔 기다림."""
+        t0 = bar.get("t")
+        if t0 is None:
+            time.sleep(STATE_INTERVAL)
+            return
+        due = t0 + STATE_INTERVAL
+        # 일찍 읽은 바로 다음에는 간격을 2배로 (바가 계속 움직여도 0.25초마다 읽지 않게. 미리 선택 → 내 차례는 그대로 빨리)
+        gap, bar["early"] = STATE_MIN_GAP * (2 if bar.get("early") else 1), False
+        while not self.closed:
+            now = time.perf_counter()
+            if now >= due:
+                return
+            box = bar.get("box")
+            if box is None:
+                time.sleep(due - now)
+                return
+            time.sleep(min(BAR_POLL, due - now))
+            if time.perf_counter() - t0 < gap:
+                continue
+            try:
+                sig = signature(grab(sct, box))
+            except Exception:
+                bar["box"] = None
+                continue
+            prev, bar["prev"] = bar.get("prev"), sig
+            if sig_changed(bar.get("ref"), sig) and prev is not None and not sig_changed(prev, sig):
+                bar["early"] = True
+                return
 
     # --- 추적: 이름 · 핸드 기록 · 프로필 · 상대 핸드 리딩 · 기록 모드 (상태 스레드) ---------------------
     def init_tracking(self):

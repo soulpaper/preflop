@@ -18,6 +18,11 @@ FIRST_DELAY = 15        # 앱 시작 뒤 밀린 기록을 올리기까지 (창�
 DEBOUNCE_SEC = 60       # 핸드가 끝난 뒤 이만큼 기다렸다가 한 번 (빠른 핸드 여러 개 → 한 번)
 DEFAULT_INTERVAL = 900
 NAMES_MAX = 2000        # 이번 실행에서 본 닉네임 (메모리 전용, known_name 검사용)
+# 기록 거르기(records_sync.build_body)는 순수 파이썬이라 도는 동안 GIL 을 잡는다. 예전엔 핸드가 끝날 때마다 7일치 파일 전체
+# (약 8MB, 20~30초 CPU)를 다시 걸러서 그동안 화면 읽기(내 차례 감지)·그리기가 몇 초씩 멈췄다 (실측: 상태 읽기 간격 최대 15초).
+# 이제 줄별 결과를 기억(LineCache)해 새 줄만 거르고, 새로 거를 때도 PACE_BUSY 만큼 일하면 그만큼 x PACE_REST 쉰다.
+PACE_BUSY = 0.02
+PACE_REST = 2.0
 
 PREFIX = "기록 전송: "
 STOPPED = ("disabled", "blocked", "blocked_rule", "nickname_field", "scrub_not_done", "hands_is_link")
@@ -61,6 +66,8 @@ class Syncer:
         self.runs = 0
         self.status = None          # 화면용 짧은 글자 (None = 아직 없음)
         self.logged = set()         # 이미 debug.log 에 적은 실패 (성공하면 비움): 같은 실패는 한 번만
+        self.line_cache = RS.LineCache()   # 줄별 거르기 결과 (메모리 전용, 주기 사이에 다시 씀)
+        self._busy_t0 = None
 
     # --- 수명 ------------------------------------------------------------------
     def start(self):
@@ -157,7 +164,9 @@ class Syncer:
         iv = cfg.get("interval_sec", DEFAULT_INTERVAL)
         if isinstance(iv, (int, float)) and iv > 0:
             self.interval = iv
-        up = RS.Uploader(self.base, cfg, on_error=self._on_error, extra_names=self.names_now)
+        self._busy_t0 = time.perf_counter()
+        up = RS.Uploader(self.base, cfg, on_error=self._on_error, extra_names=self.names_now,
+                         line_cache=self.line_cache, pace=self._pace)
         code = up.cycle()
         result = str(getattr(up, "last_result", "") or "")
         if code == 0:
@@ -179,6 +188,20 @@ class Syncer:
             self._fail(result, "일부 실패 · " + time.strftime("%H:%M"), "%s (code 1)" % result)
         else:
             self._fail(result, "오류", "%s (code %s)" % (result, code))
+
+    def _pace(self):
+        """새 줄을 거를 때마다: PACE_BUSY 초 넘게 일했으면 그 PACE_REST 배만큼 잔다 (GIL 을 화면 읽기·그리기에 넘김).
+        끄는 중이면 쉬지 않는다."""
+        t0 = self._busy_t0
+        now = time.perf_counter()
+        if t0 is None:
+            self._busy_t0 = now
+            return
+        busy = now - t0
+        if busy >= PACE_BUSY:
+            if not self.stop_ev.is_set():
+                self.stop_ev.wait(busy * PACE_REST)
+            self._busy_t0 = time.perf_counter()
 
     def _on_error(self, src, what, *a):
         """records_sync 의 알림. 규칙 이름·파일 이름·줄 번호만 (필드 경로는 이름일 수 있어 뺀다)."""

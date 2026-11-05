@@ -207,6 +207,18 @@ class NameSet:
     def __len__(self):
         return len(self.sub) + len(self.seq)
 
+    def key(self):
+        """검사 항목 전체 (LineCache 가 '이 줄은 어느 항목들로 이미 검사했나'를 기억할 때)."""
+        return frozenset(self.sub), frozenset(self.seq.items())
+
+    def minus(self, done):
+        """done(key())에 없는 항목만 가진 NameSet. hit 는 항목별 판정의 OR 이므로
+        hit(self) == hit(done 의 항목) or hit(self.minus(done)) — done 으로 이미 통과한 줄은 나머지만 보면 된다."""
+        part = NameSet()
+        part.sub = self.sub - done[0]
+        part.seq = {k: v for k, v in self.seq.items() if (k, v) not in done[1]}
+        return part
+
     def hit(self, mode, s):
         if type(s) is not str:
             return False
@@ -254,9 +266,92 @@ def _prefix(raw, line):
     return raw[:pos + 1]
 
 
-def build_body(name, raw, extra_names=None, stats=None):
+def _line_result(kind, V, ln):
+    """원본 한 줄(개행·CR 뺀 바이트, 비어 있지 않음)의 필터 결과. 이름 검사만 빼면 줄 내용에만 달려 있다:
+      ("drop", 통계 또는 None)                          — 뺀 줄
+      ("block", 규칙, 경로)                              — 차단 (줄 번호는 부른 쪽이 붙임)
+      ("ok", 본문 줄, 통계, 이름 검사 문자열, 판정 필드)    — 판정 필드 = 본문 줄의 check_line 결과 (check_bytes 재사용)
+    통계 = (버린 키 수, 경로별 버린 수, 버린 값 수, 경로별 버린 값 수) — filter_record 가 Counter 에 더하는 것만 따로 모음."""
+    try:
+        text = ln.decode("utf-8")
+    except UnicodeDecodeError:
+        return ("drop", None)
+    if RC._too_deep(text):
+        return ("drop", None)
+    try:
+        rec = RC.parse_line(text)
+    except (ValueError, RecursionError):
+        return ("drop", None)
+    if not isinstance(rec, RC.Obj):
+        return ("drop", None)
+    dp = RC.dup_path(rec)
+    if dp is not None:
+        return ("block", "dup_key", dp)
+    paths, vst = collections.Counter(), {"values": 0, "vpaths": collections.Counter()}
+    try:
+        rec, dk = RC.filter_record(kind, rec, paths, vst)
+    except RC.FilterBlock as fb:
+        return ("block", fb.rule, fb.path)
+    st = (dk, tuple(paths.items()), vst["values"], tuple(vst["vpaths"].items()))
+    try:
+        data = _dump(rec).encode("utf-8")
+    except UnicodeEncodeError:
+        return ("drop", st)
+    v = RC.check_line(kind, data, (V, V))
+    if v.cls == "block":
+        return ("block", v.rule, v.path)
+    if v.cls == "format":
+        return ("drop", st)
+    return ("ok", data, st, tuple(RC.name_check_strings(kind, rec)), (v.cls, v.rule, v.line, v.path, v.lines))
+
+
+class LineCache:
+    """build_body 의 줄별 결과 기억 (메모리 전용, 디스크에 쓰지 않음). 앱 안 업로더(records_auto)가 주기마다 같은 기록 파일
+    전체를 다시 거르느라 수십 초 동안 CPU(GIL)를 잡아 화면 읽기가 멈추던 것을 없앤다: 바뀌지 않은 줄은 다시 거르지 않고,
+    이름 검사는 그 줄을 아직 검사하지 않은 이름 항목만 본다. 결과는 캐시 없이 거른 것과 같다 (줄 결과는 줄 바이트·필터 판에만
+    달려 있고, 이름 검사는 항목별 OR).
+    키는 줄 바이트 그대로 (해시 충돌 없음). 한 주기(sweep 사이)에 쓰이지 않은 줄은 버린다."""
+
+    def __init__(self, max_bytes=192 * 1024 * 1024):
+        self.max_bytes = max_bytes
+        self.lines = {}      # (kind, V, 줄 바이트) -> [결과, 마지막으로 쓴 주기, 이름 검사한 항목(NameSet.key) 또는 None]
+        self.size = 0
+        self.gen = 0
+        self.hits = self.misses = 0
+
+    def get(self, kind, V, ln):
+        e = self.lines.get((kind, V, ln))
+        if e is not None:
+            e[1] = self.gen
+            self.hits += 1
+        return e
+
+    def put(self, kind, V, ln, res):
+        self.misses += 1
+        cost = 200 + len(ln)
+        if res[0] == "ok":
+            cost += len(res[1]) + sum(len(t) + 50 for _, t in res[3])
+        if self.size + cost > self.max_bytes:
+            self.lines.clear()
+            self.size = 0
+        e = self.lines[(kind, V, ln)] = [res, self.gen, None]
+        self.size += cost
+        return e
+
+    def sweep(self):
+        """한 주기 끝: 이번·지난 주기에 쓰지 않은 줄(창 밖으로 나간 파일 등)을 버리고 다음 주기로."""
+        old = [k for k, e in self.lines.items() if e[1] < self.gen - 1]
+        for k in old:
+            del self.lines[k]
+        if old:
+            self.size = sum(200 + len(k[2]) for k in self.lines)   # 대략값 (상한 판단용)
+        self.gen += 1
+
+
+def build_body(name, raw, extra_names=None, stats=None, cache=None, pace=None):
     """원본 바이트 -> (본문 바이트 또는 None, 줄 수, 뺀 줄 수). 차단이면 Block.
-    stats(dict)가 있으면 필터가 버린 키 수 "keys"와 경로별 Counter "paths"를 더한다 (값 없음)."""
+    stats(dict)가 있으면 필터가 버린 키 수 "keys"와 경로별 Counter "paths"를 더한다 (값 없음).
+    cache(LineCache): 줄별 결과를 다시 씀 (결과는 같음). pace(): 새로 거른 줄마다 부름 (앱 안에서 CPU 를 양보할 때)."""
     V = RC.FILTER_V
     if stats is not None:
         stats.setdefault("values", 0)
@@ -265,6 +360,9 @@ def build_body(name, raw, extra_names=None, stats=None):
     cut = raw.rfind(b"\n")
     raw = raw[:cut + 1]
     ns = extra_names if isinstance(extra_names, NameSet) else NameSet(extra_names)
+    nskey = ns.key() if (ns and cache is not None) else None
+    parts = {}    # id(이미 검사한 항목) -> (남은 NameSet, 합친 항목, 원래 항목)
+    verdicts = {}  # 본문 줄 -> check_line 판정 필드 (check_bytes 에서 다시 계산하지 않게)
     out, dropped = [], 0
     if not raw:
         return None, 0, 0
@@ -273,49 +371,55 @@ def build_body(name, raw, extra_names=None, stats=None):
             ln = ln[:-1]
         if not ln:
             continue
-        try:
-            text = ln.decode("utf-8")
-        except UnicodeDecodeError:
+        ent = cache.get(kind, V, ln) if cache is not None else None
+        if ent is None:
+            res = _line_result(kind, V, ln)
+            ent = cache.put(kind, V, ln, res) if cache is not None else [res, 0, None]
+            if pace is not None:
+                pace()
+        res = ent[0]
+        tag = res[0]
+        if tag == "block":
+            raise Block(res[1], res[2], i, name)
+        st = res[1] if tag == "drop" else res[2]
+        if st is not None and stats is not None:
+            stats["keys"] += st[0]
+            for p, c in st[1]:
+                stats["paths"][p] += c
+            stats["values"] += st[2]
+            for p, c in st[3]:
+                stats["vpaths"][p] += c
+        if tag == "drop":
             dropped += 1
             continue
-        if RC._too_deep(text):
-            dropped += 1
-            continue
-        try:
-            rec = RC.parse_line(text)
-        except (ValueError, RecursionError):
-            dropped += 1
-            continue
-        if not isinstance(rec, RC.Obj):
-            dropped += 1
-            continue
-        dp = RC.dup_path(rec)
-        if dp is not None:
-            raise Block("dup_key", dp, i, name)
-        try:
-            rec, dk = RC.filter_record(kind, rec, stats["paths"] if stats is not None else None, stats)
-        except RC.FilterBlock as fb:
-            raise Block(fb.rule, fb.path, i, name)
-        if stats is not None:
-            stats["keys"] += dk
-        try:
-            data = _dump(rec).encode("utf-8")
-        except UnicodeEncodeError:
-            dropped += 1
-            continue
-        v = RC.check_line(kind, data, (V, V))
-        if v.cls == "block":
-            raise Block(v.rule, v.path, i, name)
-        if v.cls == "format":
-            dropped += 1
-            continue
-        if ns and any(ns.hit(m, t) for m, t in RC.name_check_strings(kind, rec)):
-            raise Block("known_name", "", i, name)
+        data, strings = res[1], res[3]
+        if ns:
+            if nskey is None:
+                hit = any(ns.hit(m, t) for m, t in strings)
+            else:
+                done = ent[2]
+                if done is None:
+                    part, merged = ns, nskey
+                else:
+                    pm = parts.get(id(done))
+                    if pm is None:
+                        pm = parts[id(done)] = (ns.minus(done), (done[0] | nskey[0], done[1] | nskey[1]), done)
+                    part, merged = pm[0], pm[1]
+                hit = bool(part) and any(part.hit(m, t) for m, t in strings)
+                if not hit:
+                    ent[2] = merged
+            if hit:
+                raise Block("known_name", "", i, name)
+        verdicts[data] = res[4]
         out.append(data + b"\n")
     if not out:
         return None, 0, dropped
     body = b"".join(out)
-    v = RC.check_bytes(kind, body, (V, V))
+
+    def line_check(k, line, accept):
+        f = verdicts.get(line) if k == kind and accept == (V, V) else None
+        return RC.Verdict(*f) if f is not None else RC.check_line(k, line, accept)
+    v = RC.check_bytes(kind, body, (V, V), line_check=line_check)
     if v.cls == "too_large":
         raise FileError(v.rule)
     if not v.ok():
@@ -437,8 +541,11 @@ def _same_file(st, ident):
 
 
 class Uploader:
-    def __init__(self, base, cfg, on_error=None, extra_names=None, today=None, require_audit=True):
+    def __init__(self, base, cfg, on_error=None, extra_names=None, today=None, require_audit=True,
+                 line_cache=None, pace=None):
         self.base, self.cfg = base, cfg
+        self.line_cache = line_cache  # LineCache (앱 안 업로더: 주기마다 같은 줄을 다시 거르지 않음), 없으면 매번 거름
+        self.pace = pace              # 새로 거른 줄마다 부름 (앱 안: 화면 읽기 스레드에 CPU 양보)
         self.require_audit = require_audit
         self._audit = None
         self.on_error = on_error or (lambda *a: None)
@@ -594,7 +701,7 @@ class Uploader:
                     continue
             stats = {"keys": 0, "paths": collections.Counter()}
             try:
-                body, lines, dropped = build_body(n, raw, ns, stats)
+                body, lines, dropped = build_body(n, raw, ns, stats, cache=self.line_cache, pace=self.pace)
             except Block as b:
                 b.file = n
                 if b.rule != "known_name":
@@ -624,6 +731,8 @@ class Uploader:
                 continue
             self.keystats[n] = extra_ent
             res[n] = (body, lines, dropped)
+        if self.line_cache is not None:
+            self.line_cache.sweep()
         return res
 
     # 네트워크

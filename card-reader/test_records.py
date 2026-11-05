@@ -2912,5 +2912,62 @@ class T62_NameHold(unittest.TestCase):
 _MISSING = object()
 
 
+class T63_LineCache(unittest.TestCase):
+    """앱 안 업로더의 줄별 기억(LineCache): 캐시 없이 거른 것과 결과(본문·줄 수·뺀 줄·통계·차단 규칙과 줄 번호)가 같다.
+    이름이 늘거나 바뀌어도, 파일이 뒤로 자라도."""
+
+    @staticmethod
+    def _run(name, raw, names, cache=None):
+        st = {"keys": 0, "paths": collections.Counter()}
+        try:
+            r = RS.build_body(name, raw, names, st, cache=cache)
+            return ("ok", r, st["keys"], dict(st["paths"]), st["values"], dict(st["vpaths"]))
+        except (RS.Block, RS.FileError) as e:
+            return ("err", type(e).__name__, getattr(e, "rule", None), getattr(e, "line", None))
+
+    def test_63_same_as_uncached(self):
+        lines = [dline(1, extra=',"advice":{"reason":"fine"}'), b"{broken\n", RAW_EXTRA_DEC.rstrip(b"\n") + b"\n",
+                 dline(4, extra=',"advice":{"reason":"x synthnick01 y"}'), dline(5, typ="resolution"),
+                 dline(6, extra=',"advice":{"reason":"\\ud14c\\uc2a4\\ud2b8\\ub2c9 \\uc785\\ub2c8\\ub2e4"}')]
+        full = b"".join(lines)
+        half = b"".join(lines[:3])
+        hand = RAW_EXTRA_HAND + hline(2) + hline(3)
+        cache = RS.LineCache()
+        seqs = (None, ["Jack"], ["Jack", "Zelda"], ["Zelda", NICK], ["Jack"], ["테스트닉"], ["Jack", "Zelda", "테스트닉", NICK], [])
+        seen_block = set()
+        for names in seqs:
+            for name, raw in ((D0, half), (D0, full), (D1, hand)):
+                want = self._run(name, raw, names)
+                got = self._run(name, raw, names, cache)
+                self.assertEqual(got, want, (names, name, len(raw)))
+                if want[0] == "err":
+                    seen_block.add((want[2], want[3]))
+            cache.sweep()
+        self.assertIn(("known_name", 4), seen_block)    # 영문 닉네임: 4번째 줄
+        self.assertIn(("known_name", 6), seen_block)    # 한글 닉네임 (부분 일치): 6번째 줄
+        self.assertGreater(cache.hits, 0)
+
+    def test_63_check_bytes_line_check_hook(self):
+        body = RS.build_body(D0, dline(1) + dline(2, typ="resolution"))[0]
+        calls = []
+
+        def lc(k, line, accept):
+            calls.append(line)
+            return RC.check_line(k, line, accept)
+        a = RC.check_bytes(RC.file_kind(D0), body)
+        b = RC.check_bytes(RC.file_kind(D0), body, line_check=lc)
+        self.assertEqual((a.cls, a.rule, a.lines), (b.cls, b.rule, b.lines))
+        self.assertEqual(len(calls), 2)
+
+    def test_63_sweep_drops_unused(self):
+        cache = RS.LineCache()
+        RS.build_body(D1, hline(1), None, cache=cache)
+        cache.sweep()
+        cache.sweep()
+        RS.build_body(D1, hline(2), None, cache=cache)
+        cache.sweep()
+        self.assertEqual(len(cache.lines), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

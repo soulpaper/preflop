@@ -8,6 +8,7 @@
 import asyncio
 import re
 import threading
+import time
 from collections import Counter
 
 import cv2
@@ -105,14 +106,35 @@ def read_jittered(crops):
 
 def read_texts(crops, suppress_warm=True):
     """{key: 이미지} → {key: [전처리별 OCR 문자열 3개]}. 백그라운드 스레드에서 호출.
-    suppress_warm: 따뜻한 색 픽셀을 지우고 읽음 (팟/스택 숫자용. 금색 블라인드 글자는 False)."""
-    return run_locked(_read_all(crops, suppress_warm))
+    suppress_warm: 따뜻한 색 픽셀을 지우고 읽음 (팟/스택 숫자용. 금색 블라인드 글자는 False).
+    영역(키, read_jittered 의 (키, i) 는 키)마다 잠금을 놓고, 다른 스레드가 기다리면 먼저 쓰게 한다: 숫자 읽기 한 번
+    (영역 8개 x 잘림 5 x 전처리 3 ≈ 0.5초)이 잠금을 통째로 잡아 테이블 상태(벳 금액)·닉네임 읽기가 그만큼 밀렸다."""
+    groups = {}
+    for k, img in crops.items():
+        groups.setdefault(k[0] if isinstance(k, tuple) else k, {})[k] = img
+    out = {}
+    for i, part in enumerate(groups.values()):
+        if i and _WAITING[0] > 0:
+            time.sleep(0.002)   # 기다리는 스레드가 잠금을 잡을 틈
+        out.update(run_locked(_read_all(part, suppress_warm)))
+    return out
+
+
+_WAITING = [0]   # 잠금을 기다리는 스레드 수 (대략값 — 양보할지 판단에만 씀)
 
 
 def run_locked(coro):
     """OCR 코루틴 실행 (모든 모듈이 이 함수로 엔진을 써야 스레드끼리 안 겹침)."""
-    with _LOCK:
+    if not _LOCK.acquire(blocking=False):
+        _WAITING[0] += 1
+        try:
+            _LOCK.acquire()
+        finally:
+            _WAITING[0] -= 1
+    try:
         return asyncio.run(coro)
+    finally:
+        _LOCK.release()
 
 
 # --- 문자열 → 숫자 -------------------------------------------------------------
