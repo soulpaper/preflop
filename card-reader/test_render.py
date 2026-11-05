@@ -261,15 +261,25 @@ def type_cases(app):
             fails.append("type badge")
         layout_state(app, "rest")
         app.track = {"reads": None, "names": {}, "profiles": {}, "live": {}, "types": {},
-                     "prompt": {"seat": "seat_UR", "pos": "CO", "slot": "UR", "text": "CO 자리 캐릭터를 눌러 주세요",
-                                "sub": "(타입 확인 · 오른쪽 위)"}}
+                     "prompt": {"seat": "seat_UR", "pos": "CO", "slot": "UR", "text": "테스트닉네임 님을 눌러 주세요",
+                                "sub": "(CO · 오른쪽 위 · 타입 확인)"}}
         app.render(force=True)
         app.root.update()
         txt = canvas_text(app)
-        ok = "CO 자리 캐릭터를 눌러 주세요" in txt and "(타입 확인 · 오른쪽 위)" in txt
-        print("ok  " if ok else "FAIL", "타입 확인 안내 (폴드 뒤)")
+        ok = "테스트닉네임 님을 눌러 주세요" in txt and "(CO · 오른쪽 위 · 타입 확인)" in txt
+        print("ok  " if ok else "FAIL", "타입 확인 안내 (폴드 뒤, 이름)")
         if not ok:
             fails.append("type prompt")
+        for text, sub, label in (("테스트닉… 님을 눌러 주세요", "(CO · 오른쪽 위 · 타입 확인)", "잘린 이름"),
+                                 ("CO 자리 캐릭터를 눌러 주세요", "(타입 확인 · 오른쪽 위)", "이름 없음")):
+            app.track["prompt"] = {"seat": "seat_UR", "pos": "CO", "slot": "UR", "text": text, "sub": sub}
+            app.render(force=True)
+            app.root.update()
+            txt = canvas_text(app)
+            ok = text in txt and sub in txt
+            print("ok  " if ok else "FAIL", "타입 확인 안내 (" + label + ")")
+            if not ok:
+                fails.append("type prompt " + label)
     finally:
         app.track, app.table_state = saved
     return fails

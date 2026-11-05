@@ -33,6 +33,7 @@ EMPTY_READS = 2            # 빈자리가 이만큼 연속이면 떠난 것
 SAME_RATIO = 0.75          # 닉네임 글자 유사도가 이 이상이면 같은 사람 (OCR 오타)
 TABLE_MOVE_SEATS = 3       # 이 수 이상의 좌석이 짧은 시간에 바뀌면 테이블 이동/합치기
 TABLE_MOVE_WINDOW = 20.0
+NAME_SHOW_MAX = 8   # 안내에 보일 닉네임 최대 글자 수 (넘으면 … 로 줄임)
 PROMPT_HOLD = 8.0          # 안내한 좌석을 바꾸지 않고 유지하는 시간 (초)
 # 포스트플랍 행동 순서 (뒤일수록 나중에 행동 = 포지션이 좋음)
 POST_ORDER = ("SB", "BB", "UTG", "U1", "U2", "U3", "MP", "LJ", "HJ", "CO", "BTN")
@@ -303,8 +304,26 @@ class SeatTypes:
         rows.sort(key=lambda r: r[0])
         return [(k, pos, slot) for _, k, pos, slot in rows]
 
-    def prompt(self, state, live=None, t=None):
-        """지금 보여 줄 안내 {seat, pos, slot, text, sub} 또는 None (한 번에 한 좌석)."""
+    def shown_name(self, k, names=None):
+        """안내에 보여 줄 화면 닉네임 (메모리 전용 — 파일·로그·기록에 쓰지 않음). 없으면 None.
+        잘렸거나 짧게 줄인 이름은 끝에 '…'."""
+        nm = (names or {}).get(k)
+        if not (nm and nm[0]):
+            rec = self.seats.get(k)
+            nm = rec.name if rec is not None else None
+        if not (nm and str(nm[0]).strip()):
+            return None
+        base = str(nm[0]).strip().rstrip(".…‥").strip()
+        if not base:
+            return None
+        cut = bool(nm[1])
+        if len(base) > NAME_SHOW_MAX:
+            base, cut = base[:NAME_SHOW_MAX], True
+        return base + ("…" if cut else "")
+
+    def prompt(self, state, live=None, t=None, names=None):
+        """지금 보여 줄 안내 {seat, pos, slot, text, sub} 또는 None (한 번에 한 좌석).
+        이름을 알면 '테스트닉… 님을 눌러 주세요' + '(CO · 오른쪽 위 · 타입 확인)', 모르면 '자리' 문구."""
         try:
             if not self.idle(state):
                 self.prompt_seat = None
@@ -320,6 +339,10 @@ class SeatTypes:
                 self.prompt_seat, self.prompt_t = keys[0], t
             k, pos, slot = next(c for c in cands if c[0] == self.prompt_seat)
             where = SLOT_KO.get(slot)
+            nm = self.shown_name(k, names)
+            if nm:
+                sub = " · ".join(x for x in (pos, where, "타입 확인") if x)
+                return {"seat": k, "pos": pos, "slot": slot, "text": f"{nm} 님을 눌러 주세요", "sub": f"({sub})"}
             who = f"{pos} 자리" if pos else (f"{where} 자리" if where else "상대")
             sub = "타입 확인" + (f" · {where}" if pos and where else "")
             return {"seat": k, "pos": pos, "slot": slot, "text": f"{who} 캐릭터를 눌러 주세요", "sub": f"({sub})"}

@@ -2624,7 +2624,7 @@ class App:
                     if p is not None:
                         profiles[k] = p
                     seat_type[k] = {"known": types.known(k), "style": types.style(k)}
-            prompt = types.prompt(st, live, now)
+            prompt = types.prompt(st, live, now, names)
         reads = self.track.get("reads")
         if reads and reads["hero"] != tuple(hero):  # 새 핸드
             reads = None
@@ -4491,7 +4491,7 @@ class App:
         return y
 
     def draw_type_prompt(self, c, y, prompt):
-        """'CO 자리 캐릭터를 눌러 주세요' 안내 상자 (큰 글씨). 앱은 클릭하지 않는다 — 사용자가 직접 누름."""
+        """'테스트닉… 님을 눌러 주세요' 안내 상자 (큰 글씨). 앱은 클릭하지 않는다 — 사용자가 직접 누름."""
         s, W, P = self.s, self.s(self.W), self.s(self.P)
         y = self.section_title(c, y, W, P, "상대 타입 확인", "opp_type")
         top = y

@@ -180,7 +180,7 @@ def test_prompt_priority_and_once():
     assert set(order[:2]) == {"seat_UR", "seat_BR"}, order
     # 한 번에 한 좌석, 큰 글 안내 문구
     pr = st.prompt(s, live2, 10.0)
-    assert pr["seat"] == "seat_TC" and pr["text"] == "UTG 자리 캐릭터를 눌러 주세요" and "타입 확인" in pr["sub"], pr
+    assert pr["seat"] == "seat_TC" and pr["text"] == "User0… 님을 눌러 주세요" and "타입 확인" in pr["sub"], pr  # 잘린 이름 + …
     assert "위 가운데" in pr["sub"]
     # 유지: 우선순위가 바뀌어도 PROMPT_HOLD 동안은 같은 좌석
     live3 = {"seat_BL": {"preflop": ["blind", "raise"]}}
@@ -199,6 +199,54 @@ def test_prompt_priority_and_once():
     st.observe(NAMES, state(occupied=set(KEYS) - {"seat_UL"}), 51.0)
     st.observe(dict(NAMES, seat_UL=("Kilo", False)), state(**folded_hero), 52.0)
     assert st.prompt(state(**folded_hero), {}, 53.0)["seat"] == "seat_UL"
+
+
+def test_prompt_shows_name():
+    """이름을 알면 '누구를 누를지' (메모리 전용 화면 문구), 잘림/긴 이름은 …, 이름이 없으면 자리 문구."""
+    s = state(in_hand={"seat_TC"}, hero_folded=True, hero_in_hand=False)
+    pr = sty.SeatTypes().prompt(s, {}, 1.0, {"seat_TC": ("테스트닉네임", False)})
+    assert pr["seat"] == "seat_TC" and pr["text"] == "테스트닉네임 님을 눌러 주세요", pr
+    assert pr["sub"] == "(UTG · 위 가운데 · 타입 확인)", pr
+    pr = sty.SeatTypes().prompt(s, {}, 1.0, {"seat_TC": ("테스트닉", True)})   # 잘린 이름
+    assert pr["text"] == "테스트닉… 님을 눌러 주세요", pr
+    long_name = "가나다라마바사아자차카타"                                     # 너무 긴 이름은 줄임
+    pr = sty.SeatTypes().prompt(s, {}, 1.0, {"seat_TC": (long_name, False)})
+    assert pr["text"] == long_name[:sty.NAME_SHOW_MAX] + "… 님을 눌러 주세요", pr
+    for nm in ({}, {"seat_TC": ("", False)}, {"seat_TC": ("…", True)}, None):   # 이름 없음 → 자리 문구
+        pr = sty.SeatTypes().prompt(s, {}, 1.0, nm)
+        assert pr["text"] == "UTG 자리 캐릭터를 눌러 주세요", pr
+    st = sty.SeatTypes()   # observe 가 기억한 이름 사용
+    st.observe({"seat_TC": ("테스트닉네임", False)}, s, 1.0)
+    assert st.prompt(s, {}, 1.0)["text"] == "테스트닉네임 님을 눌러 주세요"
+
+
+def test_prompt_text_never_reaches_disk():
+    """안내 문구(닉네임 포함)는 화면 전용: 합성 실행 중 디스크에 쓰인 어떤 파일에도, 로그용 출력에도 없어야 함."""
+    import json
+    import os
+    import re
+    import tempfile
+    nick = "테스트닉네임"
+    s = state(in_hand={"seat_TC"}, hero_folded=True, hero_in_hand=False)
+    with tempfile.TemporaryDirectory() as d:
+        old = os.getcwd()
+        os.chdir(d)
+        try:
+            st = sty.SeatTypes()
+            st.observe({"seat_TC": (nick, False)}, s, 1.0)
+            pr = st.prompt(s, {}, 1.0, {"seat_TC": (nick, False)})
+            assert nick in pr["text"]
+            logged = json.dumps([st.for_log(), st.full_names({"seat_TC": (nick[:3], True)})], ensure_ascii=False)
+            assert "님을 눌러" not in logged and "캐릭터를 눌러" not in logged, logged
+            assert not os.listdir(d), "SeatTypes 는 파일을 만들지 않음"
+        finally:
+            os.chdir(old)
+    # 정적 확인: reader.py 에서 안내 문구(prompt)는 화면 상태(self.track) 와 그리기에만 쓰이고 로그·저장 호출에 없음
+    here = os.path.dirname(os.path.abspath(__file__))
+    src = open(os.path.join(here, "reader.py"), encoding="utf-8").read().splitlines()
+    for i, ln in enumerate(src, 1):
+        if re.search(r"\bprompt\b", ln) and re.search(r"log|write|dump|save|upload|record|json", ln, re.I):
+            assert "log_once" not in ln and "debug" not in ln.lower() and "dump" not in ln and "write" not in ln, (i, ln)
 
 
 def test_prompt_without_position():
