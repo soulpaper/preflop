@@ -180,13 +180,13 @@ def test_overlay_is_not_empty_seats():
         st.apply_popup(popup(nm[0] if not nm[1] else nm[0] + "999"), NAMES, 0.5)
     for i in range(10):   # 10초 동안 상대 모두 안 보임
         assert st.observe({}, state(occupied=set()), 1.0 + i) == []
-    assert all(st.known(k) for k in NAMES) and st.table_moves == 0
+    assert all(st.known(k) for k in NAMES) and st.resets == 0
     st.observe(NAMES, state(), 12.0)
     # 아주 오래 계속되면 (OVERLAY_MAX) 진짜 빈자리 → 테이블 이동으로 전체 초기화
     out = []
     for i in range(int(sty.OVERLAY_MAX + sty.EMPTY_SECS) + 3):
         out = st.observe({}, state(occupied=set()), 20.0 + i) or out
-    assert out == ["*"] and not any(st.known(k) for k in NAMES), out
+    assert "*" not in out and not any(st.known(k) for k in NAMES), out   # 좌석별로 떠남 처리 (전체 초기화 아님)
 
 
 def test_seat_reset_rules():
@@ -231,7 +231,7 @@ def test_seat_reset_rules():
     assert st.known("seat_UR")
 
 
-def test_table_move_resets_all():
+def test_many_seats_changing_only_rechecks_those_seats():
     st = sty.SeatTypes()
     st.observe(NAMES, state(), 0.0)
     for k, nm in NAMES.items():
@@ -244,8 +244,15 @@ def test_table_move_resets_all():
         out = st.observe(new, state(), 100.0 + i)
         if out:
             break
-    assert out == ["*"] and st.table_moves == 1, out
-    assert not any(st.known(k) for k in NAMES), "테이블 이동: 이름이 그대로인 좌석(UR, BR)도 초기화"
+    assert out and "*" not in out, out
+    assert set(out) <= {"seat_BL", "seat_UL", "seat_TC"}
+    assert st.known("seat_UR") and st.known("seat_BR"), "이름이 그대로인 좌석은 타입 유지 (전체 초기화 없음)"
+    # 배치 실패 / 빈 프레임은 아무것도 지우지 않음
+    before = {k: st.style(k) for k in NAMES}
+    st.prompt_seat = "seat_UR"
+    bad = state(); bad["layout_ok"] = False
+    assert st.observe({}, bad, 300.0) == [] and st.observe({}, {"seats": []}, 301.0) == []
+    assert st.prompt_seat == "seat_UR" and before == {k: st.style(k) for k in NAMES}
     st.observe(new, state(), 200.0)
     st.apply_popup(popup("Echo"), new, 201.0)
     st.reset()   # 새 [자동 지정]
@@ -453,7 +460,7 @@ def test_prompt_sticky():
     for i in range(sty.CHANGE_READS):
         st6.observe(new, state(), 100.0 + i)
     st6.observe(new, state(), 100.0 + sty.CHANGE_SECS_WEAK)
-    assert st6.prompt_seat is None and st6.table_moves == 1
+    assert st6.known("seat_UR") and st6.known("seat_BR") and not st6.known("seat_BL"), "바뀐 좌석만 초기화"
     st7 = sty.SeatTypes()
     st7.prompt_seat = "seat_BL"
     st7.reset()
@@ -582,6 +589,7 @@ def test_popup_during_prompt_is_prompted_player():
     st.observe(NAMES, state(), 1.0)
     pr = st.prompt(state(**fh), {}, 2.0)
     seat = pr["seat"]
+    assert pr.get("picture") is True and pr["slot"] in pr["slots"] and len(pr["slots"]) == 5, pr   # 이름 확신 없음 -> 그림
     assert st.apply_popup(popup("Qqqqzzzz", "TAG"), NAMES, 3.0) == seat and st.style(seat) == "TAG"
     # 이미 아는 팝업 이름을 다시 열면 그 좌석 그대로, 안내는 유지
     pr2 = st.prompt(state(**fh), {}, 4.0)

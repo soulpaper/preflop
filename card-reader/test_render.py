@@ -280,6 +280,21 @@ def type_cases(app):
             print("ok  " if ok else "FAIL", "타입 확인 안내 (" + label + ")")
             if not ok:
                 fails.append("type prompt " + label)
+        app.track["prompt"] = {"seat": "seat_UR", "pos": "CO", "slot": "UR", "text": "오른쪽 위 사람을 눌러 주세요",
+                               "sub": "(오른쪽 위 · CO · 타입 확인)", "picture": True,
+                               "slots": ["BL", "UL", "TC", "UR", "BR"]}
+        try:
+            app.render(force=True)
+            app.root.update()
+            txt = canvas_text(app)
+            ok = "그림의 빛나는 자리 사람을 눌러 주세요" in txt and "(오른쪽 위 · CO · 타입 확인)" in txt
+            ok = ok and max(app.col_bottoms) <= app.win_h
+        except Exception as exc:
+            print("picture prompt raised", repr(exc))
+            ok = False
+        print("ok  " if ok else "FAIL", "타입 확인 안내 (그림)")
+        if not ok:
+            fails.append("type prompt picture")
     finally:
         app.track, app.table_state = saved
     return fails

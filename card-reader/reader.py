@@ -2602,9 +2602,6 @@ class App:
         log_names, log_types = names, None
         if types is not None:
             dropped = types.observe(names, st, now, fps=name_fps)
-            if dropped == ["*"]:  # 테이블 이동/합치기: 핸드 기록 세션(pid 소금)도 새로
-                self.tracker.new_session()
-                self.store.new_session(self.tracker.session)
             if dropped and self.popup is not None:
                 self.popup.reset()   # 같은 사람이 다시 앉아도 팝업을 다시 받아들이게
             log_names, log_types = types.full_names(names), types.for_log()
@@ -4500,14 +4497,48 @@ class App:
         y = self.section_title(c, y, W, P, "상대 타입 확인", "opp_type")
         top = y
         pad = s(12)
-        t = self.text(c, P + pad, y + pad, prompt.get("text") or "", FS_HAND + 6, "bold", WARN, width=W - 2 * (P + pad))
+        pic = bool(prompt.get("picture"))
+        text = "그림의 빛나는 자리 사람을 눌러 주세요" if pic else (prompt.get("text") or "")
+        t = self.text(c, P + pad, y + pad, text, FS_HAND + 6, "bold", WARN, width=W - 2 * (P + pad))
         b = c.bbox(t)
-        t2 = self.text(c, P + pad, b[3] + s(4), prompt.get("sub") or "", FS_BODY + 2, "bold", TEXT,
-                       width=W - 2 * (P + pad))
-        bottom = c.bbox(t2)[3] + pad
+        if pic:
+            ph = s(78)
+            pw = min(s(190), W - 2 * (P + pad))
+            self.draw_seat_picture(c, P + pad, b[3] + s(6), pw, ph, prompt.get("slot"), prompt.get("slots") or [])
+            t2 = self.text(c, P + pad + pw + s(12), b[3] + s(6) + ph / 2, prompt.get("sub") or "", FS_BODY + 2, "bold",
+                           TEXT, anchor="w", width=max(s(60), W - 2 * (P + pad) - pw - s(12)))
+            bottom = max(c.bbox(t2)[3], b[3] + s(6) + ph) + pad
+        else:
+            t2 = self.text(c, P + pad, b[3] + s(4), prompt.get("sub") or "", FS_BODY + 2, "bold", TEXT,
+                           width=W - 2 * (P + pad))
+            bottom = c.bbox(t2)[3] + pad
         bg = round_rect(c, P, top, W - P, bottom, s(10), fill=PANEL, outline=WARN, width=max(1, int(s(2))))
         c.tag_lower(bg, t)
         return bottom + s(6)
+
+    SLOT_XY = {"TL": (.27, .08), "TC": (.5, .05), "TR": (.73, .08), "UL": (.07, .27), "UR": (.93, .27),
+               "L": (.03, .52), "R": (.97, .52), "BL": (.1, .78), "BR": (.9, .78)}
+
+    def draw_seat_picture(self, c, x, y, w, h, target, slots):
+        """작은 테이블 그림: 앉은 자리는 회색 동그라미, 눌러야 할 자리는 크고 빛나는 동그라미, 나는 아래 가운데."""
+        s = self.s
+        r0, r1 = s(6), s(11)
+        ix0, ix1, iy0, iy1 = x + r1, x + w - r1, y + r1, y + h - r0
+        c.create_oval(x + w * .12, y + h * .16, x + w * .88, y + h * .84, fill=CHIP, outline=MUTED, width=1)
+        def pos(key):
+            fx, fy = self.SLOT_XY[key]
+            return ix0 + (ix1 - ix0) * fx, iy0 + (iy1 - iy0) * fy
+        for k in slots:
+            if k in self.SLOT_XY and k != target:
+                px, py = pos(k)
+                c.create_oval(px - r0, py - r0, px + r0, py + r0, fill=MUTED, outline="")
+        hx, hy = ix0 + (ix1 - ix0) * .5, iy1
+        c.create_oval(hx - r0, hy - r0, hx + r0, hy + r0, fill=ACCENT, outline="")
+        self.text(c, hx, hy, "나", FS_SMALL - 2, "bold", BG, anchor="center")
+        if target in self.SLOT_XY:
+            px, py = pos(target)
+            c.create_oval(px - r1 - s(3), py - r1 - s(3), px + r1 + s(3), py + r1 + s(3), fill="", outline=WARN, width=max(1, int(s(2))))
+            c.create_oval(px - r1, py - r1, px + r1, py + r1, fill=WARN, outline="")
 
     def type_badge_size(self, tinfo):
         style = (tinfo or {}).get("style")

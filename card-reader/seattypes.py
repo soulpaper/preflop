@@ -17,7 +17,8 @@
   - 확정된 닉네임이 기억과 다른 사람으로 CHANGE_READS 프레임 연속, 그리고 CHANGE_SECS 초 넘게 읽힘. OCR 은 잘 틀리므로
     잘린 이름의 접두사 / 글자 유사도 SAME_RATIO 이상 / 글자 지문(names.fp_similarity)이 같으면 같은 사람으로 보고,
     글자 지문이 '다르다'고 확인되지 않았거나 이름이 반쯤 닮았으면(LIKE_RATIO) CHANGE_SECS_WEAK 초를 봐야 함
-  - TABLE_MOVE_SEATS 자리 이상이 TABLE_MOVE_WINDOW 초 안에 바뀜 = 테이블 이동/합치기 → 모든 좌석 초기화
+  - 게임 창 위치는 바뀌지 않음: 좌석 칸은 세션 내내 고정. 배치 실패·빈 프레임은 그 프레임만 건너뛰고 아무것도 지우지 않음
+    (한 번 정한 타입은 그 사람이 정말 바뀌거나 떠나기 전까지 유지; 전체 초기화는 새 [자동 지정] 의 reset() 뿐)
   - reset(): 새 [자동 지정] 세션 (앱이 track_new_session 에서 부름)
 팝업 → 좌석 (OCR 이 틀려도 안내대로 누른 것은 저장되게, 애매하면 다른 좌석으로 옮기지 않게)
   0. 같은 팝업 이름을 이미 저장한 좌석 하나 → 그 좌석
@@ -56,8 +57,6 @@ FP_DIFF = 0.50             # 이 아래면 확실히 다른 글자
 PROMPT_CLICK_WINDOW = 20.0  # 안내를 보여 준 지 이 초 안에 연 팝업은 무조건 안내한 그 사람으로 봄
 PROMPT_RECENT = 120.0      # 안내를 보여 준 지 이 초 안에 열린 팝업은 안내한 좌석 쪽으로 봄
 NAME_STABLE = 2            # 안내에 닉네임을 쓰려면 같은 이름이 이만큼 연속 프레임 그대로여야 함
-TABLE_MOVE_SEATS = 3       # 이 수 이상의 좌석이 짧은 시간에 바뀌면 테이블 이동/합치기
-TABLE_MOVE_WINDOW = 20.0
 NAME_SHOW_MAX = 8   # 안내에 보일 닉네임 최대 글자 수 (넘으면 … 로 줄임)
 # 포스트플랍 행동 순서 (뒤일수록 나중에 행동 = 포지션이 좋음)
 POST_ORDER = ("SB", "BB", "UTG", "U1", "U2", "U3", "MP", "LJ", "HJ", "CO", "BTN")
@@ -164,9 +163,7 @@ class SeatTypes:
         self.empty_seen = {}         # 좌석 → (빈자리로 보인 연속 프레임 수, 처음 비어 보인 시각)
         self.last_occ = set()        # 덮는 화면이 아닌 마지막 프레임에 앉아 있던 상대 좌석
         self.overlay_t0 = None
-        self.recent_resets = []      # (t, seat) — 테이블 이동 감지
         self.resets = 0              # 초기화 횟수 (좌석 + 전체; 앱이 바뀌었는지 볼 때)
-        self.table_moves = 0
 
     def _drop(self, key, t):
         if key in self.seats:
@@ -174,16 +171,13 @@ class SeatTypes:
             self.resets += 1
             if self.prompt_seat == key:
                 self.prompt_seat = None
-            if t is not None:
-                self.recent_resets = [(tt, k) for tt, k in self.recent_resets if t - tt <= TABLE_MOVE_WINDOW]
-                self.recent_resets.append((t, key))
             return True
         return False
 
     # --- 매 프레임 ------------------------------------------------------------------------------------
     def observe(self, names, state, t=None, fps=None):
         """names {seat: (name, truncated)} (확정만) + tablestate 결과 (+ fps {seat: 닉네임 글자 지문}, 메모리 전용)
-        → 이번에 초기화한 좌석 목록. 테이블 이동으로 보이면 전체를 초기화하고 ['*'] 반환."""
+        → 이번에 초기화한(떠나거나 주인이 바뀐) 좌석 목록."""
         dropped = []
         try:
             if not isinstance(state, dict) or state.get("layout_ok") is False or not state.get("seats"):
@@ -243,13 +237,6 @@ class SeatTypes:
                     dropped.append(k)
                     new = self.seats[k] = _Seat()
                     new.name, new.fp, new.hits = nm, fp, 1
-            if t is not None:
-                recent = {k for tt, k in self.recent_resets if t - tt <= TABLE_MOVE_WINDOW}
-                if len(recent) >= TABLE_MOVE_SEATS:
-                    self.reset()
-                    self.table_moves += 1
-                    self.resets += 1
-                    return ["*"]
         except Exception:
             pass
         return dropped
@@ -464,11 +451,11 @@ class SeatTypes:
             if not self.idle(state):
                 return None  # 안 보여 줄 뿐, 고른 좌석은 기억 (쉬는 때 다시 같은 사람)
             cands = self.candidates(state, live)
-            if not cands:
-                self.prompt_seat = None
-                self.prompt_shown_t = None
-                return None
             keys = [c[0] for c in cands]
+            if self.prompt_seat is not None and self.prompt_seat not in keys and not self.known(self.prompt_seat):
+                return None  # 잠깐 안 보이는 좌석(애니메이션 등): 안내만 쉬고 고른 사람은 유지. 떠남은 observe 가 정리
+            if not keys:
+                return None
             if self.prompt_seat not in keys:  # 처음 / 안내한 좌석이 해결됨·떠남 → 지금 1순위. 시간으로는 바꾸지 않음
                 self.prompt_seat = keys[0]
             self.prompt_t = t
@@ -485,6 +472,11 @@ class SeatTypes:
                 text = f"{pos} 자리 사람을 눌러 주세요"
             else:
                 text = "상대 캐릭터를 눌러 주세요"
-            return {"seat": k, "pos": pos, "slot": slot, "text": text, "sub": sub}
+            out = {"seat": k, "pos": pos, "slot": slot, "text": text, "sub": sub}
+            if not nm:   # 이름을 확실히 못 부를 때: 그림으로 어디인지 보여 줌
+                slots = [s.get("slot") for s in (state.get("seats") or [])
+                         if s.get("key") and s.get("key") != "hero" and s.get("occupied") and s.get("slot")]
+                out["picture"], out["slots"] = True, slots
+            return out
         except Exception:
             return None
