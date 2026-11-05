@@ -358,7 +358,8 @@ def parse_logged(line):
     {codes, covered(%), classes{이름: %}, groups{묶음: %}, board(bool), truncated}.
     포스트플랍 새 표기 'BTN 오픈: 예상 상위 7% | 보드 기준: Q 탑페어 (AQ, KQ) 30% · 플러시 드로우 (AK) 20%' 는
     groups 에 묶음 이름(예시 괄호 뺌)과 화면 확률, covered = 그 합."""
-    out = {"codes": set(), "covered": None, "classes": {}, "groups": {}, "board": None, "truncated": False}
+    out = {"codes": set(), "covered": None, "classes": {}, "groups": {}, "board": None, "truncated": False,
+           "fmt": None}
     if not line:
         return out
     head, _, tail = line.partition(" | ")
@@ -385,6 +386,8 @@ def parse_logged(line):
                 out["classes"][n] = v
         if out["groups"] and not m:
             out["covered"] = min(100.0, sum(out["groups"].values()))
+    # 표기 형식: 'groups' = f67f1b4 이후 보드 기준 묶음, 'classes' = 예전 7분류/프리플랍 분류, None = 기준 줄 없음·해석 불가
+    out["fmt"] = "groups" if out["groups"] else "classes" if out["classes"] else None
     return out
 
 
@@ -572,11 +575,11 @@ def score_logged(line, hand, seat, street, code, cls, row, grp=None):
         g = p["groups"]
         top = max(g.items(), key=lambda kv: kv[1])[0]
         return OrderedDict(hand=hand, seat=seat, street=street, actual=code, actual_class=cls, kind=row["kind"],
-                           family=row["family"], in_top3=grp in g, top1=(top == grp), shown_p=g.get(grp, 0.0) / 100,
+                           family=row["family"], fmt="groups", in_top3=grp in g, top1=(top == grp), shown_p=g.get(grp, 0.0) / 100,
                            in_summary=grp in g, covered=p["covered"], replay_cls_p=row["live"]["cls_p"])
     top = max(shown.items(), key=lambda kv: kv[1])[0] if shown else None
     return OrderedDict(hand=hand, seat=seat, street=street, actual=code, actual_class=cls, kind=row["kind"],
-                       family=row["family"], in_top3=cls in shown, top1=(top == cls), shown_p=shown.get(cls, 0.0) / 100,
+                       family=row["family"], fmt=p["fmt"] or "classes", in_top3=cls in shown, top1=(top == cls), shown_p=shown.get(cls, 0.0) / 100,
                        in_summary=(code in p["codes"]) if p["covered"] is not None else None,
                        covered=p["covered"], replay_cls_p=row["live"]["cls_p"])
 
@@ -633,6 +636,24 @@ def group(rows, keyfn):
     return g
 
 
+LOGGED_FMTS = ("classes", "groups")
+LOGGED_FMT_KO = {"classes": "예전 7분류 표기", "groups": "새 묶음 표기(f67f1b4~)"}
+TOP5_NOTE = ("재생 top5: 프리플랍 = 상위 5개 핸드코드, 포스트플랍 = 보인 묶음 안 상위 5개 핸드 (f67f1b4 이후 의미; "
+             "그 이전 보고서의 포스트플랍 top5 와 직접 비교 금지)")
+
+
+def _logged_by_street(lrows):
+    out = OrderedDict()
+    for k, v in group(lrows, lambda r: r["street"]).items():
+        summ = [x for x in v if x["in_summary"] is not None]
+        out[k] = {"n": len(v), "in_top3": _mean([float(x["in_top3"]) for x in v]),
+                  "top1": _mean([float(x["top1"]) for x in v]), "shown_p": _mean([x["shown_p"] for x in v]),
+                  "replay_cls_p": _mean([x["replay_cls_p"] for x in v]),
+                  "summary_n": len(summ), "in_summary": _mean([float(x["in_summary"]) for x in summ]),
+                  "summary_claims": _mean([x["covered"] / 100 for x in summ])}
+    return out
+
+
 def summarize(rows, lrows, skipped, bet_fold=None, boot=1000):
     post = [r for r in rows if r["street"] != "preflop"]
     final = {}
@@ -670,16 +691,15 @@ def summarize(rows, lrows, skipped, bet_fold=None, boot=1000):
     s["by_row"] = by_row(rows, boot)
     if bet_fold:
         s["bet_fold_by_type"] = bet_fold
+    s["top5_note"] = TOP5_NOTE
     if lrows:
-        lg = OrderedDict()
-        for k, v in group(lrows, lambda r: r["street"]).items():
-            summ = [x for x in v if x["in_summary"] is not None]
-            lg[k] = {"n": len(v), "in_top3": _mean([float(x["in_top3"]) for x in v]),
-                     "top1": _mean([float(x["top1"]) for x in v]), "shown_p": _mean([x["shown_p"] for x in v]),
-                     "replay_cls_p": _mean([x["replay_cls_p"] for x in v]),
-                     "summary_n": len(summ), "in_summary": _mean([float(x["in_summary"]) for x in summ]),
-                     "summary_claims": _mean([x["covered"] / 100 for x in summ])}
-        s["logged"] = lg
+        # 형식별로 따로 집계 (예전 7분류 'classes' 와 새 묶음 'groups' 는 지표 뜻이 달라 섞지 않는다)
+        s["logged"] = OrderedDict((f, _logged_by_street([x for x in lrows if x.get("fmt") == f]))
+                                  for f in LOGGED_FMTS if any(x.get("fmt") == f for x in lrows))
+        # 합산(참고용, 두 형식이 섞인 값): 형식이 둘 이상일 때만
+        if len(s["logged"]) > 1:
+            s["logged_mixed_total"] = _logged_by_street(lrows)
+            s["logged_mixed_total"]["_note"] = "형식이 섞인 합산 — 지표 뜻이 달라 시계열 비교에 쓰지 말 것"
     return s
 
 
@@ -1060,13 +1080,23 @@ def report(s, out=None):
         parts = [f"{n} {_pct(v['pred'])}→{_pct(v['actual'])}" for n, v in c["classes"].items()
                  if v["pred"] >= 0.03 or v["actual"] > 0]
         w(f"  {name} (n={c['n']}): " + " · ".join(parts) + "\n")
-    if s.get("logged"):
-        w("\n[결정 순간 화면에 보인 리딩 (decisions 기록)]\n")
-        for k, v in s["logged"].items():
+    def _logged_lines(d):
+        for k, v in d.items():
+            if k == "_note":
+                continue
             w(f"  {STREET_KO.get(k, k):<6} n={v['n']:>3} | 실제 분류가 표시 상위3 안 {_pct(v['in_top3'])}, 1순위 {_pct(v['top1'])},"
               f" 표시 확률 {_pct(v['shown_p'])} (재생 {_pct(v['replay_cls_p'])})"
               f" | 요약 표기에 실제 핸드 포함 {_pct(v['in_summary'])} (표기가 주장한 비중 {_pct(v['summary_claims'])},"
               f" n={v['summary_n']})\n")
+    if s.get("logged"):
+        w("\n[결정 순간 화면에 보인 리딩 (decisions 기록) — 표기 형식별 따로 집계]\n")
+        for f, d in s["logged"].items():
+            w(f" <{LOGGED_FMT_KO.get(f, f)}>\n")
+            _logged_lines(d)
+        if s.get("logged_mixed_total"):
+            w(" <합산: 두 형식이 섞인 값 — 참고만, 시계열 비교 금지>\n")
+            _logged_lines(s["logged_mixed_total"])
+    w("\n" + s.get("top5_note", TOP5_NOTE) + "\n")
     w("\n주의: 쇼다운까지 간 핸드만 보임 → 폴드시킨 블러프가 빠져 공격 액션의 에어 비중은 실제보다 낮게 관측된다. 표본이 작다.\n")
 
 
