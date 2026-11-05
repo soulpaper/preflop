@@ -22,7 +22,8 @@
   - 내가 쉴 때만: 내 차례/예약(preaction)이 아니고, 폴드했거나 이번 핸드에 카드가 없을 때 (차례 시간 ~9.8초를 뺏지 않게)
   - 타입을 모르는 상대만 (한 번 읽으면 그 좌석이 초기화되기 전까지 다시 묻지 않음)
   - 우선순위: 아직 핸드에 남은 상대 → 이번 핸드에 자발적으로 칩을 넣은(루즈/액티브) 상대 → 나보다 뒤에 행동하는 상대 → 자리 순
-  - 고른 좌석은 PROMPT_HOLD 초 동안 유지 (안내가 이리저리 바뀌지 않게)
+  - 한 번 고른 좌석은 눌러서 타입을 읽거나 그 좌석이 초기화(떠남/주인 바뀜/테이블 이동)될 때까지 계속 그 사람만 안내
+    (시간이 지나도, 우선순위가 바뀌어도, 내 차례로 잠깐 안 보였다 다시 나와도 바꾸지 않음 → 눌러야 할 사람이 눌리기 전에 바뀌지 않게)
 """
 import difflib
 
@@ -34,7 +35,6 @@ SAME_RATIO = 0.75          # 닉네임 글자 유사도가 이 이상이면 같�
 TABLE_MOVE_SEATS = 3       # 이 수 이상의 좌석이 짧은 시간에 바뀌면 테이블 이동/합치기
 TABLE_MOVE_WINDOW = 20.0
 NAME_SHOW_MAX = 8   # 안내에 보일 닉네임 최대 글자 수 (넘으면 … 로 줄임)
-PROMPT_HOLD = 8.0          # 안내한 좌석을 바꾸지 않고 유지하는 시간 (초)
 # 포스트플랍 행동 순서 (뒤일수록 나중에 행동 = 포지션이 좋음)
 POST_ORDER = ("SB", "BB", "UTG", "U1", "U2", "U3", "MP", "LJ", "HJ", "CO", "BTN")
 SLOT_KO = {"BL": "왼쪽 아래", "L": "왼쪽", "UL": "왼쪽 위", "TL": "위 왼쪽", "TC": "위 가운데", "TR": "위 오른쪽",
@@ -91,7 +91,7 @@ class SeatTypes:
     def reset(self):
         """모든 좌석 초기화 (새 [자동 지정] / 테이블 이동)."""
         self.seats = {}
-        self.prompt_seat, self.prompt_t = None, None
+        self.prompt_seat = None
         self.recent_resets = []      # (t, seat) — 테이블 이동 감지
         self.resets = 0              # 초기화 횟수 (좌석 + 전체; 앱이 바뀌었는지 볼 때)
         self.table_moves = 0
@@ -127,6 +127,8 @@ class SeatTypes:
                         rec.empty += 1
                         if rec.empty >= EMPTY_READS and self._drop(k, t):
                             dropped.append(k)
+                    elif self.prompt_seat == k:
+                        self.prompt_seat = None  # 이름을 기억하기 전에 떠난 자리: 다음 사람에게 안내가 넘어가지 않게
                     continue
                 nm = names.get(k)
                 if rec is None:
@@ -326,17 +328,14 @@ class SeatTypes:
         이름을 알면 '테스트닉… 님을 눌러 주세요' + '(CO · 오른쪽 위 · 타입 확인)', 모르면 '자리' 문구."""
         try:
             if not self.idle(state):
-                self.prompt_seat = None
-                return None
+                return None  # 안 보여 줄 뿐, 고른 좌석은 기억 (쉬는 때 다시 같은 사람)
             cands = self.candidates(state, live)
             if not cands:
                 self.prompt_seat = None
                 return None
             keys = [c[0] for c in cands]
-            hold = (self.prompt_seat in keys and t is not None and self.prompt_t is not None
-                    and t - self.prompt_t < PROMPT_HOLD)
-            if not hold:  # 처음 / 안내한 좌석이 해결됨 / 유지 시간이 지남 → 지금 1순위 (같으면 시간만 새로)
-                self.prompt_seat, self.prompt_t = keys[0], t
+            if self.prompt_seat not in keys:  # 처음 / 안내한 좌석이 해결됨·떠남 → 지금 1순위. 시간으로는 바꾸지 않음
+                self.prompt_seat = keys[0]
             k, pos, slot = next(c for c in cands if c[0] == self.prompt_seat)
             where = SLOT_KO.get(slot)
             nm = self.shown_name(k, names)

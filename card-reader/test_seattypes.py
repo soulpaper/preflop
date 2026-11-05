@@ -182,14 +182,19 @@ def test_prompt_priority_and_once():
     pr = st.prompt(s, live2, 10.0)
     assert pr["seat"] == "seat_TC" and pr["text"] == "User0… 님을 눌러 주세요" and "타입 확인" in pr["sub"], pr  # 잘린 이름 + …
     assert "위 가운데" in pr["sub"]
-    # 유지: 우선순위가 바뀌어도 PROMPT_HOLD 동안은 같은 좌석
+    # 유지: 우선순위가 바뀌어도, 시간이 오래 지나도 같은 좌석
     live3 = {"seat_BL": {"preflop": ["blind", "raise"]}}
     s3 = state(in_hand={"seat_BL"}, **folded_hero)
     assert st.prompt(s3, live3, 11.0)["seat"] == "seat_TC"
-    assert st.prompt(s3, live3, 10.0 + sty.PROMPT_HOLD + 0.1)["seat"] == "seat_BL"
-    # 읽은 좌석은 다시 묻지 않음
-    st.apply_popup(popup("Alpha77"), NAMES, 30.0)
+    assert st.prompt(s3, live3, 10.0 + 8.1)["seat"] == "seat_TC"
+    assert st.prompt(s3, live3, 200.0)["seat"] == "seat_TC"
+    # 읽은 좌석은 다시 묻지 않음 (TC 를 읽으면 다음 1순위 = BL)
+    st.apply_popup(popup("User0999"), NAMES, 30.0)
+    assert st.known("seat_TC")
     pr = st.prompt(s3, live3, 31.0)
+    assert pr["seat"] == "seat_BL"
+    st.apply_popup(popup("Alpha77"), NAMES, 31.5)
+    pr = st.prompt(s3, live3, 32.0)
     assert pr["seat"] != "seat_BL" and not st.known(pr["seat"])
     for k, nm in NAMES.items():
         st.apply_popup(popup(nm[0] if not nm[1] else nm[0] + "999"), NAMES, 32.0)
@@ -247,6 +252,77 @@ def test_prompt_text_never_reaches_disk():
     for i, ln in enumerate(src, 1):
         if re.search(r"\bprompt\b", ln) and re.search(r"log|write|dump|save|upload|record|json", ln, re.I):
             assert "log_once" not in ln and "debug" not in ln.lower() and "dump" not in ln and "write" not in ln, (i, ln)
+
+
+def test_prompt_sticky():
+    """고른 좌석은 눌러서 해결되거나 그 좌석이 초기화될 때까지 바뀌지 않음 (시간 · 우선순위 · 내 차례와 무관)."""
+    fh = dict(hero_folded=True, hero_in_hand=False)
+    # (a) 8초 넘게, 우선순위가 바뀌어도 같은 좌석
+    st = sty.SeatTypes()
+    st.observe(NAMES, state(), 0.0)
+    live_a = {"seat_TC": {"preflop": ["open"]}}
+    first = st.prompt(state(in_hand={"seat_TC", "seat_BL"}, **fh), live_a, 1.0)["seat"]
+    assert first == "seat_TC"
+    live_b = {"seat_BL": {"preflop": ["raise"]}, "seat_UR": {"preflop": ["raise"]}}
+    s_b = state(in_hand={"seat_BL", "seat_UR"}, folded={"seat_TC"}, **fh)
+    assert st.candidates(s_b, live_b)[0][0] != "seat_TC", "우선순위는 실제로 바뀜"
+    for t in (5.0, 9.5, 60.0, 600.0):
+        assert st.prompt(s_b, live_b, t)["seat"] == "seat_TC", t
+    # (b) 내 차례/핸드 중이면 안 보이지만 기억은 유지 → 다시 쉬면 같은 사람
+    assert st.prompt(state(to_act=True, **fh), live_b, 601.0) is None
+    assert st.prompt(state(), live_b, 602.0) is None
+    assert st.prompt_seat == "seat_TC"
+    assert st.prompt(s_b, live_b, 603.0)["seat"] == "seat_TC"
+    # (c) 팝업으로 해결되면 다음 후보
+    assert st.apply_popup(popup("User0999"), NAMES, 604.0) == "seat_TC"
+    nxt = st.prompt(s_b, live_b, 605.0)["seat"]
+    assert nxt != "seat_TC" and not st.known(nxt)
+    assert st.prompt(s_b, live_b, 700.0)["seat"] == nxt, "새로 고른 좌석도 유지"
+    # 후보가 없으면 지움
+    st2 = sty.SeatTypes()
+    st2.observe(NAMES, state(), 0.0)
+    st2.prompt(state(**fh), {}, 1.0)
+    assert st2.prompt_seat
+    for k, nm in NAMES.items():
+        st2.apply_popup(popup(nm[0] if not nm[1] else nm[0] + "999"), NAMES, 2.0)
+    assert st2.prompt(state(**fh), {}, 3.0) is None and st2.prompt_seat is None
+    # (d) 주인이 바뀌면 (같은 좌석 키에 새 사람) 안내 좌석을 버리고 다시 고름
+    st3 = sty.SeatTypes()
+    st3.observe(NAMES, state(), 0.0)
+    pick = st3.prompt(state(**fh), {}, 1.0)["seat"]
+    changed = dict(NAMES, **{pick: ("Newcomer", False)})
+    for i in range(sty.CHANGE_READS):
+        st3.observe(changed, state(**fh), 2.0 + i)
+    assert st3.prompt_seat is None, "주인이 바뀌면 이전 안내 해제"
+    # 떠난 자리 (EMPTY_READS 프레임 연속 빈자리) → 후보에서 빠지고 다른 사람으로
+    st4 = sty.SeatTypes()
+    st4.observe(NAMES, state(), 0.0)
+    pick = st4.prompt(state(**fh), {}, 1.0)["seat"]
+    occ = set(KEYS) - {pick}
+    for i in range(sty.EMPTY_READS):
+        st4.observe(NAMES, state(occupied=occ), 2.0 + i)
+    assert st4.prompt_seat is None
+    assert st4.prompt(state(occupied=occ, **fh), {}, 5.0)["seat"] != pick
+    # 이름을 기억하기 전에 떠난 자리도 안내 해제
+    st5 = sty.SeatTypes()
+    st5.prompt_seat = "seat_UL"
+    st5.observe({}, state(occupied=set(KEYS) - {"seat_UL"}), 1.0)
+    assert st5.prompt_seat is None
+    # 테이블 이동 (전체 초기화) / reset()
+    st6 = sty.SeatTypes()
+    st6.observe(NAMES, state(), 0.0)
+    for k, nm in NAMES.items():
+        st6.apply_popup(popup(nm[0] if not nm[1] else nm[0] + "999"), NAMES, 0.5)
+    st6.prompt_seat = "seat_UR"
+    new = {"seat_BL": ("Echo", False), "seat_UL": ("Foxtrot", False), "seat_TC": ("Golf", False),
+           "seat_UR": ("Charlie", False), "seat_BR": ("Delta", False)}
+    for i in range(sty.CHANGE_READS):
+        st6.observe(new, state(), 100.0 + i)
+    assert st6.prompt_seat is None and st6.table_moves == 1
+    st7 = sty.SeatTypes()
+    st7.prompt_seat = "seat_BL"
+    st7.reset()
+    assert st7.prompt_seat is None
 
 
 def test_prompt_without_position():
