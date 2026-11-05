@@ -119,6 +119,8 @@ ROLE_ADJ = {
     "delay": ([1.10, 1.10, 1.00, 0.90, 0.70], 1.00),
     "probe": ([1.10, 1.10, 1.10, 1.00, 0.60], 0.95),
 }
+# 가중치 바닥(최대 가중치 대비): 살아있는 콤보는 이 값 아래로 내려가도 지우지 않고 이 값으로 올린다 (1e-4 컷으로 지우던 예전 방식은 확률 0 을 만들었다).
+WEIGHT_FLOOR_REL = 1e-6
 IMPROVE = {"delay": 1.35, "probe": 1.35}   # 직전 스트리트 보드보다 이번 스트리트에 좋아진 콤보의 추가 배율
 
 
@@ -829,11 +831,10 @@ def _estimate_one(seat, board, players, dead, profile, stack_bb, ante=False):
     total = sum(weights)
     if total <= 0:
         weights, total = [1.0] * len(combos), float(len(combos))
-    # 극소 가중치 정리
-    cut = max(weights) * 1e-4
-    keep = [i for i, w in enumerate(weights) if w >= cut]
-    combos = [combos[i] for i in keep]
-    weights = [weights[i] for i in keep]
+    # 극소 가중치: 지우지 않고 바닥만 깐다. 길고 공격적인 라인(플랍·턴 공격 + 리버 올인)에서 중간·약한 페어가 1e-4 컷 아래로
+    # 내려가 지워지면 실제 패의 확률이 0 이 되어 채점(score_reads)에서 '확률 0 오답' 이 된다. 살아있는 콤보는 0 이 되지 않는다.
+    floor = max(weights) * WEIGHT_FLOOR_REL
+    weights = [w if w >= floor else floor for w in weights]
     total = sum(weights)
 
     mass, live = {}, {}

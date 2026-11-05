@@ -522,6 +522,17 @@ with tempfile.TemporaryDirectory() as d:
         _bad_since = True
     test("--since: 형식 오류는 종료", _bad_since)
 
+# --- 긴 공격 라인: 실제 패의 확률이 0 (zero) 으로 채점되지 않는다 ------------------------------------------
+_zb = ["Ks", "8d", "4c", "2h", "Jd"]
+_zs = {"pos": "MP", "preflop": ["open", "4bet"], "flop": [{"a": "cbet", "size": 0.8}, "raise"],
+       "turn": [{"a": "cbet", "size": 0.5}], "river": ["allin"]}
+_zres = hr.estimate({"V": _zs}, _zb, 9, stack_bb=100)["V"]
+_zk, _zhi, _zlo = sr.combo_key(ev.parse_card("4h"), ev.parse_card("3h"))
+_zy = sr.actual_class(hr._board_cards(_zb), _zhi, _zlo)[1]
+_zsc = sr.score_result(_zres, _zk, "43s", _zy, 45 * 44 // 2)
+test("score_result: 긴 공격 라인에서 약한 페어 실제 패 zero=False, p>0",
+     _zsc["zero"] is False and _zsc["p"] > 0 and hr.CLASSES_POST[_zy] == "중간·약한 페어", str(_zsc["p"]))
+
 # --- 결과 ---------------------------------------------------------------------------------------
 failed = 0
 for ok, name, info in results:

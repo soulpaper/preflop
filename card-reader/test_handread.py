@@ -522,6 +522,25 @@ _ok_cfg = hr.MULT_SET == "aggr_m"
 hr.configure(**_o)
 test("aggr_m: configure(mult_set='aggr_m') 와 복원", _ok_cfg and hr.MULT_SET == "prev" and _o["mult_set"] == "prev")
 
+# --- 긴 공격 라인에서도 살아있는 콤보는 확률 0 이 되지 않는다 (극소 가중치 정리가 지우던 버그) ---------------------------
+_LONG_B = ["Ks", "8d", "4c", "2h", "Jd"]
+_LONG = {
+    "리버 올인 (오픈→콜, 플랍 리드+콜, 턴 체크)":
+        {"pos": "UTG", "preflop": ["open", "call"], "flop": [{"a": "lead", "size": 0.5}, "call"], "turn": ["check"],
+         "river": ["allin"]},
+    "리버 올인 (오픈→4벳, 플랍 큰 c-bet+레이즈, 턴 c-bet)":
+        {"pos": "MP", "preflop": ["open", "4bet"], "flop": [{"a": "cbet", "size": 0.8}, "raise"],
+         "turn": [{"a": "cbet", "size": 0.5}], "river": ["allin"]},
+}
+for _nm, _s in _LONG.items():
+    _r = one(_s, _LONG_B)
+    _p = _r["range"].get("4h3h", _r["range"].get("3h4h", 0.0))   # 4c 보드 + 4h3h = 약한 페어
+    test(f"{_nm}: 약한 페어 4h3h 확률 > 0", _p > 0, f"{_p:.2e}")
+    test(f"{_nm}: 중간·약한 페어 분류 질량 > 0", _r["classes"]["중간·약한 페어"] > 0, str(_r["classes"]))
+    _blocked = {ev.parse_card(c) for c in _LONG_B}
+    _live = sum(1 for code in rq.COMBOS for a, b in rq.COMBOS[code] if a not in _blocked and b not in _blocked)
+    test(f"{_nm}: 살아있는 모든 콤보가 range 에 있다", len(_r["range"]) == _live, f"{len(_r['range'])}/{_live}")
+
 # --- 결과 ---------------------------------------------------------------------------------------
 failed = 0
 for ok, name, info in results:
