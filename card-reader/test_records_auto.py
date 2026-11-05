@@ -279,6 +279,35 @@ class Failures(Base):
         self.assertIn("known_name", self.logs[0])
         self.assertNotIn("SomeNick", self.logs[0])
 
+    def test_held_status_and_log_once(self):
+        self.fake()
+        FakeUp.code, FakeUp.result = 1, "held"
+        s = RA.Syncer(self.dir, log=self.logs.append)
+        orig = FakeUp.__init__
+
+        def init(self_, *a, **k):
+            orig(self_, *a, **k)
+            self_.held_now = {"2026-11-01.jsonl"}
+        FakeUp.__init__ = init
+        try:
+            s.run_once()
+            s.run_once()
+        finally:
+            FakeUp.__init__ = orig
+        self.assertRegex(s.status_text(), r"^기록 전송: 보류 1개 · \d\d:\d\d$")
+        self.assertIn("전송: 보류 1개", s.status_texts())
+        self.assertEqual(len(self.logs), 1)
+        self.assertIn("held files=2026-11-01", self.logs[0])
+        self.assertNotIn("일부 실패", s.status_text())
+
+    def test_held_callback_logs_rule_file_line_once(self):
+        self.fake()
+        s = RA.Syncer(self.dir, log=self.logs.append)
+        for _ in range(2):
+            s._on_error("records_sync", "held", "known_name", "2026-11-01.jsonl", 3)
+        self.assertEqual(len(self.logs), 1)
+        self.assertIn("rule=known_name file=2026-11-01.jsonl line=3", self.logs[0])
+
     def test_logger_failure_swallowed(self):
         self.fake()
         FakeUp.code, FakeUp.result = 3, "unreachable"

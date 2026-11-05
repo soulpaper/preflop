@@ -581,6 +581,31 @@ def _objs_only(val):
     return isinstance(val, list) and all(e is None or isinstance(e, Obj) or _objs_only(e) for e in val)
 
 
+def name_check_strings(kind, top):
+    """알려진 이름 검사(업로더)에 쓸 문자열 [(mode, s)]. 규칙 19 와 같은 칸을 고른다 (pid, 카드, 열거 등 고정 형식 칸은 뺀다).
+    mode: "text" = 자유 텍스트, "code" = 코드·키 칸 (LINE, NODE, 맵 키, X)."""
+    sch = schema_for(kind, top)
+    out = []
+
+    def key(k, s, ok):
+        if nick_key(s[-1]) and k not in CLASSES:
+            out.append(("code", k))
+        return False
+
+    def other(v, s):
+        out.append(("text", v))              # 안전망: 스키마 밖 문자열은 자유 텍스트로 본다
+        return False
+
+    def leaf(v, typ, s):
+        mode = "text" if TYPES.get(typ, {}).get("text") else "code"
+        for e in (v if isinstance(v, list) else [v]):
+            if type(e) is str and nick_leaf(typ, e):
+                out.append((mode, e))
+        return False
+    _scan(top, sch, [], "top", key, other, leaf)
+    return out
+
+
 def container_hit(top, sch):
     """줄 전체에서 모양이 틀린 첫 컨테이너 키의 경로(문자열), 없으면 None. 키 정렬 순, 깊이 우선."""
     def w(o, node, segs, ctx):

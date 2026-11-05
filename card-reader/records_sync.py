@@ -162,16 +162,96 @@ def _dump(v):
     return json.dumps(v, ensure_ascii=False)
 
 
-def _strings(v):
-    if isinstance(v, dict):
-        for k, x in v.items():
-            yield k
-            yield from _strings(x)
-    elif isinstance(v, list):
-        for x in v:
-            yield from _strings(x)
-    elif type(v) is str:
-        yield v
+# 한글·일본어·한자는 띄어쓰기 없이 조사가 붙으므로 이런 이름은 부분 일치로 본다
+_CJK_CH = "\u1100-\u11ff\u3040-\u30ff\u3130-\u318f\u3400-\u9fff\uac00-\ud7af\uf900-\ufaff"
+_SPACELESS = re.compile("[" + _CJK_CH + "]")
+_WORD = re.compile(r"[^\W_]+")
+_CJK_SPLIT = re.compile("[" + _CJK_CH + "]+|[^" + _CJK_CH + "]+")
+
+
+def _fold(s):
+    t = unicodedata.normalize("NFKC", str(s)).casefold()
+    return "".join(c for c in t if unicodedata.category(c) != "Cf")
+
+
+def _tokens(s):
+    return [m.group() for run in _WORD.findall(_fold(s)) for m in _CJK_SPLIT.finditer(run)]
+
+
+def _squash(s):
+    return "".join(c for c in _fold(s) if c.isalnum())
+
+
+class NameSet:
+    """알려진 이름 모음 (메모리 전용). 한글·CJK 이름은 부분 일치, 그 밖의 이름은 토큰 단위 일치.
+    토큰 일치: 이름의 토큰을 이어 붙인 글자가 문자열의 이웃한 토큰들을 이어 붙인 글자와 같을 때.
+    mode "code" (코드·키 칸)에서는 앱 어휘(열거값)로만 이뤄진 이름은 건너뛴다 (닉네임 "fold" 대 행동 코드 "fold")."""
+
+    def __init__(self, names=()):
+        self.sub = set()
+        self.seq = {}
+        for x in names or ():
+            if not isinstance(x, str) or len(norm_name(x)) < 4 or not any(c.isalpha() for c in norm_name(x)):
+                continue
+            if _SPACELESS.search(_fold(x)):
+                q = _squash(x)
+                if q:
+                    self.sub.add(q)
+                continue
+            t = tuple(_tokens(x))
+            if not t:
+                continue
+            w = _en_words(x)
+            self.seq["".join(t)] = bool(w) and w <= _code_vocab()
+
+    def __len__(self):
+        return len(self.sub) + len(self.seq)
+
+    def hit(self, mode, s):
+        if type(s) is not str:
+            return False
+        if self.sub:
+            q = _squash(s)
+            if any(n in q for n in self.sub):
+                return True
+        if not self.seq:
+            return False
+        toks = _tokens(s)
+        for joined, vocab_only in self.seq.items():
+            if mode == "code" and vocab_only:
+                continue
+            # 이웃한 토큰을 이어 붙여도 본다 ("Synth Nick01" 대 "synthnick01", "synthnick 01")
+            for i in range(len(toks)):
+                acc = ""
+                for tk in toks[i:]:
+                    acc += tk
+                    if acc == joined:
+                        return True
+                    if not joined.startswith(acc):
+                        break
+        return False
+
+
+_CV = None
+
+
+def _code_vocab():
+    global _CV
+    if _CV is None:
+        _CV = frozenset(w for vs in RC.ENUMS.values() for v in vs for w in _en_words(v))
+    return _CV
+
+
+def _prefix(raw, line):
+    """raw 의 line 번째 줄바꿈까지(포함). 줄이 모자라면 None."""
+    if type(line) is not int or line < 1:
+        return None
+    pos = -1
+    for _ in range(line):
+        pos = raw.find(b"\n", pos + 1)
+        if pos < 0:
+            return None
+    return raw[:pos + 1]
 
 
 def build_body(name, raw, extra_names=None, stats=None):
@@ -184,7 +264,7 @@ def build_body(name, raw, extra_names=None, stats=None):
     kind = RC.file_kind(name)
     cut = raw.rfind(b"\n")
     raw = raw[:cut + 1]
-    names = [n for n in (norm_name(x) for x in (extra_names or ())) if len(n) >= 4 and any(c.isalpha() for c in n)]
+    ns = extra_names if isinstance(extra_names, NameSet) else NameSet(extra_names)
     out, dropped = [], 0
     if not raw:
         return None, 0, 0
@@ -229,11 +309,8 @@ def build_body(name, raw, extra_names=None, stats=None):
         if v.cls == "format":
             dropped += 1
             continue
-        if names:
-            for s in _strings(rec):
-                ns = norm_name(s)
-                if any(n in ns for n in names):
-                    raise Block("known_name", "", i, name)
+        if ns and any(ns.hit(m, t) for m, t in RC.name_check_strings(kind, rec)):
+            raise Block("known_name", "", i, name)
         out.append(data + b"\n")
     if not out:
         return None, 0, dropped
@@ -373,6 +450,10 @@ class Uploader:
         self.errors = []
         self.idents = {}      # name -> (st_dev, st_ino, st_size, st_mtime_ns) (targets 때)
         self.keystats = {}    # name -> 필터가 버린 키 통계
+        self.held = {}        # name -> {rule, line, since, prefix_sha256} (상태 파일의 "held")
+        self.held_now = set()  # 이번 주기에 보류된 파일
+        self.names_used = 0   # 이번 주기에 쓴 이름 수
+        self.held_dirty = False
 
     # 상태
     def _state_path(self):
@@ -487,7 +568,8 @@ class Uploader:
     def make_bodies(self, names):
         res = {}
         d = os.path.join(self.base, "hands")
-        extra = self._names_now()
+        ns = NameSet(self._names_now())
+        self.names_used = len(ns)
         for n in names:
             try:
                 raw = self._open_checked(os.path.join(d, n), self.idents.get(n))
@@ -503,16 +585,36 @@ class Uploader:
                 self.files[n] = {"result": "audit_required"}
                 self.errors.append(n)
                 continue
+            h = self.held.get(n)
+            if isinstance(h, dict):
+                pre = _prefix(raw, h.get("line"))
+                if not ns or (pre is not None and hashlib.sha256(pre).hexdigest() == h.get("prefix_sha256")):
+                    self.files[n] = {"result": "held", "rule": h.get("rule", "known_name"), "line": h.get("line", 0)}
+                    self.held_now.add(n)
+                    continue
             stats = {"keys": 0, "paths": collections.Counter()}
             try:
-                body, lines, dropped = build_body(n, raw, extra, stats)
+                body, lines, dropped = build_body(n, raw, ns, stats)
             except Block as b:
                 b.file = n
-                raise
+                if b.rule != "known_name":
+                    raise
+                pre = _prefix(raw, b.line)
+                old = self.held.get(n)
+                since = old.get("since") if isinstance(old, dict) and type(old.get("since")) is int else int(time.time())
+                self.held[n] = {"rule": b.rule, "line": b.line, "since": since,
+                                "prefix_sha256": hashlib.sha256(pre or b"").hexdigest()}
+                self.held_dirty = True
+                self.held_now.add(n)
+                self.files[n] = {"result": "held", "rule": b.rule, "line": b.line}
+                self._err("held", b.rule, n, b.line)
+                continue
             except FileError as e:
                 self.files[n] = {"result": e.code}
                 self.errors.append(n)
                 continue
+            if self.held.pop(n, None) is not None:
+                self.held_dirty = True
             top = sorted(stats["paths"].items(), key=lambda kv: (-kv[1], kv[0]))[:20]
             vtop = sorted(stats["vpaths"].items(), key=lambda kv: (-kv[1], kv[0]))[:20]
             extra_ent = {"dropped_keys": stats["keys"], "dropped_paths": dict(top),
@@ -803,6 +905,14 @@ class Uploader:
                 t = self.today()
                 lo, hi = t - datetime.timedelta(days=self.cfg["window_days"]), t + datetime.timedelta(days=1)
             names = self.targets(lo, hi)
+            h = st.get("held")
+            if not isinstance(h, dict):
+                h = st["held"] = {}
+            hd = os.path.join(self.base, "hands")
+            for n in [n for n in h if not (isinstance(n, str) and n == os.path.basename(n)
+                                           and os.path.lexists(os.path.join(hd, n)))]:
+                del h[n]
+            self.held = h
             try:
                 bodies = self.make_bodies(names)
             except Block as b:
@@ -810,6 +920,11 @@ class Uploader:
                           disabled_path=b.path)
                 self._err("blocked", b.rule, b.file, b.line, b.path)
                 raise Refuse("blocked_rule", b.rule)
+            if self.held_dirty and not (check_only or dry_run):
+                try:
+                    self.save_state(st)
+                except OSError:
+                    pass
             if check_only:
                 print("files=%d ok=%d errors=%d" % (len(names), len(bodies), len(self.errors)))
                 for n in sorted(self.files):
@@ -822,9 +937,11 @@ class Uploader:
                         k = self.keystats[n]
                         print("%s dropped_keys=%d dropped_paths=%s" % (
                             n, k["dropped_keys"], json.dumps(k["dropped_paths"], ensure_ascii=False, sort_keys=True)))
-                return 1 if self.errors else 0
+                return 1 if (self.errors or self.held_now) else 0
             if not bodies:
-                return self._finish(1 if self.errors else 0, "nothing", st)
+                if self.errors:
+                    return self._finish(1, "nothing", st)
+                return self._finish(1, "held", st) if self.held_now else self._finish(0, "nothing", st)
             try:
                 blocked, remote = self.get_status()
                 if blocked:
@@ -928,13 +1045,17 @@ class Uploader:
                 worst = 1
                 self.errors.append(n)
                 break
-        return self._finish(worst, "ok" if not worst else "file_errors", st)
+        if worst:
+            return self._finish(worst, "file_errors", st)
+        if self.held_now:
+            return self._finish(1, "held", st)
+        return self._finish(0, "ok", st)
 
     def _finish(self, code, result, st=None, save=True):
         if save:
             st = st if st is not None else self.load_state()
             st.update(last_run=int(time.time()), last_result=result, last_code=code,
-                      name_check="known_names" if self.extra_names else "shape_only",
+                      name_check="known_names" if self.names_used else "shape_only", name_count=self.names_used,
                       files=self.files if self.files else st.get("files", {}))
             try:
                 self.save_state(st)
@@ -960,6 +1081,7 @@ def main(argv=None):
     g.add_argument("--dry-run", action="store_true")
     g.add_argument("--backfill", metavar="FROM")
     g.add_argument("--reset-disabled", action="store_true")
+    g.add_argument("--release-held", metavar="FILE|all")
     g.add_argument("--audit", action="store_true")
     ap.add_argument("--from", dest="from_")
     ap.add_argument("--to")
@@ -992,6 +1114,37 @@ def main(argv=None):
             lock.close()
         print("disabled 해제")
         return 0
+    if a.release_held:
+        try:
+            lock = _lock(base)
+        except Refuse:
+            print("records_sync: busy", file=sys.stderr)
+            return 2
+        try:
+            p = os.path.join(base, STATE_NAME)
+            try:
+                with _open(p, encoding="utf-8") as f:
+                    st = json.load(f)
+            except OSError:
+                print("상태 파일이 없습니다")
+                return 0
+            except ValueError:
+                st = {}
+            if not isinstance(st, dict):
+                st = {}
+            h = st.get("held") if isinstance(st.get("held"), dict) else {}
+            if a.release_held == "all":
+                freed = sorted(h)
+                h.clear()
+            else:
+                freed = [a.release_held] if a.release_held in h else []
+                h.pop(a.release_held, None)
+            st["held"] = h
+            save_state_atomic(p, st)
+        finally:
+            lock.close()
+        print("held 해제: %s" % (", ".join(os.path.basename(n) for n in freed) if freed else "없음"))
+        return 0
     if a.audit:
         try:
             fd = parse_date(a.from_) if a.from_ else None
@@ -1021,6 +1174,7 @@ def main(argv=None):
         try:
             while True:
                 up.files, up.errors, up.idents, up.keystats = {}, [], {}, {}
+                up.held_now, up.names_used, up.held_dirty = set(), 0, False
                 up.cycle()
                 time.sleep(cfg["interval_sec"])
         except KeyboardInterrupt:

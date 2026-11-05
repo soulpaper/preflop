@@ -171,6 +171,10 @@ class Syncer:
             self._fail(result, "멈춤(점검 필요)", "%s (code 2)" % result)
         elif code == 2 and result == "auth":
             self._fail(result, "인증 오류", "auth (code 2)")
+        elif code == 1 and result == "held":
+            held = tuple(sorted(getattr(up, "held_now", ()) or ()))
+            self.status = "보류 %d개 · %s" % (len(held), time.strftime("%H:%M"))
+            self._log_once(("held", held), "records_sync: held files=%s" % ",".join(os.path.splitext(n)[0] for n in held))
         elif code == 1:
             self._fail(result, "일부 실패 · " + time.strftime("%H:%M"), "%s (code 1)" % result)
         else:
@@ -178,7 +182,7 @@ class Syncer:
 
     def _on_error(self, src, what, *a):
         """records_sync 의 알림. 규칙 이름·파일 이름·줄 번호만 (필드 경로는 이름일 수 있어 뺀다)."""
-        if what == "blocked" and a:
+        if what in ("blocked", "held") and a:
             detail = "rule=%s file=%s line=%s" % tuple((list(a[:3]) + ["", "", ""])[:3])
         else:
             detail = ""

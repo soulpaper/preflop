@@ -519,11 +519,13 @@ class T24_Block(unittest.TestCase):
         base = mkbase("t24e")
         wr(base, "hands/" + D0, dline(1, extra=',"advice":{"reason":"nice play by synth nick01 here"}'))
         up = mk(base, fake_cfg(), fake=True, extra_names=[NICK])
-        self.assertEqual(run(up), 2)
+        self.assertEqual(run(up), 1)
         self.assertEqual(up.puts, [])
         with open(os.path.join(base, RS.STATE_NAME)) as f:
             st = json.load(f)
-        self.assertEqual(st["disabled_rule"], "known_name")
+        self.assertNotIn("disabled", st)
+        self.assertEqual(st["held"][D0]["rule"], "known_name")
+        self.assertEqual(st["last_result"], "held")
         self.assertNotIn("nick", json.dumps(st).lower().replace("nickname", ""))
 
     def test_24_reset_disabled(self):
@@ -1678,10 +1680,10 @@ class T48_ExtraNames(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         wr(base, "hands/" + D0, dline(1, extra=',"advice":{"reason":"x synthnick01 y"}'))
         up2 = mk(base, fake_cfg(), fake=True, extra_names=names)
-        self.assertEqual(run(up2), 2)
+        self.assertEqual(run(up2), 1)
         with open(os.path.join(base, RS.STATE_NAME)) as f:
             txt = f.read()
-        self.assertEqual(json.loads(txt)["disabled_rule"], "known_name")
+        self.assertEqual(json.loads(txt)["held"][D0]["rule"], "known_name")
         self.assertEqual(json.loads(txt)["name_check"], "known_names")
         self.assertNotIn(NICK.lower(), txt.lower())
 
@@ -2726,6 +2728,185 @@ class T61_AuditEnglish(unittest.TestCase):
         j = json.loads(out)
         for f in j["files"]:
             self.assertEqual((f["unk_ko"], f["unk_en"]), (0, 0), f)
+
+
+def _hand_pid(pid):
+    return ('{"id":"20261105_120000-0001","seats":{"hero":{"hero":true,"pid":null,"pos":"BTN"},"seat_TC":{"pid":"%s"}}}\n'
+            % pid).encode()
+
+
+def _held_base(name, names, reason=None, extra=None, other=True):
+    """D0 에 reason(또는 extra) 이 든 결정 한 줄, D1 에 정상 손 한 줄. (base, up, code)"""
+    base = mkbase(name)
+    ex = extra if extra is not None else ',"advice":{"reason":%s}' % json.dumps(reason, ensure_ascii=False)
+    wr(base, "hands/" + D0, dline(1, extra=ex))
+    if other:
+        wr(base, "hands/" + D1, hline(1))
+    errs = []
+    up = mk(base, fake_cfg(), fake=True, extra_names=names, on_error=lambda *a: errs.append(a))
+    up.errs = errs
+    return base, up, run(up)
+
+
+def _state(base):
+    with open(os.path.join(base, RS.STATE_NAME), encoding="utf-8") as f:
+        return json.load(f)
+
+
+class T62_NameHold(unittest.TestCase):
+    """알려진 이름 검사: 고정 칸 제외, 토큰 일치, 파일 보류(held)."""
+
+    def test_62_no_false_positive_pid_hex(self):
+        base = mkbase("t62a")
+        wr(base, "hands/" + D1, _hand_pid("p_cafe1234") + _hand_pid("p_beef0000").replace(b"0001", b"0002"))
+        up = mk(base, fake_cfg(), fake=True, extra_names=["cafe", "beef", "face"])
+        self.assertEqual(run(up), 0)
+        self.assertEqual(len(up.puts), 1)
+        self.assertEqual(_state(base)["held"], {})
+
+    def test_62_no_false_positive_action_words(self):
+        ex = (',"advice":{"action":"fold","action_ko":"폴드","color_key":"call","gto":{"actions":{"fold":1,"call":2,"check":3},'
+              '"line":"x_bet33_c","node":"check:call"}},"hero_pos":"BTN","street":"flop"')
+        base, up, code = _held_base("t62b", ["fold", "call", "check"], extra=ex, other=False)
+        self.assertEqual(code, 0, _state(base))
+        self.assertEqual(len(up.puts), 1)
+        self.assertEqual(_state(base)["held"], {})
+
+    def test_62_no_false_positive_cards_and_substring(self):
+        ex = ',"hero":["Js","Jh"],"hand_name":"원페어 (J)","advice":{"gto":{"combo":"JsJh"},"reason":"jack77 is fine"}'
+        base, up, code = _held_base("t62c", ["Jack"], extra=ex, other=False)
+        self.assertEqual(code, 0, _state(base))
+        self.assertEqual(len(up.puts), 1)
+
+    def test_62_true_hits_free_text(self):
+        for i, (names, text) in enumerate([
+                (["Jack"], "Jack"), (["Jack"], "(Jack)"), (["Jack"], "Jack,"), (["Jack"], "vs JACK raise"),
+                (["Synth Nick01"], "synth nick01"), (["Synth Nick01"], "synthnick01"), (["SynthNick01"], "synth nick01"),
+                (["Jack"], "Jack이 레이즈"), (["테스트닉"], "테스트닉님이 콜"), (["테스트닉"], "테스트닉이"),
+                (["테스트닉"], "[테스트닉]"), (["Ｊack"], "jack")]):
+            with self.subTest(text=text):
+                base, up, code = _held_base("t62d%d" % i, names, reason=text)
+                self.assertEqual(code, 1)
+                self.assertEqual(sorted(_state(base)["held"]), [D0])
+                self.assertEqual([p[0] for p in up.puts], [D1])
+
+    def test_62_code_field_hit(self):
+        ex = ',"advice":{"gto":{"node":"kingfish"}}'
+        base, up, code = _held_base("t62e", ["kingfish"], extra=ex)
+        self.assertEqual(code, 1)
+        self.assertEqual(sorted(_state(base)["held"]), [D0])
+
+    def test_62_held_d0_uploads_d1_only_and_no_names_in_output(self):
+        base, up, code = _held_base("t62f", ["Jack"], reason="hi Jack")
+        self.assertEqual(code, 1)
+        self.assertEqual([p[0] for p in up.puts], [D1])
+        st = _state(base)
+        self.assertEqual(st["last_result"], "held")
+        self.assertEqual(st["files"][D0]["result"], "held")
+        self.assertEqual(st["files"][D1]["result"], "uploaded")
+        h = st["held"][D0]
+        self.assertEqual((h["rule"], h["line"]), ("known_name", 1))
+        self.assertEqual(len(h["prefix_sha256"]), 64)
+        blob = (json.dumps(st) + repr(up.errs)).lower()
+        self.assertNotIn("jack", blob)
+        self.assertEqual(up.errs, [("records_sync", "held", "known_name", D0, 1)])
+
+    def test_62_held_persists_without_names_and_on_append(self):
+        base, up, code = _held_base("t62g", ["Jack"], reason="hi Jack")
+        since = _state(base)["held"][D0]["since"]
+        up2 = mk(base, fake_cfg(), fake=True, extra_names=[])
+        self.assertEqual(run(up2), 1)
+        self.assertEqual([x for x in up2.puts if x[0] == D0], [])
+        self.assertEqual(_state(base)["held"][D0]["since"], since)
+        with open(os.path.join(base, "hands", D0), "ab") as f:
+            f.write(dline(2, extra=',"advice":{"reason":"fine"}'))
+        up3 = mk(base, fake_cfg(), fake=True, extra_names=["Jack"])
+        self.assertEqual(run(up3), 1)
+        self.assertEqual([x for x in up3.puts if x[0] == D0], [])
+        self.assertIn(D0, _state(base)["held"])
+
+    def test_62_release_by_edit(self):
+        base, up, code = _held_base("t62h", ["Jack"], reason="hi Jack")
+        wr(base, "hands/" + D0, dline(1, extra=',"advice":{"reason":"hi there"}'))
+        up2 = mk(base, fake_cfg(), fake=True, extra_names=[])          # 해시가 바뀌어도 이름이 없으면 유지
+        self.assertEqual(run(up2), 1)
+        self.assertIn(D0, _state(base)["held"])
+        up3 = mk(base, fake_cfg(), fake=True, extra_names=["Jack"])
+        self.assertEqual(run(up3), 0)
+        self.assertIn(D0, [p[0] for p in up3.puts])
+        self.assertEqual(_state(base)["held"], {})
+
+    def test_62_release_held_command(self):
+        base, up, code = _held_base("t62i", ["Jack"], reason="hi Jack")
+        self.assertEqual(RS.main(["--base", base, "--release-held", D0]), 0)
+        self.assertEqual(_state(base)["held"], {})
+        up2 = mk(base, fake_cfg(), fake=True, extra_names=["Jack"])
+        self.assertEqual(run(up2), 1)                                    # 다시 검사해서 또 보류
+        self.assertIn(D0, _state(base)["held"])
+        self.assertEqual(RS.main(["--base", base, "--release-held", "all"]), 0)
+        self.assertEqual(_state(base)["held"], {})
+        self.assertEqual(RS.main(["--base", base, "--reset-disabled"]), 0)
+
+    def test_62_reset_disabled_keeps_held(self):
+        base, up, code = _held_base("t62j", ["Jack"], reason="hi Jack")
+        st = _state(base)
+        st["disabled"] = True
+        RS.save_state_atomic(os.path.join(base, RS.STATE_NAME), st)
+        self.assertEqual(RS.main(["--base", base, "--reset-disabled"]), 0)
+        st = _state(base)
+        self.assertNotIn("disabled", st)
+        self.assertIn(D0, st["held"])
+
+    def test_62_format_block_still_disables_and_keeps_held(self):
+        base, up, code = _held_base("t62k", ["Jack"], reason="hi Jack", other=False)
+        wr(base, "hands/" + D1, b'{"id":"20261105_120000-0001","id":"20261105_120000-0002"}\n')
+        up2 = mk(base, fake_cfg(), fake=True, extra_names=["Jack"])
+        self.assertEqual(run(up2), 2)
+        st = _state(base)
+        self.assertEqual(st["disabled_rule"], "dup_key")
+        self.assertIn(D0, st["held"])
+
+    def test_62_held_saved_when_network_fails(self):
+        base = mkbase("t62l")
+        wr(base, "hands/" + D0, dline(1, extra=',"advice":{"reason":"hi Jack"}'))
+        wr(base, "hands/" + D1, hline(1))
+        up = mk(base, fake_cfg(), extra_names=["Jack"])                  # fake 아님: 연결 실패
+        up._connect = lambda: (_ for _ in ()).throw(RS.ConnFail())
+        self.assertEqual(run(up), 3)
+        self.assertIn(D0, _state(base)["held"])
+
+    def test_62_held_pruned_when_file_gone(self):
+        base, up, code = _held_base("t62m", ["Jack"], reason="hi Jack")
+        os.remove(os.path.join(base, "hands", D0))
+        up2 = mk(base, fake_cfg(), fake=True, extra_names=["Jack"])
+        run(up2)
+        self.assertEqual(_state(base)["held"], {})
+
+    def test_62_name_check_report(self):
+        for i, (names, want, cnt) in enumerate([
+                (lambda: [], "shape_only", 0), (["abc", "ab"], "shape_only", 0), (["12345678"], "shape_only", 0),
+                (["Jack", "abc", "Jack"], "known_names", 1), (["Jack", "테스트닉"], "known_names", 2)]):
+            with self.subTest(i=i):
+                base, up, code = _held_base("t62n%d" % i, names, reason="fine", other=False)
+                st = _state(base)
+                self.assertEqual((st["name_check"], st["name_count"]), (want, cnt))
+
+    def test_62_short_and_numeric_names_ignored(self):
+        base, up, code = _held_base("t62o", ["abc", "12345", "ab"], reason="abc 12345 ab")
+        self.assertEqual(code, 0)
+
+    def test_62_name_check_strings_selection(self):
+        rec = RC.parse_line(json.dumps({
+            "id": DID0, "type": "decision", "seats": {"seat_TC": {"pid": "p_cafe1234", "type": "LAG"}},
+            "advice": {"action": "fold", "reason": "hello", "gto": {"line": "x_c", "actions": {"fold": 1}}}}))
+        got = RC.name_check_strings(RC.file_kind(D0), rec)
+        self.assertIn(("text", "hello"), got)
+        self.assertIn(("code", "x_c"), got)
+        self.assertIn(("code", "fold"), got)
+        vals = [s for _, s in got]
+        self.assertNotIn("p_cafe1234", vals)
+        self.assertNotIn("LAG", vals)
+        self.assertEqual(vals.count("fold"), 1)          # 행동 enum 값은 없고 맵 키만
 
 
 _MISSING = object()
