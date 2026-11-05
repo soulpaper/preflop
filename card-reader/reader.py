@@ -2566,6 +2566,7 @@ class App:
                 self.seat_types = st_m.SeatTypes(log=self.log_once) if st_m else None
 
                 def on_hand(rec, store=self.store):
+                    self.note_review(rec)   # 덜 잃기 복기: 기록에 rec['review'] (숫자·줄만), 화면에 지난 판 복기
                     tr = self.tracker
                     store.observe(rec, names=tr.names_for(rec.get("id")) if tr is not None else None)
                     if self.declog is not None:  # 내 결정 기록에 실제 행동·결과를 이어 붙임
@@ -3175,6 +3176,7 @@ class App:
         pre = self.anticipating() and not self.result_stale()
         if pre:
             ctx = self.anticipate_ctx(ctx)
+        self.guard_ctx = ctx   # 덜 잃기 경고의 팟·콜 금액 (render_beaters)
         key = repr(sorted((k, repr(v)) for k, v in ctx.items() if k != "villain_ranges")) + repr(self.result.get("rkey"))
         cards = (tuple(ctx["hero"]), tuple(ctx["board"]))
         if key == self.advice_key and not self.result_stale():
@@ -3793,6 +3795,9 @@ class App:
         n = iterations if iterations is not None else min(6000, int(self.cfg["iterations"]))
         res["equity"] = self.rangeq.equity_vs_ranges(list(hero), list(board), ranges, n)
         res["equity_basis"], res["villain_ranges"], res["villain_keys"] = "range", ranges, order
+        lr = _optional("lossreview")
+        if lr is not None and len(board) >= 3:  # 덜 잃기: 상대 범위 기준 '나를 이기는 패' (메이드 패일 때만, 몇 ms)
+            res["guard"] = lr.beat_info(list(hero), list(board), ranges)
         return res
 
     def finish_analysis(self, gen, state, res, rkey=None, final=True, shown=None):
@@ -3835,7 +3840,9 @@ class App:
                bool(self.cfg.get("auto_numbers")), repr(self.ocr_values), self.rec_on, self.rec_elapsed(),
                self.reads_sig(), repr((self.track or {}).get("names")), repr(self.cfg.get("section_layout")),
                repr((self.track or {}).get("prompt")), repr((self.track or {}).get("types")),
-               repr(self.tourney), repr(self.cfg.get("tourney")), self.cfg.get("ui_bias"), self.records_status())
+               repr(self.tourney), repr(self.cfg.get("tourney")), self.cfg.get("ui_bias"), self.records_status(),
+               id(getattr(self, "hand_review", None)),
+               repr([(getattr(self, "guard_ctx", None) or {}).get(k) for k in ("call", "pot", "pot_total", "board")]))
         if key == self.last_render and not force:
             return
         self.last_render = key
@@ -4481,6 +4488,9 @@ class App:
 
     def sec_equity(self, c, st):
         y = self.s(8)
+        rv = self.review_now()
+        if rv:   # 지난 판 복기 (다음 핸드 카드가 올 때까지)
+            y = self.render_review(c, y, rv)
         msg = self.view.get("message")
         if msg:
             return self.render_message(c, y, *msg)
@@ -5197,8 +5207,71 @@ class App:
             x = c.bbox(t)[2] + s(18)
         return self.render_beaters(c, c.bbox(t)[3] + s(4), res)
 
+    def guard_view(self, res):
+        """덜 잃기 경고 (lossreview.guard_lines): 상대 범위 기준 '나를 이기는 패' + 손해 한도 줄. 범위 계산이 없으면 None."""
+        lr = _optional("lossreview")
+        if lr is None or not res.get("guard"):
+            return None
+        cards = (tuple(ev.card_str(x) for x in res["hero"]), tuple(ev.card_str(x) for x in res["board"]))
+        ctx = getattr(self, "guard_ctx", None)
+        if not ctx or (tuple(ctx.get("hero") or ()), tuple(ctx.get("board") or ())) != cards:
+            ctx = None   # 지난 스트리트의 팟·콜 금액은 쓰지 않는다
+        try:   # 추천은 같은 카드로 계산된 것만 (추천과 반대로 말하지 않게 guard_lines 가 맞춘다)
+            return lr.guard_lines(res["guard"], ctx, self.advice if self.advice_cards == cards else None)
+        except Exception:
+            self.log_once("guard_lines")
+            return None
+
+    def render_guard(self, c, y, g):
+        s, W, P = self.s, self.s(self.W), self.s(self.P)
+        y += s(6)
+        t = self.text(c, P, y, g["lines"][0], FS_BODY, "bold", LOSE_C if g["p"] >= 0.05 else WIN_C, width=W - 2 * P)
+        y = c.bbox(t)[3] + s(3)
+        for line in g["lines"][1:2]:
+            t = self.text(c, P, y, line, FS_BODY, "bold", LOSE_C if g["fold"] else ACCENT, width=W - 2 * P)
+            y = c.bbox(t)[3] + s(3)
+        return y + s(2)
+
+    def review_now(self):
+        """지난 판 복기 (lossreview.review_hand 의 줄) — 다음 핸드 카드가 들어오기 전, 쉬는 화면/폴드 뒤 화면에서만."""
+        rv = getattr(self, "hand_review", None)
+        if not rv or not rv.get("lines") or not (self.view.get("message") or self.fold_view is not None):
+            return None
+        hero = {x for x in self.view.get("hero", []) if ev.is_card(x)}
+        return None if hero and hero != set(rv["hero"]) else rv
+
+    def render_review(self, c, y, rv):
+        s, W, P = self.s, self.s(self.W), self.s(self.P)
+        t = self.text(c, P, y, "지난 판 복기", FS_H, "bold", WARN)
+        y = c.bbox(t)[3] + s(4)
+        for i, line in enumerate(rv["lines"][:3]):
+            t = self.text(c, P, y, line, FS_BODY, "bold", LOSE_C if i == 0 and line.startswith("상대") else TEXT,
+                          width=W - 2 * P)
+            y = c.bbox(t)[3] + s(4)
+        return y + s(8)
+
+    def note_review(self, rec):
+        """끝난 핸드 → 복기 (상태 스레드, Tracker.on_hand). 기록에는 숫자·줄만 rec['review'] (닉네임 없음), 화면엔 다음 핸드 전까지."""
+        lr = _optional("lossreview")
+        if lr is None or not isinstance(rec, dict):
+            return
+        try:
+            rv = lr.review_hand(rec, iters=800)   # 상태 스레드: 몬테카를로를 줄여 핸드 끝 멈춤을 짧게
+            fields = lr.log_fields(rv)
+            if fields and (fields.get("lines") or fields.get("result_bb") is not None):
+                rec["review"] = fields
+            if rv.get("lines"):
+                self.hand_review = {"id": rec.get("id"), "hero": tuple(rec.get("hero_cards") or ()),
+                                    "lines": list(rv["lines"])}
+        except Exception:
+            self.log_once("lossreview")
+
     def render_beaters(self, c, y, res):
-        """메이드 패일 때 '질 수 있는 패': 족보마다 한 줄 (센 족보 먼저, 최대 4줄), 줄마다 예시 최대 4개 + 조합 수."""
+        """메이드 패일 때 '질 수 있는 패': 족보마다 한 줄 (센 족보 먼저, 최대 4줄), 줄마다 예시 최대 4개 + 조합 수.
+        상대 범위 계산이 있으면 그 대신 덜 잃기 경고 (범위 기준 이기는 패 + 손해 한도)."""
+        g = self.guard_view(res)
+        if g:
+            return self.render_guard(c, y, g)
         info = res.get("beaters")
         if not info or not info.get("total"):
             return y

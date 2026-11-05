@@ -399,6 +399,64 @@ def layout_cases(app):
     return fails
 
 
+def guard_review_cases(app):
+    """덜 잃기: (1) 벳을 받은 메이드 패 → 범위 기준 '나를 이기는 패' + 손해 한도 줄이 그려짐 (추천과 같은 쪽),
+    (2) 핸드가 끝난 뒤 쉬는 화면/폴드 뒤 화면에 '지난 판 복기' 3줄, 다음 핸드 카드가 오면 사라짐. 모두 한 화면 안."""
+    import lossreview
+    fails = []
+    saved = app.track, app.table_state, getattr(app, "hand_review", None), app.fold_view
+    app.declog = None
+    hero, board = ["Jh", "4c"], ["2h", "5h", "8h", "9h"]
+    try:
+        app.track = {"reads": None, "names": {}, "profiles": {}, "live": {}}
+        for k, v in (("pot", "8BB"), ("bet", "6BB"), ("my_stack", "60BB")):
+            app.set_input(k, v)
+        for call, rng, want in ((6.0, {"AhQs": 1.0, "KhQd": 1.0, "QhTd": 1.0, "7s7d": 0.3}, "접는 게 덜 잃어요"),
+                                (6.0, {"AhQs": 1.0, "KhQd": 1.0, "7s7d": 1.0}, "앞으로 최대"),
+                                (2.0, {"AhQs": 1.0, "7s7d": 4.0, "QcJc": 4.0}, "끝까지 가도")):
+            app.table_state = table([seat("seat_TC", "BTN", bet=call)], call=call)
+            state(app, hero, board)
+            app.result["guard"] = lossreview.beat_info(hero, board, [rng])
+            app.advice_key = None
+            app.compute_advice()
+            app.render(force=True)
+            app.root.update()
+            txt = canvas_text(app)
+            act = (app.advice or {}).get("action")
+            ok = "나를 이기는 패" in txt and "더 높은 플러시 (" in txt and max(app.col_bottoms) <= app.win_h
+            g = app.guard_view(app.result) or {}
+            ok = ok and (want in txt or (g.get("fold") and act not in (None, "fold") and "더 커지면 접기" in txt))
+            if g.get("fold") and act not in (None, "fold"):   # 추천과 반대로 말하지 않음
+                ok = ok and "접는 게 덜 잃어요" not in txt
+            print("ok  " if ok else "FAIL", "덜 잃기 경고 (콜", call, ") 추천", act, "|", g.get("lines"))
+            if not ok:
+                fails.append(f"guard {call} {want}")
+        lines = ["상대(BB) A♥Q♠ A 플러시 — 내 J 플러시보다 높음",
+                 "잃은 칩 대부분은 리버 콜 12BB · 그 벳 범위에서 내가 이기는 경우 20% → 접었으면 12BB 덜 잃음",
+                 "턴에 팟 크기 벳 했으면 상대가 접을 확률 약 45% → 평균 +3BB (추정)"]
+        app.hand_review = {"id": "t-1", "hero": tuple(hero), "lines": lines}
+        for label, view, fold_view, shown in (
+                ("쉬는 화면", {"hero": [], "board": [], "message": ("핸드 대기 중", "")}, None, True),
+                ("폴드 뒤 화면", {"hero": hero, "board": board + ["3d"], "folded": True}, True, True),
+                ("다음 핸드 카드", {"hero": ["Ac", "Kd"], "board": [], "message": ("딜링 중", "")}, None, False)):
+            app.fold_view = dict(view) if fold_view else None
+            app.view = dict(view)
+            app.table_state = None
+            app.render(force=True)
+            app.root.update()
+            txt = canvas_text(app)
+            drawn = "지난 판 복기" in txt and all(x in txt for x in lines)
+            ok = drawn == shown and max(app.col_bottoms) <= app.win_h
+            print("ok  " if ok else "FAIL", "지난 판 복기:", label, "| 보임", drawn)
+            if not ok:
+                fails.append(f"review {label}")
+    finally:
+        app.track, app.table_state, app.hand_review, app.fold_view = saved
+        app.render(force=True)
+        app.root.update()
+    return fails
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -436,6 +494,7 @@ def main():
         fails += len(icm_case(app))
         fails += len(layout_cases(app))
         fails += len(type_cases(app))
+        fails += len(guard_review_cases(app))
     except Exception as e:
         import traceback
         traceback.print_exc()
