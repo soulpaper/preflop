@@ -265,8 +265,8 @@ test("derive ④: 오픈 두 번 읽음 → D: 3벳 1, C: 기회 0·pfr 1",
 # --- 9. 기여 분리 (ablation): 합성 기록 ---------------------------------------------------------------------
 rows_a, _, _ = sr.score_hands([TYP, OLD, OLD2], [DEC_T], ablation=True)
 ba = {(r["hand"], r["street"]): r for r in rows_a}
-test("abl: 모든 행에 변형 5개 (순서 고정)", all(list(r["abl"]) == list(sr.ABL_NAMES) and len(r["abl"]) == 5 for r in rows_a)
-     and sr.ABL_NAMES == ("base", "+tail", "+mult", "+style", "+style1"))
+test("abl: 모든 행에 변형 7개 (순서 고정)", all(list(r["abl"]) == list(sr.ABL_NAMES) and len(r["abl"]) == 7 for r in rows_a)
+     and sr.ABL_NAMES == ("base", "+tail", "+mult", "+style", "+style1", "app", "+aggr_m"))
 test("abl: 재생 뒤 스위치 복원", (hr.MULT_SET, hr.PRE_FLOOR, hr.STYLE_STRENGTH) == ("prev", 0.07, 0.5))
 test("abl: 유형 없는 행은 +style == +mult == +style1",
      all(r["abl"]["+style"] == r["abl"]["+mult"] == r["abl"]["+style1"] for r in rows_a if r["type"] == "없음"))
@@ -283,7 +283,7 @@ test("abl: 기본 호출은 abl 없음 (기존 JSON 형태)", all("abl" not in r
 
 def srow(h, seat, lls, typ="LP", uni=5.0):
     return {"hand": h, "seat": seat, "street": "flop", "type": typ, "uniform": {"ll": uni},
-            "abl": {n: {"ll": ll} for n, ll in zip(sr.ABL_NAMES, lls)}}
+            "abl": {n: {"ll": ll} for n, ll in zip(sr.ABL_NAMES, list(lls) + [lls[-1]] * 2)}}
 
 
 def synth(steps, n=30, typ="LP"):
@@ -304,7 +304,7 @@ b2 = sr.bootstrap_ablation(good, B=200)
 b3 = sr.bootstrap_ablation(good, B=200, seed=1)
 test("bootstrap: 같은 seed 면 같은 결과, 다른 seed 면 구간이 다름", b1 == b2 and b1["delta"] != b3["delta"])
 test("bootstrap: Δ 추정치 = 0.3/ln2 근처, 구간 안에 추정치",
-     all(abs(d[0] - (0.3 + 0.01) / math.log(2)) < 0.05 and d[1] <= d[0] <= d[2] for d in b1["delta"].values()))
+     all(abs(d[0] - (0.3 + 0.01) / math.log(2)) < 0.05 and d[1] <= d[0] <= d[2] for k, d in b1["delta"].items() if k not in ("app-+style1", "+aggr_m-app")))
 test("bootstrap: 변형별 정보이득은 변형 순서대로 커짐", [b1["bits"][n][0] for n in sr.ABL_NAMES]
      == sorted(b1["bits"][n][0] for n in sr.ABL_NAMES))
 dup = good + [dict(good[0]), dict(good[0]), dict(good[0], street="turn")]      # 같은 (hand, seat) 행 복제 → 묶음 수 그대로
@@ -383,7 +383,7 @@ with tempfile.TemporaryDirectory() as d:
     with open(outp, encoding="utf-8") as f:
         jj = json.load(f)
     test("main: 기본은 기여 분리 포함 (rows[].abl, summary.ablation)", "abl" in jj["rows"][0]
-         and set(jj["summary"]["ablation"]) == {"all", "post", "decision"} and len(jj["rows"][0]["abl"]) == 5)
+         and set(jj["summary"]["ablation"]) == {"all", "post", "decision", "aggr"} and len(jj["rows"][0]["abl"]) == 7)
     sr.main([d, "--json", outp, "--quiet", "--no-ablation"])
     with open(outp, encoding="utf-8") as f:
         jj = json.load(f)
@@ -467,6 +467,60 @@ _bb3 = _io.StringIO()
 sr._report_by_row(r1, _bb3.write)
 test("report: 액션 행별 절 + 보정 줄", "액션 행별 채점" in _bb3.getvalue() and "bet_big" in _bb3.getvalue()
      and "분류 보정" in _bb3.getvalue() and "flop/bet_big" in _bb3.getvalue())
+
+# --- 12. +aggr_m 판정 / --since ---------------------------------------------------------------------------
+def arow(h, kind, d, n_extra=0):
+    """app ll=5.0, +aggr_m ll=5.0-d (d>0 이면 +aggr_m 이 좋아짐)."""
+    return {"hand": h, "seat": "V", "street": "flop", "kind": kind, "type": "없음", "uniform": {"ll": 6.0},
+            "abl": {n: {"ll": 5.0} for n in sr.ABL_NAMES} | {"+aggr_m": {"ll": 5.0 - d}}}
+
+
+def aggr_set(n, d, kind="allin", jitter=True):
+    return [arow(f"a{j}", kind, d + (0.02 * (j % 3) if jitter else 0)) for j in range(n)]
+
+
+plain = [arow(f"p{j}", "bet_med", 0.0) for j in range(30)]
+da = sr.decide_aggr(aggr_set(50, 0.2) + plain, B=200)
+test("decide_aggr: 행 50, 분명히 좋아짐 → switch, 전체 Δ 는 희석", da["verdict"] == "switch" and da["n_aggr_rows"] == 50
+     and da["n_post_rows"] == 80 and da["aggr"][1] > 0 and 0 < da["all"][0] < da["aggr"][0], str(da))
+da = sr.decide_aggr(aggr_set(50, -0.2) + plain, B=200)
+test("decide_aggr: 분명히 나빠짐 → drop", da["verdict"] == "drop" and da["aggr"][2] < 0, str(da))
+da = sr.decide_aggr(aggr_set(25, 0.2) + [arow(f"b{j}", "raise", -0.2) for j in range(25)] + plain, B=200)
+test("decide_aggr: 구간이 0 을 걸치면 hold", da["verdict"] == "hold" and da["aggr"][1] < 0 < da["aggr"][2], str(da))
+da = sr.decide_aggr(aggr_set(39, 0.2) + plain, B=200)
+test("decide_aggr: 행 39 < 40 이면 좋아져도 hold", da["verdict"] == "hold" and da["n_aggr_rows"] == 39 and da["aggr"][1] > 0)
+da = sr.decide_aggr(aggr_set(40, 0.2, "checkraise") + plain, B=200)
+test("decide_aggr: 행 정확히 40 (checkraise) → switch", da["verdict"] == "switch" and da["n_aggr_rows"] == 40)
+da = sr.decide_aggr(plain, B=50)
+test("decide_aggr: 대상 행 없음 → hold, aggr None", da["verdict"] == "hold" and da["aggr"] is None and da["n_aggr_rows"] == 0)
+test("decide_aggr: 같은 seed 면 같은 결과", sr.decide_aggr(aggr_set(50, 0.2), B=100) == sr.decide_aggr(aggr_set(50, 0.2), B=100))
+test("aggr_verdict: 경계", sr.aggr_verdict(40, (0.1, 0.0, 0.2)) == "hold" and sr.aggr_verdict(40, (0.1, 0.01, 0.2)) == "switch"
+     and sr.aggr_verdict(100, (-0.1, -0.2, 0.0)) == "hold" and sr.aggr_verdict(100, None) == "hold")
+_bb4 = _io.StringIO()
+sr.report(dict(sbf, ablation={"all": b1, "post": b1, "decision": sr.decide(b1), "aggr": sr.decide_aggr(aggr_set(50, 0.2), B=50)}), _bb4)
+test("report: +aggr_m 절", "+aggr_m − app" in _bb4.getvalue() and "판정: switch" in _bb4.getvalue())
+with tempfile.TemporaryDirectory() as d:
+    for nm in ("2026-01-01", "2026-02-01", "2026-03-01"):
+        with open(os.path.join(d, nm + ".jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps(dict(REC, id="id-" + nm)) + "\n")
+    with open(os.path.join(d, "decisions_2026-01-01.jsonl"), "w", encoding="utf-8") as f:
+        f.write(json.dumps(DEC_T) + "\n")
+    h_all, d_all = sr.load(d)
+    h_s, d_s = sr.load(d, since="2026-02-01")
+    h_n, _ = sr.load(d, since="2026-03-02")
+    test("--since: 파일 날짜 이상만 (경계 포함), 결정 기록은 그대로",
+         [h["id"] for h in h_all] == ["id-2026-01-01", "id-2026-02-01", "id-2026-03-01"]
+         and [h["id"] for h in h_s] == ["id-2026-02-01", "id-2026-03-01"] and h_n == [] and len(d_s) == len(d_all) == 1)
+    outp = os.path.join(d, "o.json")
+    s_since = sr.main([d, "--json", outp, "--quiet", "--no-ablation", "--since", "2026-03-02"])
+    s_full = sr.main([d, "--json", outp, "--quiet", "--no-ablation"])
+    test("--since main: 날짜 이후 파일이 없으면 행 0", s_since["n_rows"] == 0 < s_full["n_rows"], f"{s_since['n_rows']} {s_full['n_rows']}")
+    try:
+        sr.main([d, "--quiet", "--since", "2026/03/01"])
+        _bad_since = False
+    except SystemExit:
+        _bad_since = True
+    test("--since: 형식 오류는 종료", _bad_since)
 
 # --- 결과 ---------------------------------------------------------------------------------------
 failed = 0

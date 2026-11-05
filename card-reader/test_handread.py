@@ -492,6 +492,36 @@ _d0, _d1, _d05 = (cl(r, MP) for r in (_s0, _s1, _s05))
 test("STYLE 0.5 (기본): LP 콜 중간 페어 차이가 0 과 1.0 사이", 0 < _d05 - cl(sty(_STY_CALL, None), MP) < _d1 - _d0 and _s05["style"] == "LP",
      f"{_d0} / {_d05} / {_d1}")
 
+# --- aggr_m (평가 전용 MULT_SET) -----------------------------------------------------------------------
+_orig_mult2 = {k: (list(v[0]), v[1]) for k, v in hr.MULT.items()}
+_scen = [(k, ad, af) for k in ("bet_med", "raise", "allin", "checkraise", "cbet_med", "check", "call_med") for ad, af in ((0, 0), (1, 0.5))]
+_before = [hr._kind_mults_base(*x) for x in _scen]
+_aggr = {}
+with hr.switches(mult_set="aggr_m"):
+    _aggr = [hr._kind_mults_base(*x) for x in _scen]
+    _aggr_cb = hr.MULT["cbet_med"]
+_after = [hr._kind_mults_base(*x) for x in _scen]
+test("aggr_m: 기본 MULT_SET 은 prev 그대로, 왕복 뒤 결과·MULT 동일",
+     hr.MULT_SET == "prev" and _before == _after and "aggr_m" in hr.MULT_SETS
+     and hr.MULT == {k: (v[0], v[1]) for k, v in _orig_mult2.items()})
+_P, _G = hr.MULT_SETS["prev"], hr.MULT_SETS["aggr_m"]
+test("aggr_m: allin/raise/checkraise 의 M(·allin T,A) 만 올라가고 나머지 행·값은 prev 와 같다",
+     _G["allin"] == ([1.00, 0.80, 0.40, 0.15, 0.15], 0.45) and _G["raise"][0][hr.M] == 0.15
+     and _G["checkraise"][0][hr.M] == 0.15 and _G["raise"][0][:3] == _P["raise"][0][:3]
+     and _G["raise"][0][4] == _P["raise"][0][4] and _G["checkraise"][0][:3] == _P["checkraise"][0][:3]
+     and all(_G[k] == _P[k] for k in _P if k not in ("allin", "raise", "checkraise")))
+_diff = [x[0] != y[0] for x, y in zip(_before, _aggr)]
+test("aggr_m: 시나리오에서 allin/raise/checkraise 만 달라지고 역할 행(cbet)·bet·call·check 는 같다",
+     [(s_[0], d_) for s_, d_ in zip(_scen, _diff) if d_] and all(d_ == (s_[0] in ("raise", "allin", "checkraise"))
+                                                          for s_, d_ in zip(_scen, _diff)))
+test("aggr_m: 중간 페어 가중치 상승 (allin 0.07→0.15, raise 0.08→0.15, checkraise 0.06→0.15)",
+     _aggr[4][0][hr.M] > _before[4][0][hr.M] and _aggr[2][0][hr.M] > _before[2][0][hr.M]
+     and _aggr[6][0][hr.M] > _before[6][0][hr.M] and _aggr_cb == hr.MULT["cbet_med"])
+_o = hr.configure(mult_set="aggr_m")
+_ok_cfg = hr.MULT_SET == "aggr_m"
+hr.configure(**_o)
+test("aggr_m: configure(mult_set='aggr_m') 와 복원", _ok_cfg and hr.MULT_SET == "prev" and _o["mult_set"] == "prev")
+
 # --- 결과 ---------------------------------------------------------------------------------------
 failed = 0
 for ok, name, info in results:

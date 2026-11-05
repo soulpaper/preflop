@@ -1,6 +1,6 @@
 """상대 핸드 리딩 채점 — 쇼다운에서 공개된 상대 실제 카드로 '우리 예상이 맞았나'를 잰다.
 
-    python score_reads.py [핸드기록 폴더] [--ok-only] [--json 경로] [--quiet]
+    python score_reads.py [핸드기록 폴더] [--since YYYY-MM-DD] [--ok-only] [--json 경로] [--quiet]
 
   폴더: 인자 > 환경변수 CARD_READER_DATA > <이 파일 폴더>/dist/hands
         (YYYY-MM-DD.jsonl 핸드 기록 + decisions_YYYY-MM-DD.jsonl 결정 기록. 저장소에는 데이터를 두지 않는다)
@@ -59,6 +59,9 @@ ABLATION = (
     ("+mult", {"mult_set": "current", "pre_floor": 0.07, "style_strength": 0}),
     ("+style", {"mult_set": "current", "pre_floor": 0.07, "style_strength": 0.5}),
     ("+style1", {"mult_set": "current", "pre_floor": 0.07, "style_strength": 1.0}),
+    # 아래 둘은 앱 현재 기본값(app)과 올인/레이즈 중간 페어 배율 상향안(+aggr_m) 비교용 — decide_aggr 가 둘만 짝지어 본다
+    ("app", {"mult_set": "prev", "pre_floor": 0.07, "style_strength": 0.5}),
+    ("+aggr_m", {"mult_set": "aggr_m", "pre_floor": 0.07, "style_strength": 0.5}),
 )
 ABL_NAMES = tuple(n for n, _ in ABLATION)
 BOOT_SEED = 20261105
@@ -96,12 +99,15 @@ def _read_jsonl(path):
     return out
 
 
-def load(folder):
-    """(핸드 기록 리스트, 결정 기록 리스트)."""
+def load(folder, since=None):
+    """(핸드 기록 리스트, 결정 기록 리스트). since="YYYY-MM-DD" 이면 그 날짜 이후(포함) 파일의 핸드만
+    (날짜는 파일 이름 YYYY-MM-DD.jsonl 기준; 결정 기록은 프로필·세션 기본값 맥락이라 거르지 않는다)."""
     hands, decs = [], []
     for f in sorted(glob.glob(os.path.join(folder, "*.jsonl"))):
         name = os.path.basename(f)
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.jsonl", name):
+            if since and name[:10] < since:
+                continue
             hands.extend(r for r in _read_jsonl(f) if r.get("actions") is not None and r.get("seats"))
         elif name.startswith("decisions_"):
             decs.extend(r for r in _read_jsonl(f) if r.get("type") == "decision")
@@ -440,7 +446,7 @@ def _session_defaults(decs):
 
 
 def score_hands(hands, decs, ok_only=False, ablation=False):
-    """→ (rows, logged_rows, skipped Counter). ablation=True 면 행마다 row["abl"][변형] = 점수 (ABLATION 5개)."""
+    """→ (rows, logged_rows, skipped Counter). ablation=True 면 행마다 row["abl"][변형] = 점수 (ABLATION 7개)."""
     skipped = Counter()
     decs_by_hand = defaultdict(list)
     for d in sorted(decs, key=lambda d: d.get("t") or 0):
@@ -846,6 +852,57 @@ def decide(boot):
     return out
 
 
+AGGR_ROWS = ("raise", "checkraise", "allin")
+AGGR_MIN_ROWS = 40
+
+
+def decide_aggr(rows, B=1000, seed=BOOT_SEED):
+    """+aggr_m − app 의 Δbit(짝지은 (hand, seat) 묶음 부트스트랩, 95% 구간): 포스트플랍 전체 행과 액션이 raise/checkraise/allin 인 행.
+    판정은 후자 기준: n_aggr_rows >= 40 이고 하한 > 0 이면 "switch", 상한 < 0 이면 "drop", 그 외 "hold".
+    (배율을 바꾼 행만 점수가 달라지므로 전체 Δ 는 같은 합을 더 큰 n 으로 나눈 희석판이다.)
+    → {"n_post_rows", "n_aggr_rows", "all": (추정, 하한, 상한)|None, "aggr": (...)|None, "verdict"}"""
+    ln2 = math.log(2)
+
+    def est(vs):
+        n = sum(v[0] for v in vs)
+        return (sum(v[1] - v[2] for v in vs) / n / ln2) if n else None
+
+    def boot(subset):
+        bun = OrderedDict()
+        for r in rows:
+            a = r.get("abl")
+            if r["street"] == "preflop" or not a or "app" not in a or "+aggr_m" not in a or not subset(r):
+                continue
+            v = bun.setdefault((r["hand"], r["seat"]), [0, 0.0, 0.0])
+            v[0] += 1
+            v[1] += a["app"]["ll"]
+            v[2] += a["+aggr_m"]["ll"]
+        vecs = list(bun.values())
+        n = sum(v[0] for v in vecs)
+        e = est(vecs)
+        if e is None:
+            return n, None
+        rng = random.Random(seed)
+        xs = sorted(est([vecs[rng.randrange(len(vecs))] for _ in vecs]) for _ in range(B)) if B > 0 else []
+        return n, ((e, _pctile(xs, 0.025), _pctile(xs, 0.975)) if xs else (e, e, e))
+
+    n_all, d_all = boot(lambda r: True)
+    n_ag, d_ag = boot(lambda r: row_label(r.get("kind")) in AGGR_ROWS)
+    return {"n_post_rows": n_all, "n_aggr_rows": n_ag, "all": d_all, "aggr": d_ag,
+            "verdict": aggr_verdict(n_ag, d_ag)}
+
+
+def aggr_verdict(n_aggr_rows, ci):
+    """ci: (추정, 하한, 상한) 또는 None."""
+    if ci is None or n_aggr_rows < AGGR_MIN_ROWS:
+        return "hold"
+    if ci[1] > 0:
+        return "switch"
+    if ci[2] < 0:
+        return "drop"
+    return "hold"
+
+
 # --- 벳 후 폴드율 (유형별) ------------------------------------------------------------------------
 def wilson(k, n, z=1.96):
     """이항 비율의 Wilson 95% 구간 (하한, 상한)."""
@@ -1029,6 +1086,8 @@ def _report_ablation(ab, w):
             w(f"    {nm:<8} {_ci(b['bits'].get(nm))}\n")
         for nm, d in b["delta"].items():
             w(f"    Δ {nm:<14} {_ci(d)}\n")
+    if ab.get("aggr"):
+        _report_aggr(ab["aggr"], w)
     dec = ab.get("decision")
     if dec:
         w("  [판정 (포스트플랍 기준; 구간 하한>0 유지 / 상한<0 되돌림 / 그 외 근거 부족=되돌림 권고)]\n")
@@ -1037,6 +1096,13 @@ def _report_ablation(ab, w):
             w(f"    {ko}: {v['verdict']} — {v['action']} (Δ {_ci(v['delta'])})\n")
         if dec.get("style_strength_suggest"):
             w(f"    STYLE_STRENGTH {dec['style_strength_suggest']} 이 0.5 보다 낫다 (구간 하한>0) → 1.0 제안\n")
+
+
+def _report_aggr(da, w):
+    w(f"\n[+aggr_m − app: Δbit (올인/레이즈/체크레이즈 중간 페어 배율 상향안, 평가 전용), 짝지은 부트스트랩 95% 구간]\n")
+    w(f"  포스트플랍 전체 (행 {da['n_post_rows']}): {_ci(da['all'])}\n")
+    w(f"  allin/raise/checkraise 행 (행 {da['n_aggr_rows']}, 최소 {AGGR_MIN_ROWS}): {_ci(da['aggr'])}\n")
+    w(f"  판정: {da['verdict']} (switch = 행>={AGGR_MIN_ROWS} 이고 하한>0 / drop = 상한<0 / 그 외 hold)\n")
 
 
 def _jsonable(rows):
@@ -1062,18 +1128,22 @@ def main(argv=None):
     ap.add_argument("--json", help=f"JSON 요약 경로 (기본: 데이터 폴더/{OUT_NAME})")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--boot", type=int, default=1000, help="기여 분리 부트스트랩 횟수 (기본 1000, 0 이면 생략)")
+    ap.add_argument("--since", metavar="YYYY-MM-DD", help="이 날짜 이후(포함) 핸드 파일만 채점 (파일 이름 YYYY-MM-DD.jsonl 기준)")
     ap.add_argument("--no-ablation", action="store_true", help="기여 분리(변형별 재생) 건너뜀")
     args = ap.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     folder = data_dir(args.folder)
-    hands, decs = load(folder)
+    if args.since and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.since):
+        ap.error("--since 는 YYYY-MM-DD 형식이어야 합니다")
+    hands, decs = load(folder, since=args.since)
     abl = not args.no_ablation
     rows, lrows, skipped = score_hands(hands, decs, ok_only=args.ok_only, ablation=abl)
     s = summarize(rows, lrows, skipped, bet_fold=bet_fold_rates(hands, decs), boot=args.boot)
     if abl and args.boot > 0 and rows:
         post = bootstrap_ablation(rows, args.boot, subset=lambda r: r["street"] != "preflop")
-        s["ablation"] = {"all": bootstrap_ablation(rows, args.boot), "post": post, "decision": decide(post)}
+        s["ablation"] = {"all": bootstrap_ablation(rows, args.boot), "post": post, "decision": decide(post),
+                         "aggr": decide_aggr(rows, args.boot)}
     if not args.quiet:
         report(s)
     path = args.json or os.path.join(folder, OUT_NAME)

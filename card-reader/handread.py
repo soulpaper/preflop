@@ -94,6 +94,16 @@ MULT_SETS["prev"]["bet_med"][0][2] = 1.00
 MULT_SETS["prev"]["bet_med"][0][3] = 0.50
 MULT_SETS["prev"]["bet_big"][0][3] = 0.18
 MULT_SETS["prev"]["check"][0][2] = 0.85
+# aggr_m: 평가 전용 (기본값은 계속 "prev"). 616a833 시점 by_row 채점(141좌석)에서 올인+레이즈 행이 중간·약한 페어를
+#   과소예측했다 (합산 6/26 = 23%, Wilson 약 11~42%, 예측 약 8%). 로그 공간에서 관측 쪽으로 약 절반만 옮긴 값:
+#   allin M 0.07→0.15, A 0.10→0.15, T 0.45→0.40 / raise M 0.08→0.15 / checkraise M 0.06→0.15.
+#   표본 밖 검증으로 결정하기 전까지 기본은 prev 로 두고, score_reads 의 "+aggr_m" 변형으로만 비교한다.
+MULT_SETS["aggr_m"] = {k: (list(v[0]), v[1]) for k, v in MULT_SETS["prev"].items()}
+MULT_SETS["aggr_m"]["allin"][0][M] = 0.15
+MULT_SETS["aggr_m"]["allin"][0][A] = 0.15
+MULT_SETS["aggr_m"]["allin"][0][T] = 0.40
+MULT_SETS["aggr_m"]["raise"][0][M] = 0.15
+MULT_SETS["aggr_m"]["checkraise"][0][M] = 0.15
 MULT_SET = "prev"
 _MULT_BUILT = None
 # --- 주도권(이니셔티브)별 벳 --------------------------------------------------------------
