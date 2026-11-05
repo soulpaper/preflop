@@ -12,16 +12,26 @@
 타입을 좌석별로 기억해 상대 읽기에 쓴다. 닉네임·타입 모두 디스크에 쓰지 않는다 (핸드 기록에는 좌석별 타입만 handlog 가 씀).
 
 좌석 초기화 (그 좌석 타입을 버림)
-  - 확정된 닉네임이 기억과 다른 사람으로 CHANGE_READS 프레임 연속 읽힘 (잘린 이름의 접두사 / OCR 오타 정도 차이는 같은 사람)
-  - 빈자리로 EMPTY_READS 프레임 연속 보임 (떠남 → 다음에 앉는 사람은 새 사람)
+  - 빈자리로 EMPTY_READS 프레임 연속 + EMPTY_SECS 초 넘게 보임 (떠남 → 다음에 앉는 사람은 새 사람) — 가장 믿을 만한 신호.
+    승리 애니메이션은 좌석을 몇 초 가리고, 쇼다운 글자·휴식 안내는 여러 좌석을 한꺼번에 가림(OVERLAY_SEATS) → 세지 않음
+  - 확정된 닉네임이 기억과 다른 사람으로 CHANGE_READS 프레임 연속, 그리고 CHANGE_SECS 초 넘게 읽힘. OCR 은 잘 틀리므로
+    잘린 이름의 접두사 / 글자 유사도 SAME_RATIO 이상 / 글자 지문(names.fp_similarity)이 같으면 같은 사람으로 보고,
+    글자 지문이 '다르다'고 확인되지 않았거나 이름이 반쯤 닮았으면(LIKE_RATIO) CHANGE_SECS_WEAK 초를 봐야 함
   - TABLE_MOVE_SEATS 자리 이상이 TABLE_MOVE_WINDOW 초 안에 바뀜 = 테이블 이동/합치기 → 모든 좌석 초기화
   - reset(): 새 [자동 지정] 세션 (앱이 track_new_session 에서 부름)
-팝업 → 좌석: 팝업 닉네임과 같은 사람(위 규칙)인 좌석이 하나면 그 좌석. 없고 지금 눌러 달라고 한 좌석의 닉네임을 아직 못 읽었으면
-  그 좌석 (사용자가 안내대로 눌렀다고 봄). 그 밖(모호/다른 좌석)이면 저장하지 않음.
+팝업 → 좌석 (OCR 이 틀려도 안내대로 누른 것은 저장되게, 애매하면 다른 좌석으로 옮기지 않게)
+  0. 같은 팝업 이름을 이미 저장한 좌석 하나 → 그 좌석
+  1. 팝업 닉네임과 정확히 같은 이름(또는 4글자 이상 잘린 이름의 접두사)인 좌석이 하나 → 그 좌석
+  2. 안내 중인 좌석(PROMPT_RECENT 초 안에 보여 줌)의 이름을 못 읽었거나 반쯤이라도 닮았으면(LIKE_RATIO) → 그 좌석
+     (다른 좌석 이름이 매우 닮았으면(STRONG_RATIO) 사용자가 그쪽을 누른 것 → 3으로)
+  3. 같은 사람(유사도 SAME_RATIO)인 좌석이 하나 → 그 좌석. 단 이미 다른 사람의 팝업 타입이 있는 좌석이면 옮기지 않음
+  그 밖(모호/다른 좌석)이면 저장하지 않음.
 안내 (prompt) — 앱은 아무것도 클릭하지 않는다. 사용자에게 어느 캐릭터를 눌러 달라고 큰 글씨로 한 자리씩만.
   - 내가 쉴 때만: 내 차례/예약(preaction)이 아니고, 폴드했거나 이번 핸드에 카드가 없을 때 (차례 시간 ~9.8초를 뺏지 않게)
   - 타입을 모르는 상대만 (한 번 읽으면 그 좌석이 초기화되기 전까지 다시 묻지 않음)
   - 우선순위: 아직 핸드에 남은 상대 → 이번 핸드에 자발적으로 칩을 넣은(루즈/액티브) 상대 → 나보다 뒤에 행동하는 상대 → 자리 순
+  - 문구: 닉네임이 확실할 때만(NameReader 확정 + 여러 전처리가 같은 글자 + NAME_STABLE 프레임 그대로) '닉네임 님을 눌러 주세요',
+    아니면 화면 위치로 '오른쪽 위 사람을 눌러 주세요'. 아래 줄에는 늘 화면 위치를 먼저 (포지션 이름보다 알아보기 쉬움)
   - 한 번 고른 좌석은 눌러서 타입을 읽거나 그 좌석이 초기화(떠남/주인 바뀜/테이블 이동)될 때까지 계속 그 사람만 안내
     (시간이 지나도, 우선순위가 바뀌어도, 내 차례로 잠깐 안 보였다 다시 나와도 바꾸지 않음 → 눌러야 할 사람이 눌리기 전에 바뀌지 않게)
 """
@@ -29,9 +39,20 @@ import difflib
 
 STYLES_KO = {"LAG": "루즈-어그레시브", "LP": "루즈-패시브", "TAG": "타이트-어그레시브", "TP": "타이트-패시브"}
 LOOSE = ("LAG", "LP")
-CHANGE_READS = 3           # 다른 닉네임이 이만큼 연속으로 확정돼 읽히면 좌석 주인이 바뀐 것
-EMPTY_READS = 2            # 빈자리가 이만큼 연속이면 떠난 것
+CHANGE_READS = 3           # 다른 닉네임이 이만큼 연속으로 확정돼 읽히고
+CHANGE_SECS = 10.0         # 이만큼 넘게 계속되면 좌석 주인이 바뀐 것 (쇼다운 족보·빛 고리 몇 초로는 안 바뀌게)
+CHANGE_SECS_WEAK = 30.0    # 글자 지문으로 '다른 글자'가 확인되지 않았거나 이름이 반쯤 닮았으면 이만큼
+EMPTY_READS = 2            # 빈자리가 이만큼 연속이고
+EMPTY_SECS = 6.0           # 이만큼 넘게 계속되면 떠난 것 (승리 애니메이션이 좌석을 몇 초 가림)
+OVERLAY_SEATS = 3          # 앉아 있던 상대가 이만큼 (그리고 절반 넘게) 한꺼번에 빈자리로 보이면 덮는 화면 (쇼다운 글자 등)
+OVERLAY_MAX = 15.0         # 덮는 화면이 이보다 오래면 진짜 빈자리로 받아들임
 SAME_RATIO = 0.75          # 닉네임 글자 유사도가 이 이상이면 같은 사람 (OCR 오타)
+LIKE_RATIO = 0.5           # 이 이상이면 '반쯤 닮음' (안내한 좌석 팝업 매칭 / 주인 바뀜 판단을 늦춤)
+STRONG_RATIO = 0.85        # 안내 좌석이 아닌 다른 좌석으로 팝업을 보낼 만큼 닮음
+FP_SAME = 0.70             # 글자 지문 유사도가 이 이상이면 같은 글자 (names.FP_SAME 과 같게)
+FP_DIFF = 0.50             # 이 아래면 확실히 다른 글자
+PROMPT_RECENT = 120.0      # 안내를 보여 준 지 이 초 안에 열린 팝업은 안내한 좌석 쪽으로 봄
+NAME_STABLE = 2            # 안내에 닉네임을 쓰려면 같은 이름이 이만큼 연속 프레임 그대로여야 함
 TABLE_MOVE_SEATS = 3       # 이 수 이상의 좌석이 짧은 시간에 바뀌면 테이블 이동/합치기
 TABLE_MOVE_WINDOW = 20.0
 NAME_SHOW_MAX = 8   # 안내에 보일 닉네임 최대 글자 수 (넘으면 … 로 줄임)
@@ -51,6 +72,45 @@ def _norm(name):
     return "".join(str(name or "").split()).rstrip(".…‥").lower()
 
 
+def _parts(a):
+    if isinstance(a, tuple):
+        return _norm(a[0]), bool(a[1])
+    return _norm(a), False
+
+
+def name_ratio(a, b):
+    """닉네임 둘 (문자열 또는 (name, truncated)) 의 글자 유사도 0..1 (잘린 이름은 접두사 길이만큼 비교)."""
+    (na, ta), (nb, tb) = _parts(a), _parts(b)
+    if not na or not nb:
+        return 0.0
+    if ta and len(nb) > len(na):
+        nb = nb[:len(na)]
+    if tb and len(na) > len(nb):
+        na = na[:len(nb)]
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
+def exact_person(a, b):
+    """같은 글자 (잘린 이름이면 4글자 이상 접두사가 같음) — 팝업 매칭에서 '확실'."""
+    (na, ta), (nb, tb) = _parts(a), _parts(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    return (ta and len(na) >= 4 and nb.startswith(na)) or (tb and len(nb) >= 4 and na.startswith(nb))
+
+
+def _fp_sim(a, b):
+    """글자 지문 유사도 (둘 중 하나라도 없으면 None)."""
+    if a is None or b is None:
+        return None
+    try:
+        import names
+        return names.fp_similarity(a, b)
+    except Exception:
+        return None
+
+
 def same_person(a, b):
     """닉네임 둘 (문자열 또는 (name, truncated)) 이 같은 사람으로 볼 만한가 (잘린 이름 접두사, OCR 오타 허용)."""
     ta = bool(a[1]) if isinstance(a, tuple) else False
@@ -66,7 +126,7 @@ def same_person(a, b):
 
 
 class _Seat:
-    __slots__ = ("name", "diff", "empty", "style", "stats", "src", "t", "popup_name")
+    __slots__ = ("name", "diff", "empty", "style", "stats", "src", "t", "popup_name", "fp", "diff_t0", "diff_weak", "hits")
 
     def __init__(self):
         self.name = None        # 메모리에서만: 지금 이 자리 사람의 닉네임 (name, truncated)
@@ -77,6 +137,10 @@ class _Seat:
         self.src = None         # 'popup' 이면 팝업을 읽었음 (style 을 못 읽었어도 다시 묻지 않음)
         self.t = None
         self.popup_name = None  # 메모리에서만: 팝업에서 읽은 전체 닉네임 (좌석 매칭용)
+        self.fp = None          # 메모리에서만: 이 사람 닉네임 글자 지문 (names.NameReader.fingerprints)
+        self.diff_t0 = None     # 다른 이름이 처음 읽힌 시각
+        self.diff_weak = False  # 이번 '다른 이름'이 약한 증거인지 (지문으로 확인 안 됨 / 반쯤 닮음)
+        self.hits = 0           # 같은 이름(name 그대로)이 연속으로 읽힌 프레임 수 (안내에 이름을 쓸지)
 
     def known(self):
         return self.src is not None
@@ -92,6 +156,10 @@ class SeatTypes:
         """모든 좌석 초기화 (새 [자동 지정] / 테이블 이동)."""
         self.seats = {}
         self.prompt_seat = None
+        self.prompt_t = None         # 안내를 마지막으로 보여 준 시각
+        self.empty_seen = {}         # 좌석 → (빈자리로 보인 연속 프레임 수, 처음 비어 보인 시각)
+        self.last_occ = set()        # 덮는 화면이 아닌 마지막 프레임에 앉아 있던 상대 좌석
+        self.overlay_t0 = None
         self.recent_resets = []      # (t, seat) — 테이블 이동 감지
         self.resets = 0              # 초기화 횟수 (좌석 + 전체; 앱이 바뀌었는지 볼 때)
         self.table_moves = 0
@@ -109,47 +177,68 @@ class SeatTypes:
         return False
 
     # --- 매 프레임 ------------------------------------------------------------------------------------
-    def observe(self, names, state, t=None):
-        """names {seat: (name, truncated)} (확정만) + tablestate 결과 → 이번에 초기화한 좌석 목록.
-        테이블 이동으로 보이면 전체를 초기화하고 ['*'] 반환."""
+    def observe(self, names, state, t=None, fps=None):
+        """names {seat: (name, truncated)} (확정만) + tablestate 결과 (+ fps {seat: 닉네임 글자 지문}, 메모리 전용)
+        → 이번에 초기화한 좌석 목록. 테이블 이동으로 보이면 전체를 초기화하고 ['*'] 반환."""
         dropped = []
         try:
             if not isinstance(state, dict) or state.get("layout_ok") is False or not state.get("seats"):
                 return dropped
-            names = names or {}
-            for s in state["seats"]:
-                k = s.get("key") if isinstance(s, dict) else None
-                if not k or k == "hero":
-                    continue
+            names, fps = names or {}, fps or {}
+            seats = [s for s in state["seats"] if isinstance(s, dict) and s.get("key") and s.get("key") != "hero"]
+            occ = {s["key"] for s in seats if s.get("occupied")}
+            if self._overlay(occ, t):
+                return dropped  # 쇼다운·휴식 화면이 테이블을 덮음: 빈자리로 세지 않음 (이름 판단도 보류)
+            for s in seats:
+                k = s["key"]
                 rec = self.seats.get(k)
-                if not s.get("occupied"):
+                if k not in occ:
+                    n, t0 = self.empty_seen.get(k, (0, t))
+                    n += 1
+                    self.empty_seen[k] = (n, t0)
+                    # 승리 애니메이션 등이 좌석을 몇 초 가림 → EMPTY_READS 프레임 + EMPTY_SECS 초 넘게 비어야 떠난 것
+                    gone = n >= EMPTY_READS and (t is None or t0 is None or t - t0 >= EMPTY_SECS)
                     if rec is not None:
-                        rec.empty += 1
-                        if rec.empty >= EMPTY_READS and self._drop(k, t):
+                        rec.empty = n
+                        if gone and self._drop(k, t):
                             dropped.append(k)
-                    elif self.prompt_seat == k:
+                    elif gone and self.prompt_seat == k:
                         self.prompt_seat = None  # 이름을 기억하기 전에 떠난 자리: 다음 사람에게 안내가 넘어가지 않게
                     continue
-                nm = names.get(k)
+                self.empty_seen.pop(k, None)
+                nm, fp = names.get(k), fps.get(k)
                 if rec is None:
                     if nm and nm[0]:
                         rec = self.seats[k] = _Seat()
-                        rec.name = (nm[0], bool(nm[1]))
+                        rec.name, rec.fp, rec.hits = (nm[0], bool(nm[1])), fp, 1
                     continue
                 rec.empty = 0
                 if not nm or not nm[0]:
                     continue  # 이번 프레임에 확정된 이름 없음: 판단 보류
                 nm = (nm[0], bool(nm[1]))
-                if rec.name is None or self._same(rec, nm):
-                    if rec.name is None or (rec.name[1] and not nm[1]):
-                        rec.name = nm          # 잘리지 않은 이름이 더 정확
-                    rec.diff = 0
+                sim = _fp_sim(rec.fp, fp)
+                named = rec.name is not None and self._same(rec, nm)
+                if rec.name is None or named or (sim is not None and sim >= FP_SAME):
+                    if rec.name is None or (named and rec.name[1] and not nm[1]):
+                        rec.name, rec.hits = nm, 0     # 잘리지 않은 이름이 더 정확
+                    rec.hits = rec.hits + 1 if nm == rec.name else 0
+                    if rec.fp is None:
+                        rec.fp = fp
+                    rec.diff, rec.diff_t0 = 0, None
                     continue
+                # 다른 이름: 글자 지문이 확실히 다르지 않거나 반쯤 닮았으면 약한 증거 → 더 오래 봐야 함
+                rec.hits = 0
+                weak = sim is None or sim >= FP_DIFF or self._like(rec, nm)
+                if rec.diff == 0:
+                    rec.diff_t0, rec.diff_weak = t, weak
                 rec.diff += 1
-                if rec.diff >= CHANGE_READS and self._drop(k, t):
+                rec.diff_weak = rec.diff_weak or weak
+                secs = CHANGE_SECS_WEAK if rec.diff_weak else CHANGE_SECS
+                long_enough = t is None or rec.diff_t0 is None or t - rec.diff_t0 >= secs
+                if rec.diff >= CHANGE_READS and long_enough and self._drop(k, t):
                     dropped.append(k)
                     new = self.seats[k] = _Seat()
-                    new.name = nm
+                    new.name, new.fp, new.hits = nm, fp, 1
             if t is not None:
                 recent = {k for tt, k in self.recent_resets if t - tt <= TABLE_MOVE_WINDOW}
                 if len(recent) >= TABLE_MOVE_SEATS:
@@ -161,9 +250,27 @@ class SeatTypes:
             pass
         return dropped
 
+    def _overlay(self, occ, t):
+        """이번 프레임이 '테이블을 덮는 화면'인가: 직전까지 앉아 있던 상대 OVERLAY_SEATS 명 이상이 한꺼번에 빈자리로 보임
+        (쇼다운 글자, 휴식 안내). OVERLAY_MAX 초 넘게 계속되면 진짜로 비었다고 보고 받아들임."""
+        gone = self.last_occ - occ
+        if len(gone) >= OVERLAY_SEATS and len(gone) * 2 > len(self.last_occ):
+            if self.overlay_t0 is None:
+                self.overlay_t0 = t
+            if t is None or self.overlay_t0 is None or t - self.overlay_t0 < OVERLAY_MAX:
+                return True
+        self.overlay_t0 = None
+        self.last_occ = set(occ)
+        return False
+
     @staticmethod
     def _same(rec, nm):
         return same_person(rec.name, nm) or (rec.popup_name is not None and same_person(rec.popup_name, nm))
+
+    @staticmethod
+    def _like(rec, nm):
+        return max(name_ratio(rec.name, nm) if rec.name else 0.0,
+                   name_ratio(rec.popup_name, nm) if rec.popup_name else 0.0) >= LIKE_RATIO
 
     # --- 팝업 ----------------------------------------------------------------------------------------
     def apply_popup(self, info, names=None, t=None):
@@ -175,20 +282,35 @@ class SeatTypes:
             names = names or {}
             if names.get("hero") and same_person(names["hero"], pname):
                 return None  # 내 캐릭터
-            cands = set()
-            for k, nm in names.items():
-                if k != "hero" and nm and nm[0] and same_person(nm, pname):
-                    cands.add(k)
-            for k, rec in self.seats.items():
-                if rec.name is not None and same_person(rec.name, pname) and not names.get(k):
-                    cands.add(k)  # 이번 프레임 이름은 없지만 기억한 이름이 같음
-            if len(cands) > 1:  # 정확히 같은 이름이 하나면 그것
-                exact = {k for k in cands if _norm((names.get(k) or (self.seats[k].name if k in self.seats else None)
-                                                    or ("",))[0]) == _norm(pname)}
-                cands = exact if len(exact) == 1 else set()
-            key = next(iter(cands)) if len(cands) == 1 else None
-            if key is None and not cands and self.prompt_seat and not (names.get(self.prompt_seat) or (None,))[0]:
-                key = self.prompt_seat  # 안내한 좌석의 이름을 못 읽음: 안내대로 눌렀다고 봄
+            seen = {}   # 좌석 → 이번 프레임 이름, 없으면 기억한 이름, 그것도 없으면 None
+            for k in ({k for k in names if k != "hero"} | set(self.seats)):
+                nm = names.get(k)
+                if not (nm and nm[0]):
+                    rec = self.seats.get(k)
+                    nm = rec.name if rec is not None else None
+                seen[k] = (nm[0], bool(nm[1])) if nm and nm[0] else None
+            again = [k for k, rec in self.seats.items() if rec.popup_name and _norm(rec.popup_name) == _norm(pname)]
+            exact = [k for k, nm in seen.items() if nm and exact_person(nm, pname)]
+            key = None
+            if len(again) == 1:
+                key = again[0]            # 0. 같은 사람 팝업을 다시 열었음
+            elif len(exact) == 1:
+                key = exact[0]            # 1. 정확히 같은 이름
+            elif not exact:
+                ps = self.prompt_seat
+                recent = ps is not None and (t is None or self.prompt_t is None or t - self.prompt_t <= PROMPT_RECENT)
+                strong = [k for k, nm in seen.items() if k != ps and nm and name_ratio(nm, pname) >= STRONG_RATIO]
+                if recent and not strong:
+                    pn = seen.get(ps)
+                    if pn is None or name_ratio(pn, pname) >= LIKE_RATIO or same_person(pn, pname):
+                        key = ps          # 2. 안내한 좌석: 이름을 못 읽었거나 닮음 → 안내대로 눌렀다고 봄
+                if key is None:
+                    fuzzy = [k for k, nm in seen.items() if nm and same_person(nm, pname)]
+                    if len(fuzzy) == 1:
+                        rec = self.seats.get(fuzzy[0])
+                        taken = rec is not None and rec.known() and rec.popup_name and not same_person(rec.popup_name, pname)
+                        if not taken:
+                            key = fuzzy[0]  # 3. 닮은 좌석 하나 (다른 사람 타입이 이미 있는 좌석으로는 옮기지 않음)
             if key is None:
                 return None
             rec = self.seats.get(key)
@@ -201,7 +323,7 @@ class SeatTypes:
             if info.get("tab"):
                 rec.stats["tab"] = info["tab"]
             rec.src, rec.t, rec.popup_name = "popup", t, pname
-            rec.diff = 0
+            rec.diff, rec.diff_t0 = 0, None
             if self.prompt_seat == key:
                 self.prompt_seat = None
             return key
@@ -306,26 +428,30 @@ class SeatTypes:
         rows.sort(key=lambda r: r[0])
         return [(k, pos, slot) for _, k, pos, slot in rows]
 
-    def shown_name(self, k, names=None):
-        """안내에 보여 줄 화면 닉네임 (메모리 전용 — 파일·로그·기록에 쓰지 않음). 없으면 None.
-        잘렸거나 짧게 줄인 이름은 끝에 '…'."""
+    def shown_name(self, k, names=None, sure=None):
+        """안내에 보여 줄 화면 닉네임 (메모리 전용 — 파일·로그·기록에 쓰지 않음). 확실하지 않으면 None.
+        확실함: NameReader 가 확정했고 여러 전처리가 같은 글자로 읽었으며(sure 에 있음), 이 좌석에서 NAME_STABLE 프레임
+        그대로 (observe). 잘렸거나 짧게 줄인 이름은 끝에 '…'."""
+        if not sure or k not in sure:
+            return None
+        rec = self.seats.get(k)
         nm = (names or {}).get(k)
-        if not (nm and nm[0]):
-            rec = self.seats.get(k)
-            nm = rec.name if rec is not None else None
-        if not (nm and str(nm[0]).strip()):
+        if rec is None or rec.name is None or rec.hits < NAME_STABLE or not (nm and nm[0]):
+            return None
+        if (nm[0], bool(nm[1])) != rec.name:
             return None
         base = str(nm[0]).strip().rstrip(".…‥").strip()
-        if not base:
+        if len(base) < 2:
             return None
         cut = bool(nm[1])
         if len(base) > NAME_SHOW_MAX:
             base, cut = base[:NAME_SHOW_MAX], True
         return base + ("…" if cut else "")
 
-    def prompt(self, state, live=None, t=None, names=None):
+    def prompt(self, state, live=None, t=None, names=None, sure=None):
         """지금 보여 줄 안내 {seat, pos, slot, text, sub} 또는 None (한 번에 한 좌석).
-        이름을 알면 '테스트닉… 님을 눌러 주세요' + '(CO · 오른쪽 위 · 타입 확인)', 모르면 '자리' 문구."""
+        닉네임이 확실하면 '테스트닉… 님을 눌러 주세요', 아니면 화면 위치로 '오른쪽 위 사람을 눌러 주세요'.
+        아래 줄은 늘 '(오른쪽 위 · CO · 타입 확인)' — 화면 위치를 먼저."""
         try:
             if not self.idle(state):
                 return None  # 안 보여 줄 뿐, 고른 좌석은 기억 (쉬는 때 다시 같은 사람)
@@ -336,14 +462,19 @@ class SeatTypes:
             keys = [c[0] for c in cands]
             if self.prompt_seat not in keys:  # 처음 / 안내한 좌석이 해결됨·떠남 → 지금 1순위. 시간으로는 바꾸지 않음
                 self.prompt_seat = keys[0]
+            self.prompt_t = t
             k, pos, slot = next(c for c in cands if c[0] == self.prompt_seat)
             where = SLOT_KO.get(slot)
-            nm = self.shown_name(k, names)
+            sub = "(" + " · ".join(x for x in (where, pos, "타입 확인") if x) + ")"
+            nm = self.shown_name(k, names, sure)
             if nm:
-                sub = " · ".join(x for x in (pos, where, "타입 확인") if x)
-                return {"seat": k, "pos": pos, "slot": slot, "text": f"{nm} 님을 눌러 주세요", "sub": f"({sub})"}
-            who = f"{pos} 자리" if pos else (f"{where} 자리" if where else "상대")
-            sub = "타입 확인" + (f" · {where}" if pos and where else "")
-            return {"seat": k, "pos": pos, "slot": slot, "text": f"{who} 캐릭터를 눌러 주세요", "sub": f"({sub})"}
+                text = f"{nm} 님을 눌러 주세요"
+            elif where:
+                text = f"{where} 사람을 눌러 주세요"
+            elif pos:
+                text = f"{pos} 자리 사람을 눌러 주세요"
+            else:
+                text = "상대 캐릭터를 눌러 주세요"
+            return {"seat": k, "pos": pos, "slot": slot, "text": text, "sub": sub}
         except Exception:
             return None

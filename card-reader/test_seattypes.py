@@ -93,6 +93,102 @@ def test_popup_falls_back_to_prompted_seat():
     assert st.apply_popup(popup("Yankee"), names, 3.0) is None
 
 
+def test_popup_prefers_prompted_seat():
+    """팝업 이름과 화면 OCR 이름이 조금 달라도, 지금 안내한 좌석이면 그 좌석에 저장. 애매하면 다른 좌석으로 옮기지 않음."""
+    fh = dict(hero_folded=True, hero_in_hand=False)
+    # (a) 안내 좌석 OCR 이 반쯤 틀림 ('Xharlje' vs 'Charlie', 같은 사람 기준 미만) → 안내 좌석
+    names = dict(NAMES, seat_UR=("Xharlje", False))
+    st = sty.SeatTypes()
+    st.observe(names, state(), 1.0)
+    assert sty.LIKE_RATIO <= sty.name_ratio(names["seat_UR"], "Charlie") < sty.SAME_RATIO
+    st.prompt_seat = "seat_UR"
+    st.prompt(state(**fh), {}, 2.0)
+    assert st.prompt_seat == "seat_UR"
+    assert st.apply_popup(popup("Charlie", "TAG"), names, 3.0) == "seat_UR" and st.style("seat_UR") == "TAG"
+    # (b) 안내가 없으면 같은 OCR 로는 어느 좌석인지 모름 → 저장 안 함
+    st = sty.SeatTypes()
+    st.observe(names, state(), 1.0)
+    assert st.apply_popup(popup("Charlie"), names, 3.0) is None and not st.known("seat_UR")
+    # (c) 안내한 지 오래됨 → 안내 좌석으로 보지 않음
+    st = sty.SeatTypes()
+    st.observe(names, state(), 1.0)
+    st.prompt_seat = "seat_UR"
+    st.prompt(state(**fh), {}, 2.0)
+    assert st.apply_popup(popup("Charlie"), names, 2.0 + sty.PROMPT_RECENT + 1) is None
+    # (d) 안내 좌석 이름을 못 읽었지만 다른 좌석 이름이 팝업과 매우 닮음 → 그 좌석 (사용자가 그쪽을 누름)
+    names_d = {k: v for k, v in NAMES.items() if k != "seat_BR"}
+    st = sty.SeatTypes()
+    st.observe(names_d, state(), 1.0)
+    st.prompt_seat = "seat_BR"
+    st.prompt(state(**fh), {}, 2.0)
+    assert st.apply_popup(popup("Charlie"), names_d, 3.0) == "seat_UR"
+    assert st.prompt_seat == "seat_BR" and not st.known("seat_BR")
+    # (e) 정확히 같은 이름이 있는 좌석이 안내 좌석보다 우선
+    st.prompt_seat = "seat_BR"
+    assert st.apply_popup(popup("Bravo"), names_d, 4.0) == "seat_UL"
+    # (f) 이미 다른 사람 타입이 있는 좌석으로는 약한 매칭으로 옮기지 않음
+    st = sty.SeatTypes()
+    st.observe(NAMES, state(), 1.0)
+    assert st.apply_popup(popup("Alphonse7", "TP"), NAMES, 2.0) is None   # 안내 없음 + 닮지 않음
+    st.prompt_seat = "seat_BL"
+    st.prompt(state(**fh), {}, 2.5)
+    assert st.apply_popup(popup("Alphonse7", "TP"), NAMES, 3.0) == "seat_BL"   # 안내대로 (반쯤 닮음)
+    st.prompt_seat = None
+    assert sty.same_person(NAMES["seat_BL"], "Alpha78") and not sty.same_person("Alphonse7", "Alpha78")
+    assert st.apply_popup(popup("Alpha78", "LAG"), NAMES, 4.0) is None
+    assert st.style("seat_BL") == "TP", "알려진 타입을 약한 매칭으로 덮지 않음"
+    # (g) 같은 팝업을 다시 열면 그 좌석 (화면 이름과 달라도)
+    assert st.apply_popup(popup("Alphonse7", "LP"), NAMES, 5.0) == "seat_BL" and st.style("seat_BL") == "LP"
+
+
+def test_owner_change_needs_evidence():
+    """OCR 이름만 달라진 것은 약한 증거. 글자 지문이 같으면 주인 그대로, 확실히 다르면 CHANGE_SECS 뒤 초기화."""
+    import numpy as np
+    rng = np.random.default_rng(7)
+    fp_a = (rng.random((16, 60)) * 255).astype(np.uint8)
+    fp_b = (rng.random((16, 60)) * 255).astype(np.uint8)
+    st = sty.SeatTypes()
+    st.observe(NAMES, state(), 0.0, fps={"seat_UL": fp_a})
+    st.apply_popup(popup("Bravo"), NAMES, 0.5)
+    assert st.known("seat_UL")
+    # 같은 지문, 다른 OCR 글자 → 오래 계속돼도 같은 사람
+    misread = dict(NAMES, seat_UL=("Kxqzv", False))
+    for i in range(80):
+        assert st.observe(misread, state(), 1.0 + i, fps={"seat_UL": fp_a}) == []
+    assert st.known("seat_UL")
+    # 지문이 확실히 다름 + 이름도 다름 → CHANGE_SECS 뒤 초기화 (약한 증거보다 빠름)
+    other = dict(NAMES, seat_UL=("Kilo99", False))
+    assert st.observe(other, state(), 100.0, fps={"seat_UL": fp_b}) == []
+    assert st.observe(other, state(), 101.0, fps={"seat_UL": fp_b}) == []
+    assert st.observe(other, state(), 100.0 + sty.CHANGE_SECS - 1, fps={"seat_UL": fp_b}) == []
+    assert st.known("seat_UL")
+    assert st.observe(other, state(), 100.0 + sty.CHANGE_SECS, fps={"seat_UL": fp_b}) == ["seat_UL"]
+    assert not st.known("seat_UL") and st.seats["seat_UL"].name == ("Kilo99", False)
+    # 빈자리는 이름과 상관없이 확실한 신호 (EMPTY_READS 프레임)
+    st.apply_popup(popup("Kilo99"), other, 120.0)
+    occ = set(KEYS) - {"seat_UL"}
+    st.observe(other, state(occupied=occ), 121.0)
+    assert st.observe(other, state(occupied=occ), 122.0) == [], "승리 애니메이션 등 몇 초 가림"
+    assert st.observe(other, state(occupied=occ), 121.0 + sty.EMPTY_SECS) == ["seat_UL"]
+
+
+def test_overlay_is_not_empty_seats():
+    """쇼다운 글자·휴식 안내가 테이블을 덮어 여러 좌석이 한꺼번에 빈자리로 보이면 떠난 것으로 세지 않음."""
+    st = sty.SeatTypes()
+    st.observe(NAMES, state(), 0.0)
+    for k, nm in NAMES.items():
+        st.apply_popup(popup(nm[0] if not nm[1] else nm[0] + "999"), NAMES, 0.5)
+    for i in range(10):   # 10초 동안 상대 모두 안 보임
+        assert st.observe({}, state(occupied=set()), 1.0 + i) == []
+    assert all(st.known(k) for k in NAMES) and st.table_moves == 0
+    st.observe(NAMES, state(), 12.0)
+    # 아주 오래 계속되면 (OVERLAY_MAX) 진짜 빈자리 → 테이블 이동으로 전체 초기화
+    out = []
+    for i in range(int(sty.OVERLAY_MAX + sty.EMPTY_SECS) + 3):
+        out = st.observe({}, state(occupied=set()), 20.0 + i) or out
+    assert out == ["*"] and not any(st.known(k) for k in NAMES), out
+
+
 def test_seat_reset_rules():
     st = sty.SeatTypes()
     st.observe(NAMES, state(), 0.0)
@@ -104,14 +200,17 @@ def test_seat_reset_rules():
     for i in range(5):
         assert st.observe(noisy, state(), 1.0 + i) == []
     assert st.known("seat_UR") and st.known("seat_BL")
-    # 2) 다른 이름이 한두 번 → 유지, CHANGE_READS 번 연속 → 초기화
+    # 2) 다른 이름이 한두 번 → 유지. CHANGE_READS 번 연속이어도 짧으면 유지 (쇼다운 족보·빛 고리·오독)
+    #    글자 지문이 없으면 약한 증거 → CHANGE_SECS_WEAK 초 넘게 계속되어야 초기화
     changed = dict(NAMES, seat_UL=("Zebra", False))
     st.observe(changed, state(), 10.0)
     st.observe(NAMES, state(), 11.0)   # 끊김: 연속이 아님
     st.observe(changed, state(), 12.0)
     assert st.known("seat_UL")
     st.observe(changed, state(), 13.0)
-    assert st.observe(changed, state(), 14.0) == ["seat_UL"] and not st.known("seat_UL")
+    assert st.observe(changed, state(), 14.0) == [] and st.known("seat_UL")
+    assert st.observe(changed, state(), 12.0 + sty.CHANGE_SECS_WEAK - 1) == [] and st.known("seat_UL")
+    assert st.observe(changed, state(), 12.0 + sty.CHANGE_SECS_WEAK) == ["seat_UL"] and not st.known("seat_UL")
     assert st.seats["seat_UL"].name == ("Zebra", False), "새 사람 이름으로 다시 시작"
     # 3) 이름 없는 프레임은 판단 보류
     st.observe({}, state(), 15.0)
@@ -122,7 +221,8 @@ def test_seat_reset_rules():
     st.observe(NAMES, state(), 41.0)
     assert st.known("seat_BR")
     st.observe(NAMES, state(occupied=occ), 42.0)
-    assert st.observe(NAMES, state(occupied=occ), 43.0) == ["seat_BR"] and not st.known("seat_BR")
+    assert st.observe(NAMES, state(occupied=occ), 43.0) == [] and st.known("seat_BR"), "짧게 비어 보임 (승리 애니메이션)"
+    assert st.observe(NAMES, state(occupied=occ), 42.0 + sty.EMPTY_SECS) == ["seat_BR"] and not st.known("seat_BR")
     # 5) 화면이 보정과 어긋난 프레임은 무시
     bad = state(occupied=set())
     bad["layout_ok"] = False
@@ -140,8 +240,10 @@ def test_table_move_resets_all():
     new = {"seat_BL": ("Echo", False), "seat_UL": ("Foxtrot", False), "seat_TC": ("Golf", False),
            "seat_UR": ("Charlie", False), "seat_BR": ("Delta", False)}
     out = []
-    for i in range(sty.CHANGE_READS):
+    for i in range(int(sty.CHANGE_SECS_WEAK) + 2):
         out = st.observe(new, state(), 100.0 + i)
+        if out:
+            break
     assert out == ["*"] and st.table_moves == 1, out
     assert not any(st.known(k) for k in NAMES), "테이블 이동: 이름이 그대로인 좌석(UR, BR)도 초기화"
     st.observe(new, state(), 200.0)
@@ -179,9 +281,10 @@ def test_prompt_priority_and_once():
     order = [k for k, _, _ in st.candidates(s2, {})]
     assert set(order[:2]) == {"seat_UR", "seat_BR"}, order
     # 한 번에 한 좌석, 큰 글 안내 문구
-    pr = st.prompt(s, live2, 10.0)
+    st.observe(NAMES, state(), 1.0)                     # 같은 이름이 NAME_STABLE 프레임 그대로
+    pr = st.prompt(s, live2, 10.0, NAMES, sure=set(NAMES))
     assert pr["seat"] == "seat_TC" and pr["text"] == "User0… 님을 눌러 주세요" and "타입 확인" in pr["sub"], pr  # 잘린 이름 + …
-    assert "위 가운데" in pr["sub"]
+    assert pr["sub"].startswith("(위 가운데")
     # 유지: 우선순위가 바뀌어도, 시간이 오래 지나도 같은 좌석
     live3 = {"seat_BL": {"preflop": ["blind", "raise"]}}
     s3 = state(in_hand={"seat_BL"}, **folded_hero)
@@ -200,29 +303,51 @@ def test_prompt_priority_and_once():
         st.apply_popup(popup(nm[0] if not nm[1] else nm[0] + "999"), NAMES, 32.0)
     assert st.prompt(s3, live3, 40.0) is None, "모두 읽으면 안내 없음"
     # 좌석이 초기화되면 다시 물음
-    st.observe(NAMES, state(occupied=set(KEYS) - {"seat_UL"}), 50.0)
+    st.observe(NAMES, state(occupied=set(KEYS) - {"seat_UL"}), 45.0)
     st.observe(NAMES, state(occupied=set(KEYS) - {"seat_UL"}), 51.0)
     st.observe(dict(NAMES, seat_UL=("Kilo", False)), state(**folded_hero), 52.0)
     assert st.prompt(state(**folded_hero), {}, 53.0)["seat"] == "seat_UL"
 
 
-def test_prompt_shows_name():
-    """이름을 알면 '누구를 누를지' (메모리 전용 화면 문구), 잘림/긴 이름은 …, 이름이 없으면 자리 문구."""
+def _shown(nm, frames=2, sure=True):
+    """observe 를 frames 번 한 뒤의 안내 (sure: NameReader 가 확실하다고 한 좌석인지)."""
     s = state(in_hand={"seat_TC"}, hero_folded=True, hero_in_hand=False)
-    pr = sty.SeatTypes().prompt(s, {}, 1.0, {"seat_TC": ("테스트닉네임", False)})
+    st = sty.SeatTypes()
+    names = {"seat_TC": nm} if nm is not None else {}
+    for i in range(frames):
+        st.observe(names, s, 1.0 + i)
+    return st.prompt(s, {}, 5.0, names, sure={"seat_TC"} if sure else set())
+
+
+def test_prompt_shows_name():
+    """확실한 이름이면 '누구를 누를지' (메모리 전용 화면 문구), 잘림/긴 이름은 …, 아니면 화면 위치 문구.
+    아래 줄에는 늘 화면 위치 (먼저) · 포지션."""
+    pr = _shown(("테스트닉네임", False))
     assert pr["seat"] == "seat_TC" and pr["text"] == "테스트닉네임 님을 눌러 주세요", pr
-    assert pr["sub"] == "(UTG · 위 가운데 · 타입 확인)", pr
-    pr = sty.SeatTypes().prompt(s, {}, 1.0, {"seat_TC": ("테스트닉", True)})   # 잘린 이름
-    assert pr["text"] == "테스트닉… 님을 눌러 주세요", pr
+    assert pr["sub"] == "(위 가운데 · UTG · 타입 확인)", pr
+    assert _shown(("테스트닉", True))["text"] == "테스트닉… 님을 눌러 주세요"   # 잘린 이름
     long_name = "가나다라마바사아자차카타"                                     # 너무 긴 이름은 줄임
-    pr = sty.SeatTypes().prompt(s, {}, 1.0, {"seat_TC": (long_name, False)})
-    assert pr["text"] == long_name[:sty.NAME_SHOW_MAX] + "… 님을 눌러 주세요", pr
-    for nm in ({}, {"seat_TC": ("", False)}, {"seat_TC": ("…", True)}, None):   # 이름 없음 → 자리 문구
-        pr = sty.SeatTypes().prompt(s, {}, 1.0, nm)
-        assert pr["text"] == "UTG 자리 캐릭터를 눌러 주세요", pr
-    st = sty.SeatTypes()   # observe 가 기억한 이름 사용
+    assert _shown((long_name, False))["text"] == long_name[:sty.NAME_SHOW_MAX] + "… 님을 눌러 주세요"
+    where = "위 가운데 사람을 눌러 주세요"
+    for nm in (None, ("", False), ("…", True), ("가", False)):                  # 이름 없음/한 글자 → 위치 문구
+        pr = _shown(nm)
+        assert pr["text"] == where and pr["sub"] == "(위 가운데 · UTG · 타입 확인)", pr
+    # 확실하지 않으면 이름을 쓰지 않음: NameReader 가 sure 로 안 줌 / 한 프레임만 봄 / 화면 이름이 기억과 다름
+    assert _shown(("테스트닉네임", False), sure=False)["text"] == where
+    assert _shown(("테스트닉네임", False), frames=1)["text"] == where
+    s = state(in_hand={"seat_TC"}, hero_folded=True, hero_in_hand=False)
+    st = sty.SeatTypes()
     st.observe({"seat_TC": ("테스트닉네임", False)}, s, 1.0)
-    assert st.prompt(s, {}, 1.0)["text"] == "테스트닉네임 님을 눌러 주세요"
+    st.observe({"seat_TC": ("테스트닉네임", False)}, s, 2.0)
+    assert st.prompt(s, {}, 3.0, {"seat_TC": ("데스트닉네임", False)}, sure={"seat_TC"})["text"] == where
+    assert st.prompt(s, {}, 3.0, None, sure={"seat_TC"})["text"] == where
+    assert st.prompt(s, {}, 3.0)["text"] == where, "sure 를 안 넘기면 이름을 쓰지 않음"
+    # 이름이 흔들리면 (다른 글자가 읽힘) 안정 카운트가 처음부터
+    st.observe({"seat_TC": ("완전다른사람", False)}, s, 4.0)
+    st.observe({"seat_TC": ("테스트닉네임", False)}, s, 5.0)
+    assert st.prompt(s, {}, 6.0, {"seat_TC": ("테스트닉네임", False)}, sure={"seat_TC"})["text"] == where
+    st.observe({"seat_TC": ("테스트닉네임", False)}, s, 6.0)
+    assert st.prompt(s, {}, 7.0, {"seat_TC": ("테스트닉네임", False)}, sure={"seat_TC"})["text"] == "테스트닉네임 님을 눌러 주세요"
 
 
 def test_prompt_text_never_reaches_disk():
@@ -239,7 +364,8 @@ def test_prompt_text_never_reaches_disk():
         try:
             st = sty.SeatTypes()
             st.observe({"seat_TC": (nick, False)}, s, 1.0)
-            pr = st.prompt(s, {}, 1.0, {"seat_TC": (nick, False)})
+            st.observe({"seat_TC": (nick, False)}, s, 2.0)
+            pr = st.prompt(s, {}, 2.0, {"seat_TC": (nick, False)}, sure={"seat_TC"})
             assert nick in pr["text"]
             logged = json.dumps([st.for_log(), st.full_names({"seat_TC": (nick[:3], True)})], ensure_ascii=False)
             assert "님을 눌러" not in logged and "캐릭터를 눌러" not in logged, logged
@@ -293,6 +419,8 @@ def test_prompt_sticky():
     changed = dict(NAMES, **{pick: ("Newcomer", False)})
     for i in range(sty.CHANGE_READS):
         st3.observe(changed, state(**fh), 2.0 + i)
+    assert st3.prompt_seat == pick, "다른 이름이 잠깐 읽힌 것으로는 안내를 바꾸지 않음"
+    st3.observe(changed, state(**fh), 2.0 + sty.CHANGE_SECS_WEAK)
     assert st3.prompt_seat is None, "주인이 바뀌면 이전 안내 해제"
     # 떠난 자리 (EMPTY_READS 프레임 연속 빈자리) → 후보에서 빠지고 다른 사람으로
     st4 = sty.SeatTypes()
@@ -301,12 +429,16 @@ def test_prompt_sticky():
     occ = set(KEYS) - {pick}
     for i in range(sty.EMPTY_READS):
         st4.observe(NAMES, state(occupied=occ), 2.0 + i)
+    assert st4.prompt_seat == pick, "몇 초 비어 보인 것으로는 안내를 바꾸지 않음"
+    st4.observe(NAMES, state(occupied=occ), 2.0 + sty.EMPTY_SECS)
     assert st4.prompt_seat is None
-    assert st4.prompt(state(occupied=occ, **fh), {}, 5.0)["seat"] != pick
+    assert st4.prompt(state(occupied=occ, **fh), {}, 20.0)["seat"] != pick
     # 이름을 기억하기 전에 떠난 자리도 안내 해제
     st5 = sty.SeatTypes()
     st5.prompt_seat = "seat_UL"
     st5.observe({}, state(occupied=set(KEYS) - {"seat_UL"}), 1.0)
+    assert st5.prompt_seat == "seat_UL"
+    st5.observe({}, state(occupied=set(KEYS) - {"seat_UL"}), 1.0 + sty.EMPTY_SECS)
     assert st5.prompt_seat is None
     # 테이블 이동 (전체 초기화) / reset()
     st6 = sty.SeatTypes()
@@ -318,6 +450,7 @@ def test_prompt_sticky():
            "seat_UR": ("Charlie", False), "seat_BR": ("Delta", False)}
     for i in range(sty.CHANGE_READS):
         st6.observe(new, state(), 100.0 + i)
+    st6.observe(new, state(), 100.0 + sty.CHANGE_SECS_WEAK)
     assert st6.prompt_seat is None and st6.table_moves == 1
     st7 = sty.SeatTypes()
     st7.prompt_seat = "seat_BL"
@@ -332,7 +465,12 @@ def test_prompt_without_position():
         x["pos"] = None
     s["hero_pos"] = None
     pr = st.prompt(s, {}, 1.0)
-    assert pr["text"].endswith("자리 캐릭터를 눌러 주세요") and pr["pos"] is None, pr
+    assert pr["text"].endswith(" 사람을 눌러 주세요") and pr["pos"] is None, pr
+    assert pr["sub"] == "(" + sty.SLOT_KO[pr["slot"]] + " · 타입 확인)", pr
+    for x in s["seats"]:   # 위치도 포지션도 모름
+        x["slot"] = None
+    st2 = sty.SeatTypes()
+    assert st2.prompt(s, {}, 1.0)["text"] == "상대 캐릭터를 눌러 주세요"
 
 
 # --- 앱 연결 (reader.App 메서드를 가짜 self 로) ------------------------------------------------------

@@ -2594,10 +2594,14 @@ class App:
         if self.tracker is None or not isinstance(st, dict) or "seats" not in st:
             return
         names = self.name_reader.read(img, calib, st) if self.name_reader else {}
+        nr = self.name_reader
+        # 메모리 전용: 글자 지문(주인 바뀜 판단) · 확실히 읽은 좌석(안내에 닉네임을 쓸지)
+        name_fps = nr.fingerprints() if nr is not None and hasattr(nr, "fingerprints") else None
+        name_sure = nr.sure() if nr is not None and hasattr(nr, "sure") else None
         types = self.seat_types
         log_names, log_types = names, None
         if types is not None:
-            dropped = types.observe(names, st, now)
+            dropped = types.observe(names, st, now, fps=name_fps)
             if dropped == ["*"]:  # 테이블 이동/합치기: 핸드 기록 세션(pid 소금)도 새로
                 self.tracker.new_session()
                 self.store.new_session(self.tracker.session)
@@ -2624,7 +2628,7 @@ class App:
                     if p is not None:
                         profiles[k] = p
                     seat_type[k] = {"known": types.known(k), "style": types.style(k)}
-            prompt = types.prompt(st, live, now, names)
+            prompt = types.prompt(st, live, now, names, sure=name_sure)
         reads = self.track.get("reads")
         if reads and reads["hero"] != tuple(hero):  # 새 핸드
             reads = None
