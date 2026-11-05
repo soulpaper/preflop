@@ -90,7 +90,7 @@ def test_popup_falls_back_to_prompted_seat():
     st.prompt_seat = "seat_BR"
     assert st.apply_popup(popup("Zulu"), names, 2.0) == "seat_BR" and st.style("seat_BR") == "LP"
     st.prompt_seat = "seat_UL"   # 안내 좌석의 이름을 읽었는데 팝업 이름이 다르면 → 다른 사람을 눌렀음
-    assert st.apply_popup(popup("Yankee"), names, 3.0) is None
+    assert st.apply_popup(popup("Yankee"), names, 30.0) is None   # 안내 20초 지남 -> 옛 규칙
 
 
 def test_popup_prefers_prompted_seat():
@@ -121,11 +121,11 @@ def test_popup_prefers_prompted_seat():
     st.observe(names_d, state(), 1.0)
     st.prompt_seat = "seat_BR"
     st.prompt(state(**fh), {}, 2.0)
-    assert st.apply_popup(popup("Charlie"), names_d, 3.0) == "seat_UR"
+    assert st.apply_popup(popup("Charlie"), names_d, 30.0) == "seat_UR"   # 안내 20초 지남
     assert st.prompt_seat == "seat_BR" and not st.known("seat_BR")
     # (e) 정확히 같은 이름이 있는 좌석이 안내 좌석보다 우선
     st.prompt_seat = "seat_BR"
-    assert st.apply_popup(popup("Bravo"), names_d, 4.0) == "seat_UL"
+    assert st.apply_popup(popup("Bravo"), names_d, 31.0) == "seat_UL"
     # (f) 이미 다른 사람 타입이 있는 좌석으로는 약한 매칭으로 옮기지 않음
     st = sty.SeatTypes()
     st.observe(NAMES, state(), 1.0)
@@ -299,6 +299,7 @@ def test_prompt_priority_and_once():
     st.apply_popup(popup("Alpha77"), NAMES, 31.5)
     pr = st.prompt(s3, live3, 32.0)
     assert pr["seat"] != "seat_BL" and not st.known(pr["seat"])
+    st.prompt_shown_t = None   # 안내가 화면에 없는 때의 팝업
     for k, nm in NAMES.items():
         st.apply_popup(popup(nm[0] if not nm[1] else nm[0] + "999"), NAMES, 32.0)
     assert st.prompt(s3, live3, 40.0) is None, "모두 읽으면 안내 없음"
@@ -409,6 +410,7 @@ def test_prompt_sticky():
     st2.observe(NAMES, state(), 0.0)
     st2.prompt(state(**fh), {}, 1.0)
     assert st2.prompt_seat
+    st2.prompt_shown_t = None
     for k, nm in NAMES.items():
         st2.apply_popup(popup(nm[0] if not nm[1] else nm[0] + "999"), NAMES, 2.0)
     assert st2.prompt(state(**fh), {}, 3.0) is None and st2.prompt_seat is None
@@ -571,6 +573,38 @@ def test_synthetic_run_writes_no_names():
         assert rec["seats"]["seat_BL"]["pid"] == d0["seat_BL"]["pid"], "같은 세션: 핸드·결정 기록의 pid 가 같음"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_popup_during_prompt_is_prompted_player():
+    """안내 중에 연 팝업은 이름이 전혀 달라도 안내한 그 사람. 이미 아는 팝업 이름 재오픈 / 20초 지남 / 내 팝업은 예외."""
+    fh = dict(hero_folded=True, hero_in_hand=False)
+    st = sty.SeatTypes()
+    st.observe(NAMES, state(), 1.0)
+    pr = st.prompt(state(**fh), {}, 2.0)
+    seat = pr["seat"]
+    assert st.apply_popup(popup("Qqqqzzzz", "TAG"), NAMES, 3.0) == seat and st.style(seat) == "TAG"
+    # 이미 아는 팝업 이름을 다시 열면 그 좌석 그대로, 안내는 유지
+    pr2 = st.prompt(state(**fh), {}, 4.0)
+    assert pr2 is not None and pr2["seat"] != seat
+    assert st.apply_popup(popup("Qqqqzzzz", "LP"), NAMES, 5.0) == seat and st.style(seat) == "LP"
+    assert st.prompt_seat == pr2["seat"]
+    # 안내를 보여 준 지 20초 넘음 -> 옛 규칙 (이름이 다르면 저장 안 함 / 같으면 정확히 매칭)
+    st = sty.SeatTypes()
+    st.observe(NAMES, state(), 1.0)
+    st.prompt(state(**fh), {}, 2.0)
+    late = 2.0 + sty.PROMPT_CLICK_WINDOW + 1
+    assert st.apply_popup(popup("Qqqqzzzz"), NAMES, late) is None
+    assert st.apply_popup(popup("Bravo"), NAMES, late) == "seat_UL"
+    # 안내를 한 번도 안 보였으면 (prompt_seat 만 있음) 옛 규칙
+    st = sty.SeatTypes()
+    st.observe(NAMES, state(), 1.0)
+    st.prompt_seat = "seat_UR"
+    assert st.apply_popup(popup("Qqqqzzzz"), NAMES, 2.0) is None
+    # 내 팝업은 안내 중이어도 None
+    st = sty.SeatTypes()
+    st.observe(NAMES, state(), 1.0)
+    st.prompt(state(**fh), {}, 2.0)
+    assert st.apply_popup(popup("MyHero"), dict(NAMES, hero=("MyHero", True)), 3.0) is None
 
 
 if __name__ == "__main__":

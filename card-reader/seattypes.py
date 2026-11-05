@@ -21,6 +21,8 @@
   - reset(): 새 [자동 지정] 세션 (앱이 track_new_session 에서 부름)
 팝업 → 좌석 (OCR 이 틀려도 안내대로 누른 것은 저장되게, 애매하면 다른 좌석으로 옮기지 않게)
   0. 같은 팝업 이름을 이미 저장한 좌석 하나 → 그 좌석
+  0b. 안내 중에(PROMPT_CLICK_WINDOW 초 안에 안내를 보여 줌) 연 팝업은 안내한 그 사람으로 본다 → 이름 비교 없이 안내한 좌석
+      (아래 1~3 은 안내 중이 아닐 때만)
   1. 팝업 닉네임과 정확히 같은 이름(또는 4글자 이상 잘린 이름의 접두사)인 좌석이 하나 → 그 좌석
   2. 안내 중인 좌석(PROMPT_RECENT 초 안에 보여 줌)의 이름을 못 읽었거나 반쯤이라도 닮았으면(LIKE_RATIO) → 그 좌석
      (다른 좌석 이름이 매우 닮았으면(STRONG_RATIO) 사용자가 그쪽을 누른 것 → 3으로)
@@ -51,6 +53,7 @@ LIKE_RATIO = 0.5           # 이 이상이면 '반쯤 닮음' (안내한 좌석 
 STRONG_RATIO = 0.85        # 안내 좌석이 아닌 다른 좌석으로 팝업을 보낼 만큼 닮음
 FP_SAME = 0.70             # 글자 지문 유사도가 이 이상이면 같은 글자 (names.FP_SAME 과 같게)
 FP_DIFF = 0.50             # 이 아래면 확실히 다른 글자
+PROMPT_CLICK_WINDOW = 20.0  # 안내를 보여 준 지 이 초 안에 연 팝업은 무조건 안내한 그 사람으로 봄
 PROMPT_RECENT = 120.0      # 안내를 보여 준 지 이 초 안에 열린 팝업은 안내한 좌석 쪽으로 봄
 NAME_STABLE = 2            # 안내에 닉네임을 쓰려면 같은 이름이 이만큼 연속 프레임 그대로여야 함
 TABLE_MOVE_SEATS = 3       # 이 수 이상의 좌석이 짧은 시간에 바뀌면 테이블 이동/합치기
@@ -157,6 +160,7 @@ class SeatTypes:
         self.seats = {}
         self.prompt_seat = None
         self.prompt_t = None         # 안내를 마지막으로 보여 준 시각
+        self.prompt_shown_t = None   # 안내를 실제로 화면에 낸 마지막 시각 (None = 아직 안 냄)
         self.empty_seen = {}         # 좌석 → (빈자리로 보인 연속 프레임 수, 처음 비어 보인 시각)
         self.last_occ = set()        # 덮는 화면이 아닌 마지막 프레임에 앉아 있던 상대 좌석
         self.overlay_t0 = None
@@ -291,9 +295,13 @@ class SeatTypes:
                 seen[k] = (nm[0], bool(nm[1])) if nm and nm[0] else None
             again = [k for k, rec in self.seats.items() if rec.popup_name and _norm(rec.popup_name) == _norm(pname)]
             exact = [k for k, nm in seen.items() if nm and exact_person(nm, pname)]
+            guided = (self.prompt_seat is not None and self.prompt_shown_t is not None
+                      and (t is None or t - self.prompt_shown_t <= PROMPT_CLICK_WINDOW))
             key = None
             if len(again) == 1:
                 key = again[0]            # 0. 같은 사람 팝업을 다시 열었음
+            elif guided:
+                key = self.prompt_seat    # 안내 중에 연 팝업 = 안내한 그 사람 (이름 비교 안 함)
             elif len(exact) == 1:
                 key = exact[0]            # 1. 정확히 같은 이름
             elif not exact:
@@ -458,11 +466,13 @@ class SeatTypes:
             cands = self.candidates(state, live)
             if not cands:
                 self.prompt_seat = None
+                self.prompt_shown_t = None
                 return None
             keys = [c[0] for c in cands]
             if self.prompt_seat not in keys:  # 처음 / 안내한 좌석이 해결됨·떠남 → 지금 1순위. 시간으로는 바꾸지 않음
                 self.prompt_seat = keys[0]
             self.prompt_t = t
+            self.prompt_shown_t = t if t is not None else 0.0
             k, pos, slot = next(c for c in cands if c[0] == self.prompt_seat)
             where = SLOT_KO.get(slot)
             sub = "(" + " · ".join(x for x in (where, pos, "타입 확인") if x) + ")"
