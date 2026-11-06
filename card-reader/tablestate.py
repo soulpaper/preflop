@@ -268,9 +268,16 @@ class TableReader:
         (x0, y0, x1, y1), glyphs = box
         return _crop(img, _ocr_rect((x0, y0, x1, y1), img.shape), ocr.JITTER_MARGIN), glyphs
 
-    def read(self, img, calib):
+    def read(self, img, calib, full=False):
+        """full=True: 순서가 어긋난 것 같을 때 한 번 '전부 다시 읽기' (handlog.OrderGuard 가 요청) — 딜러 버튼을 펠트 전체에서
+        다시 찾고(직전 자리·배운 자리 지름길 없이), SB/BB 원판도 찾고, 숫자 OCR 기억을 비워 벳·스택을 모두 다시 읽는다.
+        그리고 이번 화면의 증거만으로(버튼 > 블라인드 원판) 포지션을 새로 계산해 state['rebuild'] 에 넣는다
+        (고정한 포지션은 그대로 — 바꿀지는 OrderGuard 가 정해서 adopt() 로)."""
         t0 = time.perf_counter()
         self.last_ocr = self.last_slow = 0
+        if full:
+            self.cache.clear()
+            self.dealer_at = None
         notes = []
         anchors = calib if calib.get("seats") else layout.anchors(calib)
         seats_cfg, bar = anchors.get("seats") or [], anchors.get("action_bar") or {}
@@ -369,7 +376,7 @@ class TableReader:
         if ckey != self._spots_key:  # 다른 보정: 배운 버튼 자리·이번 핸드 포지션을 버림
             self._spots, self._spots_key, self._d_prev, self._d_miss, self._lock = {}, ckey, None, 0, None
         dealer = None
-        found = self._dealer(gray, geom, pw, [s["key"] for s in seats if s["occupied"]])
+        found = self._dealer(gray, geom, pw, [s["key"] for s in seats if s["occupied"]], full=full)
         if found and seats:
             pt = found[0][1]
             dealer = self._button_seat(pt, seats)
@@ -378,12 +385,15 @@ class TableReader:
             self._d_prev = pt
         else:
             self._d_prev = None
+        dealer_seen = dealer   # 이번 프레임에 실제로 본 버튼 자리 (아래에서 고정한 딜러로 바뀌기 전)
         lock = self._lock
-        if dealer is None or lock is None or lock["dealer"] != dealer or lock["age"] < BLIND_FRAMES:
+        seen_discs = {}   # 이번 프레임에 실제로 찾아본 SB/BB 원판 (안 찾았으면 비어 있음)
+        if full or dealer is None or lock is None or lock["dealer"] != dealer or lock["age"] < BLIND_FRAMES:
             disc_seat = {}
             for kind, pt in self._discs(img, hsv, calib, geom, pw):
                 if kind not in disc_seat:
                     disc_seat[kind] = nearest_seat(pt, seats)
+            seen_discs = {k: disc_seat.get(k) for k in ("SB", "BB")}
         else:
             disc_seat = dict(lock["blinds"])   # 같은 핸드: 처음 몇 프레임에 본 SB/BB 를 그대로
         if dealer is not None:
@@ -438,12 +448,16 @@ class TableReader:
         order = [s for s in seats]  # 시계 방향 (내 왼쪽부터, 나는 마지막)
         dealt = [s for s in order if s["dealt"]]
         n = len(dealt)
+        rebuild = self._rebuild(order, dealt, dealer, disc_seat) if full else None
         positions, n_pos = self._hand_positions(order, dealt, dealer, disc_seat, notes)
         if self._lock is not None:
             dealer = self._lock["dealer"]   # 원판이 잠깐 가려져도 이번 핸드의 딜러
             for kind in ("SB", "BB"):
                 if disc_seat.get(kind):
                     self._lock["blinds"][kind] = disc_seat[kind]
+        # 이번 프레임에 본 SB/BB 원판이 고정한 포지션과 다름 (버튼으로 정한 포지션은 그대로 두고 OrderGuard 가 다시 읽어 확인)
+        disc_conflict = sorted(f"{kind} {seen_discs[kind]}" for kind in ("SB", "BB") if seen_discs.get(kind)
+                               and positions.get(seen_discs[kind]) and positions[seen_discs[kind]] != kind)
         pos_players = min(10, max(6, n_pos)) if n_pos else None
         clamped = bool(n_pos) and n_pos != pos_players
         if clamped:
@@ -486,7 +500,13 @@ class TableReader:
             "hero_folded": hero_folded,
             "hero_in_hand": bool(hero and hero["in_hand"]),
             "dealer": dealer,
+            "dealer_seen": dealer_seen,    # 이번 프레임에 본 버튼 자리 (못 찾으면 None; dealer 는 이번 핸드에 고정한 딜러)
             "blind_seats": {"sb": disc_seat.get("SB"), "bb": disc_seat.get("BB")},
+            "discs_seen": seen_discs,      # 이번 프레임에 실제로 찾아본 SB/BB 원판 {SB, BB: 좌석 키/None} (안 찾았으면 {})
+            "disc_conflict": disc_conflict,  # ['SB seat_X', ...]: 본 원판이 포지션과 다른 좌석 (없으면 [])
+            "lock_keys": sorted(self._lock["keys"]) if self._lock else [],   # 포지션을 준 좌석 (이번 핸드에 낀 사람)
+            "pos_src": (self._lock["src"] or (None,))[0] if self._lock else None,   # 'D' / 'BB' / 'SB' / 'bet' / 'order'
+            "rebuild": rebuild,            # full 읽기에서만: 이번 화면 증거로 새로 계산한 포지션 (_rebuild)
             "hero_pos": positions.get("hero"),
             "pos_players": pos_players,
             "pos_clamped": clamped,
@@ -653,11 +673,11 @@ class TableReader:
                 return True
         return False
 
-    def _dealer(self, gray, geom, pw, occupied=()):
+    def _dealer(self, gray, geom, pw, occupied=(), full=False):
         """'D' 원판: 템플릿 (흰 바탕이 글자 테두리로 조각나서 덩어리 찾기로는 안 잡힘) → [('D', (x, y))] 또는 [].
         딜러는 핸드마다 한 번 움직이고 좌석마다 자리가 정해져 있으므로: 직전 자리 → 이번 보정에서 배운 좌석별 버튼 자리 →
         펠트 전체. occupied(사람 있는 좌석 키)의 버튼 자리를 모두 아는데 어디에도 없으면 (핸드 사이·가려짐)
-        펠트 전체는 DEALER_FULL_EVERY 프레임마다만 찾는다."""
+        펠트 전체는 DEALER_FULL_EVERY 프레임마다만 찾는다. full=True 면 지름길 없이 바로 펠트 전체 (다시 읽기)."""
         ring = geom.get("ring")
         if not ring:
             return []
@@ -680,13 +700,15 @@ class TableReader:
         def near(at):
             (px, py), s = at
             return search(px - r, py - r, px + r, py + r, (s,))
+        if full:
+            self.dealer_at = None
         if self.dealer_at is not None:
             score, pt, s = near(self.dealer_at)
             if score >= D_MIN:
                 self.dealer_at, self._d_miss = (pt, s), 0
                 return [("D", pt)]
         best = (0.0, None, None)
-        for at in self._spots.values():
+        for at in (() if full else self._spots.values()):
             if self.dealer_at is not None and math.dist(at[0], self.dealer_at[0]) <= DEALER_SAME:
                 continue  # 방금 본 자리
             got = near(at)
@@ -696,7 +718,7 @@ class TableReader:
             self.dealer_at, self._d_miss = (best[1], best[2]), 0
             return [("D", best[1])]
         self._d_miss += 1
-        if occupied and all(k in self._spots for k in occupied) and (self._d_miss - 1) % DEALER_FULL_EVERY:
+        if not full and occupied and all(k in self._spots for k in occupied) and (self._d_miss - 1) % DEALER_FULL_EVERY:
             self.dealer_at = None
             return []
         rcx, rcy, ra, rb = ring
@@ -897,9 +919,9 @@ class TableReader:
                 lock = None
             elif dealer is None and lock["dealer"] is None and blind_src is not None and blind_src != lock["src"]:
                 lock = None
-            elif dealer is None and any(lock["pos"].get(disc_seat.get(k), k) != k for k in ("SB", "BB")
-                                        if disc_seat.get(k) in lock["pos"]):
-                lock = None
+            elif dealer is None and lock["dealer"] is None and any(
+                    lock["pos"].get(disc_seat.get(k), k) != k for k in ("SB", "BB") if disc_seat.get(k) in lock["pos"]):
+                lock = None   # 원판으로 정한 포지션은 새 원판을 따름. 버튼으로 정한 것은 원판이 달라도 유지 (state['disc_conflict'])
         if lock is not None:
             lock["age"] += 1
             new = in_hand - lock["keys"]
@@ -921,6 +943,43 @@ class TableReader:
                     "keys": in_hand, "pos": pos, "age": 0, "folds": any(s["folded"] for s in dealt), "blinds": {}}
         self._lock = lock
         return {k: p for k, p in lock["pos"].items() if k in keys}, len(lock["keys"])
+
+    def _rebuild(self, order, dealt, dealer, disc_seat):
+        """full 읽기: 이번 화면 증거만으로 포지션을 새로 → {pos, dealer, src, keys} 또는 None (버튼도 원판도 없음).
+        좌석 = 고정한 핸드 좌석 + 지금 카드 받은 좌석 + 원판 좌석 (폴드한 사람도 흑백이라 '카드 받음'으로 보임)."""
+        keys = set(self._lock["keys"]) if self._lock else set()
+        keys |= {s["key"] for s in dealt}
+        keys |= {disc_seat.get(k) for k in ("SB", "BB")} - {None}
+        pool = [s for s in order if s["key"] in keys]
+        pos = self._positions(order, pool, dealer, disc_seat, [])
+        if not pos:
+            return None
+        src = "D" if dealer is not None else next((k for k in ("BB", "SB") if disc_seat.get(k) in keys), None)
+        return {"pos": pos, "dealer": dealer, "src": src, "keys": sorted(keys),
+                "disc": {k: disc_seat[k] for k in ("SB", "BB") if disc_seat.get(k)}}
+
+    @classmethod
+    def positions_for(cls, keys_clockwise, in_hand, dealer=None, sb=None, bb=None):
+        """좌석 키(시계 방향, 화면 순서) 중 in_hand 좌석의 포지션 — 딜러 또는 SB/BB 좌석으로 (OrderGuard 가 블라인드 금액·
+        행동 순서로 후보를 만들 때). 못 정하면 {}."""
+        order = [{"key": k} for k in keys_clockwise]
+        pool = [s for s in order if s["key"] in set(in_hand)]
+        discs = {k: v for k, v in (("SB", sb), ("BB", bb)) if v}
+        return cls._positions(order, pool, dealer, discs, [])
+
+    def adopt(self, rebuild):
+        """OrderGuard 가 고른 포지션으로 이번 핸드 고정을 바꿈 (다음 프레임부터 그대로). rebuild: _rebuild 모양
+        ({pos, dealer, src, keys}). 그 뒤에 늦게 보인 좌석은 더하지 않는다 (이미 증거로 다시 정한 것)."""
+        if not rebuild or not rebuild.get("pos"):
+            return False
+        old = self._lock or {}
+        src = rebuild.get("src")
+        self._lock = {"dealer": rebuild.get("dealer"),
+                      "src": ("D", rebuild.get("dealer")) if src == "D" else (src, (rebuild.get("disc") or {}).get(src)),
+                      "disc": dict(rebuild.get("disc") or {}), "keys": set(rebuild.get("keys") or rebuild["pos"]),
+                      "pos": dict(rebuild["pos"]), "age": max(LOCK_GROW + 1, old.get("age", 0)),
+                      "folds": old.get("folds", False), "blinds": dict(old.get("blinds") or {})}
+        return True
 
     # --- 프리플랍 상황 ---------------------------------------------------------------------
     def _preflop(self, seats, positions, pos_players, unit, img, gray, pw, to_bb):
@@ -1021,9 +1080,15 @@ def _center(rect):
 _DEFAULT = TableReader()
 
 
-def read(img, calib):
-    """img: 보정 때와 같은 크기의 게임 창 캡처(BGR), calib: layout.calibrate() 결과 → 상태 dict."""
-    return _DEFAULT.read(img, calib)
+def read(img, calib, full=False):
+    """img: 보정 때와 같은 크기의 게임 창 캡처(BGR), calib: layout.calibrate() 결과 → 상태 dict.
+    full=True: 전부 다시 읽기 (TableReader.read 참고)."""
+    return _DEFAULT.read(img, calib, full=full)
+
+
+def adopt(rebuild):
+    """TableReader.adopt (앱이 쓰는 기본 읽기 객체)."""
+    return _DEFAULT.adopt(rebuild)
 
 
 def action_regions(calib):

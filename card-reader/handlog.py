@@ -136,6 +136,7 @@ class _Hand:
         self.turns = []          # 차례 고리 (tablestate acting_seat): {street, seat, t0, t1, p} — 결정 시간 분석용
         self.ring_wait = {}      # 고리가 지나간 자리 -> (스트리트, 남은 프레임, 차례 시작 때 액션 수): 새 액션이 안 읽히면 issue
         self.turn_acts = 0
+        self.dropped = set()     # 핸드에 없다고 판단해 뺀 좌석 (OrderGuard: 버튼과 SB 사이의 흑백 좌석) — 다시 넣지 않음
 
     def issue(self, code, detail=None):
         if not any(i["code"] == code and i.get("detail") == detail for i in self.issues):
@@ -317,6 +318,8 @@ class Tracker:
                 continue
             seat = h.seats.get(k)
             if seat is None:
+                if k in h.dropped:
+                    continue
                 if h.frames > 1 and h.street > 0:
                     continue  # 핸드 중간에 새로 카드를 받은 듯 보이는 자리는 무시 (오판)
                 if h.frames > 1:
@@ -485,28 +488,123 @@ class Tracker:
 
     def _order(self, h, street, quiet=False):
         keys = list(h.seats)
-        pos = {k: (h.seats[k].pos.most_common(1)[0][0] if h.seats[k].pos else None) for k in keys}
-        n = len(keys)
-        if all(pos.values()):
-            if n == 2 and set(pos.values()) == {"SB", "BB"}:
-                pre = sorted(keys, key=lambda k: pos[k] != "SB")
-                return pre if street == 0 else pre[::-1]
-            pre = sorted(keys, key=lambda k: PRE_RANK.index(pos[k]) if pos[k] in PRE_RANK else 99)
-            if street == 0:
-                return pre
-            return [k for k in pre if pos[k] in ("SB", "BB")] + [k for k in pre if pos[k] not in ("SB", "BB")]
-        # 포지션을 모름: 화면 순서(시계 방향, 내 왼쪽부터) + 딜러
         dealer = h.dealer.most_common(1)[0][0] if h.dealer else None
-        if dealer in keys:
-            i = keys.index(dealer)
-            post = keys[i + 1:] + keys[:i + 1]
-        else:
-            if not quiet:
-                h.issue("positions_unknown")
-            post = keys
-        if street == 0 and n > 2:
-            return post[2:] + post[:2]
-        return post
+        out, known = order_keys(keys, self.labels(h), dealer, street)
+        if not known and not quiet:
+            h.issue("positions_unknown")
+        return out
+
+    @staticmethod
+    def labels(h):
+        """핸드의 좌석별 포지션 (이번 핸드에서 가장 많이 본 값) {좌석: 포지션/None}."""
+        return {k: (s.pos.most_common(1)[0][0] if s.pos else None) for k, s in h.seats.items()}
+
+    def relabel(self, pos, dealer=None):
+        """OrderGuard 가 다시 정한 포지션으로 이번 핸드를 고침: 좌석 포지션·딜러·블라인드 좌석을 바꾸고, 잘못된 포지션으로
+        기록된 블라인드만 바로잡는다 (액션을 지어내지 않음):
+          - 'SB 0.5 블라인드 → 콜 1' 로 기록된 진짜 BB = 'BB 1 블라인드' (가짜 콜 삭제)
+          - 블라인드가 아닌 사람의 '콜 0.5'(SB 칩) / 첫 '콜 1'(BB 칩) = 그 블라인드
+          - 블라인드 종류만 바뀐 것 (SB ↔ BB) 은 이름만, 블라인드가 아닌 사람의 '블라인드' 는 뺌
+        → 고친 개수."""
+        h = self.hand
+        if h is None or not pos:
+            return 0
+        w = h.frames + 1
+        for k, seat in h.seats.items():
+            seat.pos = Counter({pos[k]: w}) if pos.get(k) else Counter()
+        if dealer:
+            h.dealer = Counter({dealer: w})
+        self._dealer_new = (None, 0)
+        n = len(pos)
+        h.pos_players = Counter({min(10, max(6, n)): w})
+        h.blind_keys = {kind.lower(): k for k, p in pos.items() for kind in ("SB", "BB") if p == kind}
+        fixed = 0
+        acts = h.actions["preflop"]
+        keep = []
+        for i, a in enumerate(acts):
+            k, act = a.get("seat"), a.get("act")
+            if a.get("_drop"):
+                continue
+            kind = pos.get(k) if pos.get(k) in ("SB", "BB") else None
+            amt = SB_AMOUNT if kind == "SB" else BB_AMOUNT
+            nxt = next((b for b in acts[i + 1:] if b.get("seat") == k), None)
+            if act == "post":
+                fixed += int(kind != a.get("blind"))
+                if kind is None:
+                    # 블라인드가 아닌 사람의 '블라인드' (잘못된 포지션이 만든 것): 바로 뒤에 같은 사람의 벳이 있으면 그 벳에 포함
+                    # (첫 칩이 곧 레이즈 금액), 아니면 그 칩은 림프 = 콜
+                    if k in h.seats:
+                        h.seats[k].posted = False
+                    if nxt is not None and nxt.get("act") in ("call", "raise"):
+                        continue
+                    a.pop("blind", None)
+                    a.update(act="call", src="bet")
+                    if k in h.seats:
+                        h.seats[k].acted = True
+                elif a.get("blind") != kind:
+                    a["blind"] = kind
+                    if kind == "BB" and nxt is not None and nxt.get("act") == "call" and \
+                            abs((_num(nxt.get("to")) or 0) - BB_AMOUNT) <= EPS:
+                        a["to"] = BB_AMOUNT       # 진짜 BB 를 SB 로 봐서 '0.5 블라인드 + 콜 1' 로 쪼갬
+                        nxt["_drop"] = True
+                keep.append(a)
+                continue
+            to = _num(a.get("to"))
+            if kind and act == "call" and not any(b.get("seat") == k for b in keep) and to is not None and \
+                    abs(to - amt) <= EPS:
+                a.clear()   # 블라인드 칩을 콜로 기록함 → 블라인드
+                a.update({"seat": k, "act": "post", "src": "bet", "facing": False, "raises_before": 0, "to": amt,
+                          "blind": kind})
+                if k in h.seats:
+                    h.seats[k].acted = any(b.get("seat") == k and b.get("act") != "post" for b in acts[i + 1:])
+                fixed += 1
+            keep.append(a)
+        acts[:] = keep
+        for k, seat in h.seats.items():
+            if any(a.get("seat") == k and a.get("act") == "post" for a in acts):
+                seat.posted = True
+        if h.street == 0:
+            h.last_actor = next((a["seat"] for a in reversed(acts) if a.get("act") != "post"), None)
+        return fixed
+
+    def drop_seats(self, keys):
+        """이번 핸드에 실제로는 없던 좌석을 뺌 (자리 비움·대기 중인 흑백 아바타가 '카드 받고 폴드' 로 보임 → 포지션이 한 칸 밀림).
+        흑백/말풍선 폴드 말고 다른 액션이 있는 좌석은 빼지 않는다 (진짜 낀 사람). → 뺀 좌석 목록."""
+        h = self.hand
+        out = []
+        for k in keys or ():
+            seat = h.seats.get(k) if h is not None else None
+            if seat is None or seat.hero:
+                continue
+            mine = [a for st in STREETS for a in h.actions[st] if a.get("seat") == k]
+            if any(not (a.get("act") == "fold" and a.get("src") == "grey/bubble") for a in mine):
+                continue
+            for st in STREETS:
+                h.actions[st][:] = [a for a in h.actions[st] if a.get("seat") != k]
+            del h.seats[k]
+            h.dropped.add(k)
+            h.notes.append(f"{k}: not in this hand (sitting out?)")
+            out.append(k)
+        if out and h.last_actor in out:
+            h.last_actor = next((a["seat"] for a in reversed(h.actions[STREETS[h.street]]) if a.get("act") != "post"), None)
+        return out
+
+    def unfold(self, k):
+        """폴드로 기록된 좌석이 다시 행동함 (흑백 오판 등): 그 좌석의 마지막 액션이 이번 스트리트의 흑백/말풍선 폴드면 지움.
+        → 지웠으면 True."""
+        h = self.hand
+        seat = h.seats.get(k) if h is not None else None
+        if seat is None or not seat.folded or seat.fold_street != h.street or k in h.shown:
+            return False
+        acts = h.actions[STREETS[h.street]]
+        mine = [i for i, a in enumerate(acts) if a.get("seat") == k]
+        if not mine or acts[mine[-1]].get("act") != "fold" or acts[mine[-1]].get("src") != "grey/bubble":
+            return False
+        del acts[mine[-1]]
+        seat.folded, seat.fold_street = False, None
+        h.over = False
+        h.notes.append(f"{k}: fold undone (acted again)")
+        return True
 
     def _blind_kind(self, h, k):
         seat = h.seats[k]
@@ -814,6 +912,426 @@ class Tracker:
         codes = {i["code"] for i in h.issues}
         rec["confidence"] = "low" if codes & FATAL else "ok"
         return [rec]
+
+
+def order_keys(keys, pos, dealer, street):
+    """좌석 키(화면 순서 = 시계 방향, 내 왼쪽부터) + {좌석: 포지션} → (이번 스트리트 행동 순서, 포지션을 다 알았나).
+    포지션을 하나라도 모르면 화면 순서 + 딜러 (딜러도 모르면 화면 순서 그대로)."""
+    keys = list(keys)
+    n = len(keys)
+    pos = {k: pos.get(k) for k in keys}
+    if keys and all(pos.values()):
+        if n == 2 and set(pos.values()) == {"SB", "BB"}:
+            pre = sorted(keys, key=lambda k: pos[k] != "SB")
+            return (pre if street == 0 else pre[::-1]), True
+        pre = sorted(keys, key=lambda k: PRE_RANK.index(pos[k]) if pos[k] in PRE_RANK else 99)
+        if street == 0:
+            return pre, True
+        return [k for k in pre if pos[k] in ("SB", "BB")] + [k for k in pre if pos[k] not in ("SB", "BB")], True
+    if dealer in keys:
+        i = keys.index(dealer)
+        post = keys[i + 1:] + keys[:i + 1]
+    else:
+        post = keys
+    if street == 0 and n > 2:
+        return post[2:] + post[:2], dealer in keys
+    return post, dealer in keys
+
+
+# --- 순서 확인: 포지션·행동 순서가 화면과 어긋나면 다시 읽어 고치고, 못 고치면 알린다 ------------------------------------
+# 매 프레임 (가벼움, 좌석 수만큼의 비교): 이번 핸드에서 본 '포지션 증거'를 모아 두고, 지금 포지션이 증거와 어긋나는지 본다.
+#   order_blind       프리플랍 SB 칩(0.5BB, 올인 아님)이 고정한 SB 가 아닌 좌석에 있음 (핸드 첫 프레임은 1BB 칩도 BB),
+#                     또는 이번에 본 SB/BB 원판이 포지션과 다름 (tablestate disc_conflict, 버튼으로 정한 포지션은 그대로)
+#   order_hero        내 포지션이 액션 바와 안 맞음 (프리플랍 '체크' 버튼 = BB, 프리플랍 콜 0.5 = SB)
+#   order_ring_first  스트리트 첫 차례(고리/내 액션 바)가 행동 순서상 첫 사람이 아님 (그 앞 사람이 아직 행동 안 함)
+#   order_ring        스트리트 중간: 행동 순서상 다음 사람을 건너뜀 (건너뛴 사람이 행동한 흔적 없음; 포지션과 무관 → 다시 읽기만)
+#   order_button      핸드 중 내 포지션을 모름 (버튼·원판 못 찾음) ORDER_MISSING_FRAMES 연속, 플랍 이후 버튼이 다른 자리,
+#                     또는 핸드 첫 ORDER_EARLY_FRAMES 프레임 안에 버튼이 옮겨 보임 (그대로면 '딜러 이동' 으로 핸드가 갈림)
+#   order_players     핸드 기록엔 있는데 포지션을 받지 못한 좌석 (인원 수가 어긋나 포지션 이름이 밀림) ORDER_PLAYERS_FRAMES 연속
+#   order_folded      폴드로 기록된 좌석이 같은 스트리트에 칩을 더 냄
+#   bet_decreased     (Tracker 의 기존 문제 코드) 벳이 줄어듦
+# 고치기: 다음 프레임을 '전부 다시 읽기' (tablestate.read(full=True): 펠트 전체 버튼 찾기 + SB/BB 원판 + 숫자 OCR 다시)
+#   → 증거 순서 버튼 > 블라인드 원판 > 블라인드 칩 금액 으로 포지션 후보 → 후보가 모아 둔 증거를 지금보다 잘 설명하면 바꾼다
+#   (TableReader.adopt + Tracker.relabel: 이미 기록한 액션의 포지션·블라인드만 고침, 액션은 지어내지 않음). 핸드마다 ORDER_TRIES 번.
+# 알리기: 그래도 증거와 어긋나거나 포지션을 모르면 status='unsure' → 앱이 노란 줄 ORDER_NOTE + 추천은 포지션 없이 (신뢰도 낮음).
+# 핸드 기록: 찾은 코드 (참고용) + 결과 order_healed / order_confirmed (포지션은 맞음, 읽기 문제) / order_unsure (FATAL).
+ORDER_TRIES = 3
+ORDER_MISSING_FRAMES = 2
+ORDER_PLAYERS_FRAMES = 2
+ORDER_EARLY_FRAMES = 4     # 핸드 시작 뒤 이 프레임 수 안의 버튼 이동 = 처음 본 버튼이 틀렸을 수 있음 (새 핸드일 수 없음)
+ORDER_NOTE = "순서 확인 중 — 이번 추천은 참고만"
+FATAL.add("order_unsure")
+
+
+class OrderGuard:
+    """앱(상태 스레드)과 replay 가 프레임마다:
+        st = table_reader.read(img, calib, full=guard.want_full())
+        guard.before(st, tracker, table_reader)     # 다시 읽은 프레임이면 포지션 후보를 보고 고침 (st 의 포지션도 바꿈)
+        tracker.update(st, ...)
+        guard.after(st, tracker, img)               # 어긋남 찾기 → 다음 프레임 다시 읽기 요청 / 결과 정리
+    save(info, img): 어긋남을 찾았을 때(img 있음)와 결과가 났을 때(img None) 부름 — 앱이 증거 이미지·JSON 을 남긴다
+    (info 에는 좌석 키·포지션·코드만, 닉네임 없음). 절대 예외를 밖으로 내지 않는다."""
+
+    def __init__(self, save=None):
+        self.save = save
+        self.events = []          # 결과 목록 [{hand, codes, outcome, ...}] (메모리, 최근 200개 — 검증용)
+        self.errors = 0
+        self.last_error = None
+        self._reset(None)
+
+    def _reset(self, hid):
+        self.hand_id = hid
+        self.tries = 0
+        self.pending = None       # 다시 읽기를 기다리는 어긋남 {key, codes, found, before, street, ...}
+        self.status = None        # None / 'healed' / 'unsure' (이번 핸드)
+        self.facts = set()        # 이번 핸드에서 본 포지션 증거 ('sb'|'bb', 좌석) / ('first', 스트리트, 좌석, 행동한 좌석들, 좌석들)
+        self.first_seen = set()   # 첫 차례를 이미 본 스트리트
+        self._acting = None       # 직전 프레임의 (스트리트, 차례 좌석)
+        self._ring_obs = None     # 다음 프레임에 판단할 차례 변화
+        self._players = 0
+        self._missing = 0
+        self._bet_dec = 0
+        self._flagged = set()     # 이번 핸드에서 이미 알린 (코드, 내용)
+        self.n = 0
+
+    # --- 앱이 묻는 것 -----------------------------------------------------------------------------
+    def want_full(self):
+        """다음 읽기를 '전부 다시 읽기'로 해야 하나."""
+        return self.pending is not None
+
+    def unsure(self):
+        return self.status == "unsure"
+
+    def note(self):
+        """화면에 보일 노란 줄 (포지션·순서를 못 믿을 때만) 또는 None."""
+        return ORDER_NOTE if self.status == "unsure" else None
+
+    # --- 프레임 처리 ------------------------------------------------------------------------------
+    def _sync(self, tracker):
+        h = getattr(tracker, "hand", None)
+        hid = h.id if h is not None else None
+        if hid != self.hand_id:
+            if self.pending is not None and self.hand_id is not None:
+                self._event(self.pending, "hand_ended", None)
+            self._reset(hid)
+        return h
+
+    def before(self, state, tracker, table_reader=None):
+        """다시 읽은 프레임 (tracker.update 전): 포지션 후보가 증거를 지금보다 잘 설명하면 바꾼다 (state 의 포지션도).
+        → 바꿨으면 {before, after, src, fixed}, 아니면 None."""
+        try:
+            h = self._sync(tracker)
+            p = self.pending
+            if p is None or h is None or not isinstance(state, dict) or not state.get("seats") \
+                    or state.get("layout_ok") is False:
+                return None
+            p["full"] = True
+            cand = self._candidate(state, h, table_reader)
+            p["cand_src"] = (cand or {}).get("src")
+            if cand is None:
+                return None
+            old = Tracker.labels(h)
+            new = {k: cand["pos"].get(k) for k in h.seats}
+            if new == old:
+                return None
+            v_old, v_new = self._violated(h, old), self._violated(h, cand["pos"])
+            unknown = any(v is None for v in old.values())
+            # 증거를 더 잘 설명하면 바꿈. 같으면 버튼으로 정한 후보·포지션을 몰랐던 경우만 (버튼 > 원판 > 칩 금액)
+            if not (len(v_new) < len(v_old) or (len(v_new) == len(v_old) and (cand["src"] == "D" or unknown))):
+                p["rejected"] = [len(v_old), len(v_new)]
+                return None
+            if table_reader is not None and hasattr(table_reader, "adopt"):
+                table_reader.adopt(cand)
+            dropped = tracker.drop_seats(cand.get("drop")) if cand.get("drop") else []
+            fixed = tracker.relabel(cand["pos"], cand.get("dealer")) + len(dropped)
+            for s in state["seats"]:
+                if isinstance(s, dict) and s.get("key") in cand["pos"]:
+                    s["pos"] = cand["pos"][s["key"]]
+            state["hero_pos"] = cand["pos"].get("hero")
+            state["pos_players"] = min(10, max(6, len(cand["pos"])))
+            if cand.get("dealer"):
+                state["dealer"] = cand["dealer"]
+            p["adopted"] = {"before": old, "after": new, "src": cand["src"], "fixed": fixed}
+            return p["adopted"]
+        except Exception as exc:
+            self._fail(exc)
+            return None
+
+    def after(self, state, tracker, img=None):
+        """tracker.update 다음: 어긋남 찾기 (+ 다시 읽은 프레임이면 결과 정리). → 이번에 새로 찾은 코드 리스트."""
+        try:
+            h = self._sync(tracker)
+            if h is None or not isinstance(state, dict) or not state.get("seats") or state.get("layout_ok") is False:
+                return []
+            found = self._detect(state, tracker, h)
+            p = self.pending
+            if p is not None and p.get("full"):
+                self._resolve(p, found, tracker, h)
+                found = [f for f in found if f not in p["found"]]
+            new = [f for f in found if f not in self._flagged]
+            if not new:
+                return []
+            self._flagged.update(new)
+            for code, detail in new:
+                h.issue(code, detail)
+            if self.pending is not None or self.tries >= ORDER_TRIES:
+                return [c for c, _ in new]     # 이미 다시 읽는 중 / 더 고쳐 보지 않음 (기록만)
+            self.tries += 1
+            self.n += 1
+            self.pending = {"key": f"{h.id}_{self.n}", "codes": sorted({c for c, _ in new}), "found": list(new),
+                            "details": [d for _, d in new], "before": Tracker.labels(h), "street": STREETS[h.street],
+                            "dealer": h.dealer.most_common(1)[0][0] if h.dealer else None}
+            self._save(self._info(self.pending), img)
+            return [c for c, _ in new]
+        except Exception as exc:
+            self._fail(exc)
+            return []
+
+    # --- 증거 · 어긋남 ---------------------------------------------------------------------------------
+    def _detect(self, state, tracker, h):
+        out = []
+        moved = getattr(tracker, "_dealer_new", (None, 0))
+        if moved[1] >= 1 and moved[0] and h.frames <= ORDER_EARLY_FRAMES and not h.over                 and state.get("dealer_seen") == moved[0]:
+            # 핸드 첫 몇 프레임 안에 버튼이 다른 자리에서 보임: 처음 본 버튼이 틀렸을 수 있음 (움직이는 중인 원판 등).
+            # 그대로 두면 다음 프레임에 '딜러 이동' 으로 핸드가 둘로 갈린다 → 다시 읽어 버튼을 확인
+            return [("order_button", f"moved {moved[0]}")]
+        if h.over or tracker._suspect() or state.get("no_hand"):
+            self._acting = self._ring_obs = None   # 핸드가 끝남·새 핸드일 수 있음·카드 받은 사람 2명 미만 → 판단 안 함
+            return out
+        seats = {s["key"]: s for s in state["seats"] if isinstance(s, dict) and "key" in s}
+        labels = Tracker.labels(h)
+        self._collect(state, seats, h)
+        for f in self._violated(h, labels):
+            if f[0] in ("sb", "bb"):
+                out.append(("order_hero" if f[1] == "hero" else "order_blind", f"{f[1]} {f[0].upper()}"))
+            else:
+                out.append(("order_ring_first", f"{STREETS[f[1]]} {f[2]}"))
+        if state.get("disc_conflict") and h.street == 0:
+            out.append(("order_blind", "disc " + " ".join(state["disc_conflict"])))
+        skip = self._ring(state, seats, h, labels)
+        if skip:
+            out.append(("order_ring", skip))
+        hero = seats.get("hero") or {}
+        if hero.get("dealt") and not hero.get("folded") and h.frames >= 3 and "hero" in h.seats and not labels.get("hero"):
+            self._missing += 1
+        else:
+            self._missing = 0
+        if self._missing >= ORDER_MISSING_FRAMES:
+            out.append(("order_button", "missing"))
+        seen, cur = state.get("dealer_seen"), (h.dealer.most_common(1)[0][0] if h.dealer else None)
+        if seen and cur and seen != cur and h.street > 0:
+            out.append(("order_button", f"moved {seen}"))
+        lk = set(state.get("lock_keys") or [])
+        extra = sorted(k for k in h.seats if lk and k not in lk)
+        self._players = self._players + 1 if extra else 0
+        if self._players >= ORDER_PLAYERS_FRAMES:
+            out.append(("order_players", " ".join(extra)))
+        for k, seat in h.seats.items():
+            s = seats.get(k)
+            if not seat.folded or seat.fold_street != h.street or s is None or k in h.shown or s.get("folded") \
+                    or not s.get("dealt"):
+                continue
+            b = _num(s.get("bet"))
+            if b is not None and b > seat.inv + EPS and (seat.stale is None or abs(b - seat.stale) > EPS):
+                out.append(("order_folded", k))
+        n_dec = sum(1 for i in h.issues if i["code"] == "bet_decreased")
+        if n_dec > self._bet_dec:
+            out.append(("bet_decreased", next(i.get("detail") for i in reversed(h.issues) if i["code"] == "bet_decreased")))
+        self._bet_dec = n_dec
+        return out
+
+    def _collect(self, state, seats, h):
+        """이번 프레임의 포지션 증거를 self.facts 에 더함."""
+        if h.street == 0:
+            def at(amount):
+                return [k for k, s in seats.items() if (s.get("dealt") or s.get("occupied")) and not s.get("allin")
+                        and _num(s.get("bet")) is not None and abs(_num(s["bet"]) - amount) <= EPS]
+            sb = at(SB_AMOUNT)
+            if len(sb) == 1 and sb[0] in h.seats:
+                self.facts.add(("sb", sb[0]))
+                bb = at(BB_AMOUNT)
+                voluntary = any(a["act"] != "post" for a in h.actions["preflop"])
+                if len(bb) == 1 and bb[0] in h.seats and h.frames <= 2 and not voluntary:
+                    self.facts.add(("bb", bb[0]))   # 핸드 첫 프레임: 0.5 와 1 이 하나씩 = SB, BB (림프 전)
+            if state.get("to_act") is True and "hero" in h.seats:
+                top = max([_num(s.get("bet")) or 0.0 for s in seats.values()] + [0.0])
+                if state.get("bar") == "check" and top <= BB_AMOUNT + EPS:
+                    self.facts.add(("bb", "hero"))
+                call = _num(state.get("call"))
+                if call is not None and abs(call - SB_AMOUNT) <= EPS and top <= BB_AMOUNT + EPS:
+                    self.facts.add(("sb", "hero"))
+
+    @staticmethod
+    def _done(h, seats, k):
+        """이번 스트리트에 이미 행동했거나 행동할 필요가 없는 좌석 (폴드·올인·액션 기록·말풍선)."""
+        seat, s = h.seats[k], seats.get(k) or {}
+        return bool(seat.folded or seat.allin or seat.acted or s.get("folded") or s.get("bubble"))
+
+    @staticmethod
+    def _fact_ok(h, f, pos):
+        if f[0] == "sb":
+            return pos.get(f[1]) == "SB"
+        if f[0] == "bb":
+            return pos.get(f[1]) == "BB"
+        _, street, acting, done, keys = f
+        keys = [k for k in h.seats if k in keys]
+        dealer = h.dealer.most_common(1)[0][0] if h.dealer else None
+        order, known = order_keys(keys, pos, dealer, street)
+        if not known or any(not pos.get(k) for k in keys):
+            return True     # 포지션을 모르면 판단하지 않음 (order_button 이 따로 봄)
+        exp = next((k for k in order if k not in done), None)
+        return exp is None or exp == acting
+
+    def _violated(self, h, pos):
+        return [f for f in sorted(self.facts, key=repr) if not self._fact_ok(h, f, pos)]
+
+    def _ring(self, state, seats, h, labels):
+        """차례(고리 / 내 액션 바)가 새 좌석 X 로 넘어옴 → 다음 프레임에 판단 (앞 사람의 말풍선·흑백이 한 프레임 늦게 보임).
+        스트리트 첫 차례: 증거 ('first', 스트리트, X, 그때까지 행동한 좌석들, 좌석들) — 포지션이 맞으면 X 가 순서상 첫 사람.
+        스트리트 중간: 마지막 행동자 다음부터 X 앞까지 행동한 흔적이 없는 사람 → order_ring 내용 (포지션과 무관)."""
+        acting = "hero" if state.get("to_act") is True else state.get("acting_seat")
+        prev, self._acting = self._acting, (h.street, acting)
+        out = None
+        obs = self._ring_obs
+        if obs is not None and obs["street"] == h.street:
+            done = obs["done"] | {k for k in h.seats if k != obs["acting"] and self._done(h, seats, k)}
+            if obs["anchor"] is None:
+                self.facts.add(("first", h.street, obs["acting"], frozenset(done), obs["keys"]))
+            else:
+                out = self._skipped(h, obs, done, labels)
+        self._ring_obs = None
+        if not acting or acting not in h.seats or prev == (h.street, acting) or h.frames < 2:
+            return out
+        acts = [a for a in h.actions[STREETS[h.street]] if a["act"] != "post"]
+        if h.street in self.first_seen and (h.last_actor is None or h.last_actor == acting):
+            return out
+        first = h.street not in self.first_seen and not any(a["seat"] != acting for a in acts)
+        self.first_seen.add(h.street)
+        self._ring_obs = {"street": h.street, "acting": acting, "anchor": None if first else h.last_actor,
+                          "keys": frozenset(h.seats),
+                          "done": {k for k in h.seats if k != acting and self._done(h, seats, k)}}
+        return out
+
+    @staticmethod
+    def _skipped(h, obs, done, labels):
+        order, known = order_keys(list(h.seats), labels, h.dealer.most_common(1)[0][0] if h.dealer else None,
+                                  obs["street"])
+        if not known or any(not labels.get(k) for k in order) or obs["anchor"] not in order or obs["acting"] not in order:
+            return None
+        i = order.index(obs["anchor"])
+        skipped = []
+        for j in range(1, len(order)):
+            k = order[(i + j) % len(order)]
+            if k == obs["acting"]:
+                break
+            if k not in done:
+                skipped.append(k)
+        if not skipped:
+            return None
+        return f"{STREETS[obs['street']]} {obs['acting']} after {obs['anchor']} skipped {' '.join(skipped)}"
+
+    # --- 후보 · 결과 -----------------------------------------------------------------------------------
+    def _candidate(self, state, h, table_reader):
+        """버튼 > 블라인드 원판 (다시 읽은 화면, state['rebuild']) > 블라인드 칩 금액 (모은 증거) 순서로 포지션 후보 하나."""
+        rb = state.get("rebuild")
+        if isinstance(rb, dict) and rb.get("pos"):
+            if self._violated(h, rb["pos"]) and rb.get("dealer"):
+                alt = self._without_phantoms(state, h, table_reader, rb["dealer"])
+                if alt is not None:
+                    return alt
+            return rb
+        if table_reader is None or not hasattr(table_reader, "positions_for"):
+            return None
+        keys_cw = [s["key"] for s in state["seats"] if isinstance(s, dict) and "key" in s]
+        in_hand = set(h.seats) | set(state.get("lock_keys") or [])
+        for kind in ("sb", "bb"):
+            k = next((f[1] for f in sorted(self.facts, key=repr) if f[0] == kind), None)
+            if k is None:
+                continue
+            pos = table_reader.positions_for(keys_cw, in_hand, **{kind: k})
+            if pos:
+                return {"pos": pos, "dealer": next((x for x, p in pos.items() if p == "BTN"), None), "src": "bet",
+                        "keys": sorted(in_hand), "disc": {}}
+        return None
+
+    def _without_phantoms(self, state, h, table_reader, dealer):
+        """버튼은 맞는데 블라인드 증거와 안 맞을 때: 버튼과 SB 칩/원판 좌석 사이(시계 방향)에 있는, 폴드 말고는 한 게 없는 흑백 좌석은
+        이번 핸드에 없던 사람 (자리 비움·대기 — 흑백 아바타라 '카드 받고 폴드' 로 보였다). 그 좌석을 빼면 버튼과 블라인드가 둘 다
+        맞으면 그 후보 (+ 'drop': 뺄 좌석). 아니면 None."""
+        if table_reader is None or not hasattr(table_reader, "positions_for"):
+            return None
+        keys_cw = [s["key"] for s in state["seats"] if isinstance(s, dict) and "key" in s]
+        sb = next((f[1] for f in sorted(self.facts, key=repr) if f[0] == "sb"), None)
+        if sb is None or dealer not in keys_cw or sb not in keys_cw or sb == dealer:
+            return None
+        i, j = keys_cw.index(dealer), keys_cw.index(sb)
+        between = [keys_cw[(i + d) % len(keys_cw)] for d in range(1, (j - i) % len(keys_cw))]
+        drop = [k for k in between if k in h.seats and h.seats[k].folded and not h.seats[k].hero
+                and all(a.get("act") == "fold" for st in STREETS for a in h.actions[st] if a.get("seat") == k)]
+        if not drop:
+            return None
+        in_hand = (set(h.seats) | set(state.get("lock_keys") or [])) - set(drop)
+        pos = table_reader.positions_for(keys_cw, in_hand, dealer=dealer)
+        if not pos or self._violated(h, pos):
+            return None
+        return {"pos": pos, "dealer": dealer, "src": "D", "keys": sorted(in_hand), "disc": {}, "drop": drop}
+
+    def _resolve(self, p, found, tracker, h):
+        """다시 읽은 프레임의 결과: healed / confirmed / (다시 시도) / unsure."""
+        self.pending = None
+        still = {c for c, _ in found} & set(p["codes"])
+        folded_fixed = False
+        if "order_folded" in still:
+            for c, d in found:
+                if c == "order_folded" and tracker.unfold(d):
+                    folded_fixed = True
+        labels = Tracker.labels(h)
+        bad = self._violated(h, labels)
+        missing = "hero" in h.seats and not labels.get("hero") and not h.over
+        if bad or missing:
+            if self.tries < ORDER_TRIES:   # 한 번 더 다시 읽기 (같은 핸드 안에서 최대 ORDER_TRIES 번)
+                self.tries += 1
+                self.pending = dict(p, full=False)
+                return
+            outcome = "order_unsure"
+        elif p.get("adopted") or folded_fixed:
+            outcome = "order_healed"
+        else:
+            outcome = "order_confirmed"
+        self.status = {"order_unsure": "unsure", "order_healed": "healed"}.get(outcome, None)
+        detail = " ".join(p["codes"])
+        if p.get("adopted"):
+            detail += f" src={p['adopted']['src']} fixed={p['adopted']['fixed']}"
+        h.issue(outcome, detail)
+        self._event(p, outcome, labels, bad=len(bad))
+
+    def _info(self, p, outcome=None, after=None, bad=None):
+        info = {"key": p["key"], "hand": self.hand_id, "street": p["street"], "codes": p["codes"],
+                "details": [d for d in p["details"] if d], "dealer": p.get("dealer"),
+                "seats": sorted(p["before"]), "before": p["before"]}
+        if outcome:
+            info.update(outcome=outcome, after=after, tries=self.tries, cand_src=p.get("cand_src"),
+                        violated=bad, rejected=p.get("rejected"),
+                        adopted=bool(p.get("adopted")))
+        return info
+
+    def _event(self, p, outcome, after, bad=None):
+        info = self._info(p, outcome, after, bad)
+        self.events.append(info)
+        del self.events[:-200]
+        self._save(info, None)
+
+    def _save(self, info, img):
+        if self.save is None:
+            return
+        try:
+            self.save(info, img)
+        except Exception as exc:
+            self._fail(exc)
+
+    def _fail(self, exc):
+        self.errors += 1
+        self.last_error = repr(exc)
 
 
 # --- 기록 → 좌석별 통계 플래그 ------------------------------------------------------------------------

@@ -127,6 +127,8 @@ STATE_INTERVAL = 1.0   # 테이블 상태 읽기 주기 (초): 읽기·추적에
 BAR_POLL = 0.08        # 기다리는 동안 액션 바 자리만 이 간격으로 찍어 봄 (버튼이 나타나면 1초를 기다리지 않고 바로 읽기)
 STATE_MIN_GAP = 0.25   # 액션 바 변화로 일찍 읽어도 지난 읽기에서 이만큼은 띄움
 STATE_REFRESH = 5.0    # 화면이 그대로여도 이 시간마다 다시 읽음
+ORDER_ISSUE_DIR = "order_issues"   # 순서 문제 증거 (BASE/hands/order_issues/<날짜>/): 이 PC 에만, 업로드 안 함
+ORDER_ISSUE_CAP = 50               # 하루에 남기는 순서 문제 증거 이미지 수
 TOURNEY_INTERVAL = 5.0  # 토너먼트 머리글(총 상금 / 내 순위) 읽기 주기 (초): 순위는 천천히 바뀜
 TOURNEY_REFRESH = 60.0  # 머리글 화면이 그대로여도 이 시간마다 다시 읽음
 TOURNEY_JUMP = 1.5      # 총 상금이 이 배수 이상 바뀌면 다른 토너먼트 (자동 참가자 수 추정을 새로 시작)
@@ -1636,6 +1638,9 @@ class App:
         self.result_state = None    # self.result 가 계산된 (내 카드, 보드, 상대 수)
         self.force_calc = False     # [지금 계산]: 내 차례가 아니어도 한 번 계산
         self.err_note = None        # 상태 읽기 등 예외가 났을 때 패널에 보일 짧은 안내 (자세한 내용은 debug.log)
+        self.order_guard = None     # 순서 확인 (handlog.OrderGuard, 상태 스레드)
+        self.order_note = None      # 포지션·순서를 못 믿을 때 추천 카드 맨 위의 노란 줄 (OrderGuard.note, Tk 스레드가 반영)
+        self.order_saved = {}       # 날짜 → 그날 남긴 순서 문제 증거 수 (ORDER_ISSUE_CAP)
         self.last_err_sig = None
         self.manual = set()      # 이번 핸드에서 직접 고른 항목 ('opponents', 'preflop') → 자동 채우기 중지
         self.last_hero = None
@@ -2559,9 +2564,16 @@ class App:
                     regions = getattr(self.tablestate, "action_regions", None)
                     seats_moved = watch.changed(img, regions(calib)) if regions is not None else False
                     now = time.time()
-                    if changed or seats_moved or last is None or now - last_read > STATE_REFRESH:
-                        last, last_read = self.tablestate.read(img, calib), now
+                    og = self.order_guard
+                    full = og is not None and og.want_full()   # 순서가 어긋남 → 이번엔 전부 다시 읽기 (버튼·원판·숫자)
+                    if changed or seats_moved or last is None or now - last_read > STATE_REFRESH or full:
+                        last, last_read = self.read_table(img, calib, full), now
                         watch.accept()
+                        if full and isinstance(last, dict):
+                            try:   # 다시 읽은 증거로 포지션 후보 → 더 잘 맞으면 이번 핸드 포지션·기록을 고침 (큐에 넣기 전)
+                                og.before(last, self.tracker, getattr(self.tablestate, "_DEFAULT", None))
+                            except Exception:
+                                self.log_once("order_guard")
                     self.state_queue.put(last if isinstance(last, dict) else {"empty": True})
                 except Exception as exc:
                     last = None
@@ -2577,6 +2589,20 @@ class App:
                 except Exception:
                     watch.target(None, [])
                     self.log_once("watch_next")
+
+    def read_table(self, img, calib, full=False):
+        """tablestate.read (full=True: 순서 확인용 전부 다시 읽기; 예전 모듈이면 그냥 읽기)."""
+        if full:
+            try:
+                return self.tablestate.read(img, calib, full=True)
+            except TypeError:
+                pass
+        return self.tablestate.read(img, calib)
+
+    def order_unsure(self):
+        """포지션·행동 순서를 못 믿는 중인가 (OrderGuard). 추천·상대 리딩은 포지션 없이, 화면엔 노란 줄."""
+        og = self.order_guard
+        return bool(og is not None and og.unsure())
 
     def watch_next(self, watch, rect, st):
         """기다리는 동안 지켜볼 상대 좌석: 지금 차례 고리가 있는 좌석 + 행동 순서상 그다음 (핸드 기록의 순서, 최대 2곳).
@@ -2677,6 +2703,8 @@ class App:
                     if self.declog is not None:  # 내 결정 기록에 실제 행동·결과를 이어 붙임
                         self.declog.link_hand(rec)
                 self.tracker = handlog_m.Tracker(on_hand=on_hand)
+                if hasattr(handlog_m, "OrderGuard"):
+                    self.order_guard = handlog_m.OrderGuard(save=self.save_order_issue)
                 self.store.new_session(self.tracker.session)
                 self.showdown = _optional("showdown")
                 self.shown_watch = self.showdown.Watcher() if self.showdown else None
@@ -2686,7 +2714,32 @@ class App:
             self.popup = ui_m.PopupWatcher() if ui_m and self.store is not None else None
         except Exception:
             self.log_once("init_tracking")
-            self.store = self.name_reader = self.tracker = None
+            self.store = self.name_reader = self.tracker = self.order_guard = None
+
+    def save_order_issue(self, info, img):
+        """순서 문제 증거 (상태 스레드, OrderGuard.save): hands/order_issues/<날짜>/<키>.jpg (게임 창만) + .json (코드·좌석 키·
+        포지션 전/후·결과, 닉네임 없음). 이 PC 에만 남는다 — 기록 업로더는 hands/ 바로 아래 허용 이름(날짜.jsonl)만 읽고
+        하위 폴더는 보지 않는다. 하루 ORDER_ISSUE_CAP 건까지 (결과가 나면 같은 키의 JSON 만 다시 씀)."""
+        key = str(info.get("key") or "")
+        if not key or not all(ch.isalnum() or ch in "_-" for ch in key):
+            return
+        day = time.strftime("%Y-%m-%d")
+        folder = BASE / "hands" / ORDER_ISSUE_DIR / day
+        js = folder / f"{key}.json"
+        if img is None:
+            if js.exists():
+                js.write_text(json.dumps(info, ensure_ascii=False, sort_keys=True, default=list), encoding="utf-8")
+            return
+        n = self.order_saved.get(day)
+        if n is None:
+            n = len(list(folder.glob("*.jpg"))) if folder.is_dir() else 0
+        if n >= ORDER_ISSUE_CAP:
+            self.order_saved[day] = n
+            return
+        folder.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(folder / f"{key}.jpg"), img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        js.write_text(json.dumps(info, ensure_ascii=False, sort_keys=True, default=list), encoding="utf-8")
+        self.order_saved[day] = n + 1
 
     def track_new_session(self, calib):
         """새 [자동 지정] / 테이블 창이 바뀜: 진행 중 핸드를 닫고 세션·이름·좌석 타입 기억을 새로 (pid 소금도 새로)."""
@@ -2777,9 +2830,14 @@ class App:
             self.hands_done += 1   # 핸드가 끝남 → 카드 잠금을 푸는 새 핸드 신호
             if rs is not None:
                 rs.hand_done()     # 기록 업로드 예약 (60초 묶음, 실제 전송은 업로더 스레드)
+        og = self.order_guard
+        if og is not None:   # 순서·포지션 어긋남 찾기 (가벼움) → 다음 읽기를 전부 다시 읽기로, 못 고치면 노란 줄
+            og.after(st, self.tracker, img)
         profiles = self.store.get_for_table(names, session=self.tracker.session,
                                             tab=self.cfg.get("game_tab")) if self.store else {}
         live = self.tracker.live()
+        if og is not None and og.unsure():   # 포지션을 못 믿음: 상대 리딩은 포지션 없이 (틀린 포지션보다 모름이 낫다)
+            live = {k: dict(v, pos=None, opener=None) for k, v in live.items()}
         prompt, seat_type = None, {}
         if types is not None:
             for s_ in st.get("seats") or []:   # 팝업 타입·통계를 좌석 프로필에 합침 (style 포함)
@@ -2828,7 +2886,8 @@ class App:
         in_hand = sorted(x["key"] for x in st["seats"] if x.get("in_hand") and x["key"] != "hero" and x["key"] in live)
         ante = bool((odds.parse_amount((self.cfg.get("inputs") or {}).get("ante")) or 0) > 0)
         styles = tuple((profiles.get(k) or {}).get("style") for k in in_hand)   # 타입을 새로 읽으면 다시 계산
-        key = (tuple(hero), tuple(board), tuple(in_hand), repr([live[k] for k in in_hand]), ante, self.looseness(), styles)
+        key = (tuple(hero), tuple(board), tuple(in_hand), repr([live[k] for k in in_hand]), ante, self.looseness(), styles,
+               self.order_unsure())
         if in_hand and (reads is None or reads["key"] != key):
             reads = self.make_reads(st, hero, board, live, profiles, in_hand, key)
         return reads
@@ -2908,6 +2967,14 @@ class App:
         return int(time.time() - self.rec_t0) if self.rec_on and self.rec_t0 else 0
 
     def apply_table_state(self):
+        note = None
+        og = self.order_guard
+        if og is not None:
+            note = og.note()
+        if note != self.order_note:   # 순서 확인 노란 줄이 생기거나 사라짐 → 추천을 포지션 있이/없이 다시
+            self.order_note = note
+            self.advice_key = None
+            self.schedule_advice()
         st = None
         while not self.state_queue.empty():
             st = self.state_queue.get_nowait()
@@ -2984,9 +3051,9 @@ class App:
                 guess = guess_situation(ts)
                 if guess:  # 테이블이 상황을 못 정함 (림프 후 레이즈·콜드 3벳 …) → 저장된 '첫 진입' 을 그대로 쓰지 않는다
                     auto["situation"] = guess
-            if ts.get("hero_pos"):
+            if ts.get("hero_pos") and not self.order_note:   # 순서 확인 중: 틀렸을 수 있는 포지션으로 채우지 않음
                 auto["hero"] = ts["hero_pos"]
-            if pre.get("villain_pos"):
+            if pre.get("villain_pos") and not self.order_note:
                 auto["villain"] = pre["villain_pos"]
             if auto:
                 out["preflop"] = auto
@@ -3009,7 +3076,7 @@ class App:
         memo = getattr(self, "pre_auto_memo", None)
         auto = memo[1] if memo and memo[0] == hero else {}
         pos = (self.table_state or {}).get("hero_pos") or auto.get("hero")
-        if not pos:
+        if not pos or self.order_note:   # 순서 확인 중엔 포지션을 말하지 않음
             return None
         sit = auto.get("situation")
         text = f"프리플랍: {pos}" + (f" · {dict(pf.SITUATIONS).get(sit, sit)}" if sit else "")
@@ -3282,7 +3349,7 @@ class App:
         if pre:
             ctx = self.anticipate_ctx(ctx)
         self.guard_ctx = ctx   # 덜 잃기 경고의 팟·콜 금액 (render_beaters)
-        key = repr(sorted((k, repr(v)) for k, v in ctx.items() if k != "villain_ranges")) + repr(self.result.get("rkey"))
+        key = repr(sorted((k, repr(v)) for k, v in ctx.items() if k != "villain_ranges")) + repr(self.result.get("rkey"))             + repr(self.order_note)
         cards = (tuple(ctx["hero"]), tuple(ctx["board"]))
         if key == self.advice_key and not self.result_stale():
             self.advice_stale, self.advice_pre = False, pre
@@ -3299,6 +3366,8 @@ class App:
             self.force_calc = False
         try:
             adv = self.advisor.recommend(ctx)
+            if isinstance(adv, dict) and adv.get("action") and self.order_note:
+                adv = dict(adv, confidence="low")   # 순서 확인 중: 참고만
             self.advice = adv if isinstance(adv, dict) and adv.get("action") else None
             self.advice_status = None if self.advice else ("추천 대기: 계산 결과 없음", "info", ())
         except Exception:
@@ -3544,6 +3613,12 @@ class App:
                 ctx.update(self.postflop_ctx(ts_live, hero_str, len(board), ctx["opponents_in_hand"], turn_pot))
             except Exception:
                 self.log_once("postflop_ctx")
+        if self.order_note:
+            # 순서 확인 중: 포지션이 틀렸을 수 있다 → '모름' 으로 (추천 모듈의 포지션 없는 판단을 쓰게). 금액·액션은 그대로
+            for k in ("hero_pos", "villain_pos", "ref3_villain_pos"):
+                if k in ctx:
+                    ctx[k] = None
+            ctx.pop("hero_ip", None)
         return ctx
 
     # --- 메인 루프 ----------------------------------------------------------
@@ -3941,7 +4016,8 @@ class App:
                len(self.matcher.labels), repr(st), repr(self.cfg.get("inputs")), w, h, self.tab,
                self.cfg.get("explain", True), repr(self.advice), repr(self.advice_status), self.advice_stale,
                self.advice_pre, (self.result or {}).get("quality"),
-               self.result_stale(), self.heavy_allowed(), self.err_note, self.state_key, tuple(sorted(self.manual)),
+               self.result_stale(), self.heavy_allowed(), self.err_note, self.order_note, self.state_key,
+               tuple(sorted(self.manual)),
                bool(self.cfg.get("auto_numbers")), repr(self.ocr_values), self.rec_on, self.rec_elapsed(),
                self.reads_sig(), repr((self.track or {}).get("names")), repr(self.cfg.get("section_layout")),
                repr((self.track or {}).get("prompt")), repr((self.track or {}).get("types")),
@@ -5011,7 +5087,7 @@ class App:
         """맨 위 추천 카드: 추천 행동(크게) + 이유 + 대응 계획 + 세부 + 상태 줄. 추천이 없으면 이유(대기 사유)를 보여준다."""
         adv, ts = self.advice, self.table_state
         status = None if adv else self.advice_status
-        if not adv and not ts and not status and not self.err_note:
+        if not adv and not ts and not status and not self.err_note and not self.order_note:
             return y
         s, W, P = self.s, self.s(self.W), self.s(self.P)
         pad = s(14)
@@ -5031,6 +5107,12 @@ class App:
             self.buttons[key].draw(c, x, top, x + bw, top + bh, text, primary=primary, font=self.font(FS_SMALL, "bold"),
                                    r=s(6))
             return bw, bh
+        if self.order_note:   # 포지션·순서를 못 믿음: 맨 위 노란 한 줄 (고쳐지면 사라짐)
+            tag = self.new_tag("tip")
+            t = self.text(c, tx, iy, self.order_note, FS_ADV_CAP, "bold", WARN, width=tw, tags=tag)
+            self.bind_tip(c, tag, "좌석 순서(누가 먼저 행동하는지)나 포지션이 화면과 맞지 않습니다. 다시 읽어 고치는 중이며, "
+                                  "그동안 추천은 포지션 없이 계산합니다 — 참고만 하세요")
+            iy = c.bbox(t)[3] + s(6)
         if adv:
             waiting = (ts.get("to_act") is False if ts else False) and not click  # 내 차례 아님 → 계획만, 흐리게
             stale = self.advice_stale
@@ -5126,7 +5208,7 @@ class App:
             return self._chip_row(c, x0, y, width, chips)
         chips = [(STREET_NAMES.get(len(board), "딜링 중"), TEXT)]
         if ts.get("hero_pos"):
-            chips.append((str(ts["hero_pos"]), TEXT))
+            chips.append(("포지션 ?", WARN) if self.order_note else (str(ts["hero_pos"]), TEXT))
         players, in_hand = _number(ts.get("players")), _number(ts.get("in_hand"))
         if players:
             chips.append((f"{int(players)}명 중 {int(in_hand)}명 참여" if in_hand is not None else f"{int(players)}명",

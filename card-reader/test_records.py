@@ -562,6 +562,11 @@ class T26_ReadScope(unittest.TestCase):
         wr(base, "hands/" + D0, dline(1))
         wr(base, "hands/snaps/x.jpg", b"\xff\xd8img")
         wr(base, "hands/snaps/2026-11-01.jsonl", hline(77))
+        # 순서 문제 증거 (reader.save_order_issue: 게임 창 이미지 + JSON) — 이 PC 에만, 업로드 대상 아님
+        wr(base, "hands/order_issues/2026-11-01/20261101_120000-0001_1.jpg", b"\xff\xd8img")
+        wr(base, "hands/order_issues/2026-11-01/20261101_120000-0001_1.json", hline(88))
+        wr(base, "hands/order_issues/2026-11-01.jsonl", hline(88))
+        wr(base, "hands/order_issues/decisions_2026-11-01.jsonl", dline(88))
         wr(base, "hands/read_scores.json", b"{}")
         wr(base, "hands/2026-11-01.jsonl.bak", hline(66))
         wr(base, "hands/decisions_2026-11-01.jsonl.1", dline(66))
@@ -629,9 +634,46 @@ class T26_ReadScope(unittest.TestCase):
         names = [p[0] for p in up.puts]
         self.assertTrue(all(RC.file_kind(n) for n in names))
         blob = b"".join(p[1] for p in up.puts)
-        for marker in (77, 66, 55, 44, 99):
+        for marker in (88, 77, 66, 55, 44, 99):
             self.assertNotIn(('"id":"20261105_120000-%04d"' % marker).encode(), blob)
         self.assertNotIn(b"img", blob)
+
+    def test_26_order_issues_folder_never_read(self):
+        """순서 문제 증거 (hands/order_issues/<날짜>/*.jpg·*.json, 닉네임이 보이는 게임 창 이미지) 는 열지도 올리지도 않는다.
+        위 시험은 심볼릭 링크를 못 만드는 Windows 에서 건너뛰므로 링크 없이 따로 확인한다."""
+        base = mkbase("t26o")
+        hands = os.path.join(base, "hands")
+        wr(base, "hands/" + D1, hline(1))
+        wr(base, "hands/order_issues/2026-11-01/20261101_120000-0001_1.jpg", b"img-order")
+        wr(base, "hands/order_issues/2026-11-01/20261101_120000-0001_1.json", hline(88))
+        wr(base, "hands/order_issues/2026-11-01.jsonl", hline(88))
+        wr(base, "hands/order_issues/" + D1, hline(88))
+        opened, scanned = [], []
+        real_open, real_os_open, real_scandir = builtins.open, os.open, os.scandir
+
+        def spy_open(f, *a, **k):
+            opened.append(os.path.abspath(f) if isinstance(f, (str, bytes, os.PathLike)) else f)
+            return real_open(f, *a, **k)
+
+        def spy_os_open(p, *a, **k):
+            opened.append(os.path.abspath(p))
+            return real_os_open(p, *a, **k)
+
+        def spy_scandir(p="."):
+            scanned.append(os.path.abspath(p))
+            return real_scandir(p)
+        up = mk(base, fake_cfg(), fake=True)
+        builtins.open, os.open, os.scandir, RS._open = spy_open, spy_os_open, spy_scandir, spy_open
+        try:
+            self.assertEqual(run(up), 0)
+        finally:
+            builtins.open, os.open, os.scandir, RS._open = real_open, real_os_open, real_scandir, real_open
+        self.assertFalse([p for p in opened if isinstance(p, str) and "order_issues" in p], opened)
+        self.assertEqual(scanned, [hands])
+        self.assertEqual([p[0] for p in up.puts], [D1])
+        blob = b"".join(p[1] for p in up.puts)
+        self.assertNotIn(b'"id":"20261105_120000-0088"', blob)
+        self.assertNotIn(b"img-order", blob)
 
     def test_26_profiles_db_refuses_without_network(self):
         for extra in ("profiles.db", "profiles.db-wal", "profiles.db-shm", "profiles.db-journal"):

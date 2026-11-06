@@ -952,6 +952,217 @@ def test_jsonl_append_after_crash():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# --- 순서 확인 (OrderGuard) ---------------------------------------------------------------------------
+class _Reader:
+    """tablestate.TableReader 대신: adopt 하면 화면 포지션(table.pos)도 바뀜, positions_for 는 진짜 것."""
+
+    def __init__(self, table):
+        self.table, self.adopted = table, []
+
+    def adopt(self, rb):
+        self.adopted.append(rb)
+        self.table.pos, self.table.dealer = dict(rb["pos"]), rb["dealer"] or self.table.dealer
+        return True
+
+    @staticmethod
+    def positions_for(keys, in_hand, dealer=None, sb=None, bb=None):
+        import tablestate
+        return tablestate.TableReader.positions_for(keys, in_hand, dealer=dealer, sb=sb, bb=bb)
+
+
+class GuardTable(Table):
+    """Table + OrderGuard (앱 상태 스레드와 같은 순서: full 읽기 → before → update → after).
+    self.pos / self.dealer = 화면에서 읽은(틀릴 수 있는) 포지션, self.button = 전부 다시 읽기에서 찾는 버튼 자리.
+    self.ring = 차례 고리 좌석, self.turn = 내 액션 바 {'bar': 'check'/'call', 'call': 금액} 또는 None."""
+
+    def __init__(self, tracker, guard, **kw):
+        self.guard, self.ring, self.turn, self.button = guard, None, None, None
+        self.reader = _Reader(self)
+        self.saved = []
+        guard.save = lambda info, img: self.saved.append(dict(info))
+        orig = tracker.update
+
+        def update(state, *a, **k):
+            state["acting_seat"] = self.ring
+            state["no_hand"] = False
+            if self.turn:
+                state.update(to_act=True, bar=self.turn["bar"], call=self.turn.get("call"))
+            state["lock_keys"] = sorted(self.pos)
+            state["dealer_seen"] = self.dealer
+            if guard.want_full():
+                d = self.button or self.dealer
+                state["rebuild"] = {"pos": positions(d), "dealer": d, "src": "D", "keys": list(self.keys)}
+            guard.before(state, tracker, self.reader)
+            out = orig(state, *a, **k)
+            guard.after(state, tracker, img="frame")
+            return out
+        tracker.update = update
+        super().__init__(tracker, **kw)
+
+    def misread(self, dealer):
+        """화면이 버튼을 dealer 자리로 잘못 읽음 (칩·블라인드는 진짜 자리 그대로)."""
+        self.dealer, self.pos = dealer, positions(dealer)
+
+
+def _codes(rec):
+    return [i["code"] for i in rec["issues"]]
+
+
+def test_order_guard_heals_wrong_button():
+    """버튼을 한 자리 잘못 읽음 (진짜 딜러 UR → TC 로 읽음): SB 칩(0.5)이 'SB' 가 아닌 좌석에 있음 → 다음 프레임 전부 다시 읽기 →
+    버튼을 UR 에서 찾음 → 포지션을 바꾸고 이미 기록한 액션을 고침 ('BB 1 칩 = 콜' 로 잡힌 가짜 VPIP 를 블라인드로). 경고 없음."""
+    tr, guard = handlog.Tracker("og1"), handlog.OrderGuard()
+    tb = GuardTable(tr, guard)                    # 진짜: SB=BR, BB=hero, UTG=BL, MP=UL, CO=TC, BTN=UR
+    tb.misread("seat_TC")                          # 화면: SB=UR, BB=BR, UTG=hero …
+    tb.button = "seat_UR"
+    tb.step()
+    assert guard.want_full() and "order_blind" in _codes({"issues": tr.hand.issues}), tr.hand.issues
+    assert tb.saved and tb.saved[0]["codes"] == ["order_blind"] and "before" in tb.saved[0]
+    assert not any("P_" in repr(x) for x in tb.saved), "증거 JSON 에 닉네임 없음"
+    tb.step()                                      # 전부 다시 읽기 → 고침
+    assert tb.reader.adopted and tb.pos == positions("seat_UR") and not guard.want_full()
+    assert guard.status == "healed" and guard.note() is None
+    assert tb.saved[-1]["outcome"] == "order_healed" and tb.saved[-1]["after"]["hero"] == "BB", tb.saved[-1]
+    tb.step(bets={"seat_BL": 2.5}, bubble={"seat_BL": "raise"})
+    tb.step(fold=["seat_UL", "seat_TC", "seat_UR", "seat_BR"])
+    tb.step(fold=["hero"])
+    rec = finish(tb)
+    assert rec["seats"]["hero"]["pos"] == "BB" and rec["seats"]["seat_BR"]["pos"] == "SB", rec["seats"]
+    pre = acts(rec, "preflop")
+    assert sorted(pre[:2]) == [("hero", "post"), ("seat_BR", "post")], pre
+    assert ("hero", "call") not in pre and st(rec, "hero")["vpip"] == 0, pre
+    assert {a["blind"] for a in rec["actions"]["preflop"] if a["act"] == "post"} == {"SB", "BB"}
+    assert "order_healed" in _codes(rec) and rec["confidence"] == "ok", rec["issues"]
+
+
+def test_order_guard_unsure_when_button_keeps_disagreeing():
+    """다시 읽어도 버튼이 같은 (틀린) 자리 → 블라인드 칩과 계속 어긋남 → ORDER_TRIES 번 뒤 '순서 확인 중' 경고, 기록은 low.
+    다음 핸드가 되면 경고가 사라짐."""
+    tr, guard = handlog.Tracker("og2"), handlog.OrderGuard()
+    tb = GuardTable(tr, guard)
+    tb.misread("seat_TC")
+    tb.button = "seat_TC"
+    for _ in range(handlog.ORDER_TRIES + 1):
+        assert guard.note() is None
+        tb.step()
+    assert guard.unsure() and guard.note() == handlog.ORDER_NOTE and not guard.want_full()
+    assert tb.saved[-1]["outcome"] == "order_unsure"
+    tb.step(fold=["seat_BL", "seat_UL", "seat_TC", "seat_UR", "seat_BR"])
+    rec = finish(tb)
+    assert "order_unsure" in _codes(rec) and rec["confidence"] == "low", rec["issues"]
+    assert guard.note() is None, "새 핸드: 경고 사라짐"
+
+
+def test_order_guard_quiet_on_normal_hand():
+    """정상 핸드 (차례 고리가 순서대로, 앞 사람 폴드가 한 프레임 늦게 보여도) → 어긋남 없음, 다시 읽기 없음."""
+    tr, guard = handlog.Tracker("og3"), handlog.OrderGuard()
+    tb = GuardTable(tr, guard)                     # SB=BR, BB=hero, UTG=BL, MP=UL, CO=TC, BTN=UR
+    tb.step()
+    tb.ring = "seat_BL"
+    tb.step()
+    tb.ring = "seat_UL"
+    tb.step(bets={"seat_BL": 2.5}, bubble={"seat_BL": "raise"})
+    tb.ring = "seat_TC"                            # MP 폴드가 아직 안 보임 (다음 프레임에 흑백)
+    tb.step()
+    tb.step(fold=["seat_UL"], bubble={"seat_UL": "fold"})
+    tb.ring = "seat_UR"
+    tb.step(fold=["seat_TC"])
+    tb.ring = "seat_BR"
+    tb.step(bets={"seat_UR": 2.5}, bubble={"seat_UR": "call"})
+    tb.ring, tb.turn = None, {"bar": "call", "call": 1.5}
+    tb.step(fold=["seat_BR"])
+    tb.turn = None
+    tb.step(bets={"hero": 2.5}, bubble={"hero": "call"})
+    tb.step(board=["Ah", "7c", "2d"], collect=True, bubble={})
+    tb.turn = {"bar": "check"}
+    tb.step()
+    tb.turn = None
+    tb.step(bubble={"hero": "check"})
+    tb.ring = "seat_BL"
+    tb.step()
+    assert not guard.pending and guard.n == 0 and guard.note() is None, tr.hand.issues
+    assert not [i for i in tr.hand.issues if i["code"].startswith("order_")], tr.hand.issues
+
+
+def test_order_guard_hero_check_button_preflop():
+    """프리플랍에 내 '체크' 버튼 = 나는 BB. 포지션이 나를 BB 가 아니라고 하면 어긋남 (order_hero) → 버튼으로 고침."""
+    tr, guard = handlog.Tracker("og4"), handlog.OrderGuard()
+    tb = GuardTable(tr, guard)                     # 진짜 BB = hero
+    tb.bets = {}                                   # 블라인드 칩을 못 읽음 (칩 증거 없음)
+    tb.misread("seat_BR")                          # 화면: hero = SB
+    tb.button = "seat_UR"
+    tb.step()
+    tb.step(fold=["seat_BL", "seat_UL", "seat_TC", "seat_UR"])
+    tb.turn = {"bar": "check"}
+    tb.step()
+    assert "order_hero" in _codes({"issues": tr.hand.issues}) and guard.want_full(), tr.hand.issues
+    tb.step()
+    assert guard.status == "healed" and tb.pos["hero"] == "BB", (guard.status, tb.pos)
+
+
+def test_order_guard_folded_seat_acts_again():
+    """흑백(폴드)으로 기록된 좌석이 같은 스트리트에 칩을 더 냄 → 다시 읽기 → 여전하면 그 폴드를 지우고 이어서 기록."""
+    tr, guard = handlog.Tracker("og5"), handlog.OrderGuard()
+    tb = GuardTable(tr, guard)
+    tb.step()
+    tb.step(bets={"seat_BL": 2.5}, bubble={"seat_BL": "raise"})
+    tb.step(fold=["seat_UL"])                      # 아바타가 잠깐 흑백 (오판)
+    tb.folded.discard("seat_UL")
+    tb.step(bets={"seat_UL": 2.5}, bubble={"seat_UL": "call"})
+    assert "order_folded" in _codes({"issues": tr.hand.issues}) and guard.want_full(), tr.hand.issues
+    tb.step()
+    assert guard.status == "healed" and not tr.hand.seats["seat_UL"].folded
+    tb.step()
+    tb.step(fold=["seat_TC", "seat_UR", "seat_BR", "hero"])
+    rec = finish(tb)
+    ul = [a for a in acts(rec, "preflop") if a[0] == "seat_UL"]
+    assert ul == [("seat_UL", "call")], acts(rec, "preflop")
+
+
+def test_relabel_fixes_blind_posts():
+    """Tracker.relabel: 잘못된 포지션으로 기록된 블라인드만 고침 — 진짜 BB 의 '0.5 블라인드 + 콜 1' → 'BB 1',
+    진짜 SB 의 '콜 0.5' → 'SB 0.5', 블라인드가 아닌데 '블라인드' 로 잡힌 칩 → 림프면 콜, 바로 레이즈했으면 레이즈에 포함."""
+    tr = handlog.Tracker("rl")
+    tb = Table(tr)                                 # 진짜: SB=BR, BB=hero
+    tb.pos = positions("seat_BR")                  # 화면: SB=hero, BB=BL, UTG=UL
+    tb.step()                                      # hero 1 → 'SB 0.5' + '콜 1', BR 0.5 → '콜 0.5'
+    tb.step(bets={"seat_BL": 1.0})                 # 진짜 UTG 림프 1 → 'BB 블라인드' 로 기록됨
+    tb.step(bets={"seat_UL": 3.0}, bubble={"seat_UL": "raise"})
+    before = acts({"actions": tr.hand.actions}, "preflop")
+    assert ("hero", "call") in before and ("seat_BR", "call") in before, before
+    fixed = tr.relabel(positions("seat_UR"), "seat_UR")
+    got = [(a["seat"], a["act"], a.get("to"), a.get("blind")) for a in tr.hand.actions["preflop"]]
+    assert ("hero", "post", 1.0, "BB") in got and ("seat_BR", "post", 0.5, "SB") in got, got
+    assert ("seat_BL", "call", 1.0, None) in got and not any(g[0] == "hero" and g[1] == "call" for g in got), got
+    assert fixed >= 3, fixed
+    assert tr.labels(tr.hand)["hero"] == "BB" and tr.hand.blind_keys == {"sb": "seat_BR", "bb": "hero"}
+
+
+def test_order_guard_drops_sitting_out_seat():
+    """2026-10-30 녹화: 버튼(TC)과 SB 칩 좌석(BR) 사이에 자리 비움인 흑백 아바타(UR)가 '카드 받고 폴드' 로 보여 포지션이 한 칸 밀림
+    (나 = UTG 로 계산, 실제 BB). 다시 읽어도 버튼은 TC → 버튼과 SB 사이의 폴드 말고 한 게 없는 흑백 좌석을 빼면 버튼·SB 칩·
+    BB 칩이 모두 맞음 → 그 좌석을 이번 핸드에서 빼고 포지션을 고침 (그 뒤에 다시 넣지 않음)."""
+    tr, guard = handlog.Tracker("og6"), handlog.OrderGuard()
+    tb = GuardTable(tr, guard)
+    tb.misread("seat_TC")                          # 화면: UR 포함 6명 → UR=SB, BR=BB, hero=UTG
+    tb.button = "seat_TC"
+    tb.folded = {"seat_UR"}
+    tb.bets = {"seat_BR": 0.5, "hero": 1.0}        # 실제 SB=BR, BB=hero
+    tb.step()
+    assert guard.want_full(), tr.hand.issues
+    tb.step()
+    assert guard.status == "healed" and "seat_UR" not in tr.hand.seats, (guard.status, list(tr.hand.seats))
+    lab = tr.labels(tr.hand)
+    assert lab["seat_BR"] == "SB" and lab["hero"] == "BB" and lab["seat_TC"] == "BTN", lab
+    for _ in range(3):
+        tb.step()
+    assert "seat_UR" not in tr.hand.seats and not guard.want_full() and guard.note() is None, tr.hand.issues
+    tb.step(fold=["seat_BL", "seat_UL", "seat_TC", "seat_BR"])
+    rec = finish(tb)
+    assert "seat_UR" not in rec["seats"] and rec["seats"]["hero"]["pos"] == "BB", rec["seats"]
+    assert "order_healed" in _codes(rec) and rec["confidence"] == "ok", rec["issues"]
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

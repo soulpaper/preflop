@@ -243,6 +243,76 @@ def order_checks():
     check("다음이 나면 안 봄 (액션 바가 잡음)", ww.keys == [], ww.keys)
 
 
+def order_guard_checks():
+    """순서 확인용 (handlog.OrderGuard): 버튼으로 정한 포지션은 원판이 달라도 유지 (state disc_conflict), 다시 계산한 후보
+    (_rebuild), 블라인드 좌석으로 포지션 (positions_for), 후보로 고정 바꾸기 (adopt), 전부 다시 읽기의 버튼 찾기 (full),
+    소수점을 놓친 OCR ('05BB' = 0.5)."""
+    TR = tablestate.TableReader
+    full = ORDER[:]
+    tr = TR()
+    first, _ = _pos(tr, full, "seat_TL")
+    pos, _ = _pos(tr, full, None, {"SB": "seat_UR", "BB": "seat_R"}, folded=["seat_BL"])
+    check("버튼으로 정한 포지션: 버튼이 가려지고 원판이 달라 보여도 유지 (예전: 원판으로 바꿔 2프레임 내 포지션 BB)",
+          pos == first and tr._lock["dealer"] == "seat_TL", pos)
+    tr2 = TR()
+    _pos(tr2, full, None, {"BB": "seat_UR"})
+    pos, _ = _pos(tr2, full, None, {"BB": "seat_R"})
+    check("원판으로 정한 포지션은 새 원판을 따름", pos.get("seat_R") == "BB", pos)
+    order = [{"key": k, "dealt": True, "folded": False, "occupied": True} for k in full]
+    rb = tr._rebuild(order, order, "seat_UL", {})
+    check("다시 계산한 후보: 이번 버튼 기준", rb and rb["src"] == "D" and rb["pos"]["seat_UL"] == "BTN" and rb["dealer"] == "seat_UL",
+          rb)
+    check("버튼·원판이 없으면 후보 없음", tr._rebuild(order, order, None, {}) is None)
+    got = TR.positions_for(full, full, sb="seat_TR")
+    check("positions_for: SB 좌석으로", got.get("seat_TR") == "SB" and got.get("seat_UR") == "BB" and got.get("seat_TL") == "BTN",
+          got)
+    check("adopt: 고정 바꿈", tr.adopt(rb) and tr._lock["pos"] == rb["pos"] and tr._lock["dealer"] == "seat_UL")
+    pos, _ = _pos(tr, full, "seat_UL", folded=["seat_BL"])
+    check("adopt 뒤 같은 버튼 → 그대로", pos == rb["pos"], pos)
+    # 전부 다시 읽기: 배운 자리를 모두 알아도 펠트 전체에서 찾음
+    pw = 228.0
+    t = tablestate._template(tablestate._D_B64, tablestate._D_SHAPE, pw, 1.0)
+    base = np.random.default_rng(2).integers(40, 80, (600, 900)).astype(np.uint8)
+    g = base.copy()
+    g[300 - t.shape[0] // 2:300 - t.shape[0] // 2 + t.shape[0], 700 - t.shape[1] // 2:700 - t.shape[1] // 2 + t.shape[1]] = t
+    geom = {"ring": [450, 300, 420, 260]}
+    tr = TR()
+    tr._spots = {"a": ((200.0, 200.0), 1.0), "b": ((600.0, 350.0), 1.0)}
+    tr._d_miss = 1
+    quick = tr._dealer(base, geom, pw, ["a", "b"])
+    found = tr._dealer(g, geom, pw, ["a", "b"], full=True)
+    check("full: 배운 자리에 없으면 바로 펠트 전체", not quick and found and abs(found[0][1][0] - 700) < 3, (quick, found))
+    check("OCR '05BB' = 0.5BB (예전: '058B' 와 글자 수를 맞춰 58BB)", ocr.candidates("05BB") == (0.5, "BB", True)
+          and tablestate._resolve(["05BB", "05BB", "058B"], "BB", 4) == (0.5, "BB"), ocr.candidates("05BB"))
+    check("OCR '10.5BB'·'0BB'·'105BB' 그대로", ocr.candidates("10.5BB")[0] == 10.5 and ocr.candidates("0BB")[0] == 0.0
+          and ocr.candidates("105BB")[0] == 105.0)
+    # 순서 문제 증거 저장 (reader.App.save_order_issue): hands/order_issues/<날짜>/ 에 이미지+JSON, 하루 ORDER_ISSUE_CAP 건
+    import json as _json
+    import shutil
+    import tempfile
+    import types
+    import reader
+    tmp = Path(tempfile.mkdtemp(prefix="order_issues_test_"))
+    old_base = reader.BASE
+    reader.BASE = tmp
+    try:
+        fake = types.SimpleNamespace(order_saved={})
+        img = np.zeros((40, 60, 3), np.uint8)
+        for i in range(reader.ORDER_ISSUE_CAP + 3):
+            reader.App.save_order_issue(fake, {"key": f"20261106_001532-0001_{i}", "codes": ["order_blind"]}, img)
+        reader.App.save_order_issue(fake, {"key": "20261106_001532-0001_0", "outcome": "order_healed"}, None)
+        reader.App.save_order_issue(fake, {"key": "../escape", "codes": ["x"]}, img)
+        days = list((tmp / "hands" / reader.ORDER_ISSUE_DIR).iterdir())
+        jpgs = list(days[0].glob("*.jpg")) if days else []
+        first = _json.loads((days[0] / "20261106_001532-0001_0.json").read_text(encoding="utf-8")) if days else {}
+        check("증거 저장: 날짜 폴더 하나, 하루 최대 개수, 결과는 같은 JSON 에 다시 씀, 이상한 키는 무시",
+              len(days) == 1 and len(jpgs) == reader.ORDER_ISSUE_CAP and first.get("outcome") == "order_healed"
+              and not list(tmp.rglob("escape*")), (len(days), len(jpgs), first))
+    finally:
+        reader.BASE = old_base
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     tr = tablestate.TableReader()
     have_ocr = ocr.available()
@@ -289,6 +359,7 @@ def main():
     check("색 판정: 청록 → 체크, 파랑 → 콜", kind == "call", kind)
     reader_checks()
     order_checks()
+    order_guard_checks()
     print(f"\n{sum(results)}/{len(results)} passed")
     return 0 if all(results) else 1
 

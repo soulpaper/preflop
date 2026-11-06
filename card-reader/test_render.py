@@ -375,6 +375,13 @@ def layout_cases(app):
         print("ok  " if ok else "FAIL", "A−/A+ 보정", s0, "→", s1, b1, "→", s2, b2)
         if not ok:
             fails.append("A−/A+")
+        # 순서 확인 노란 줄이 있어도 같은 창에서 한 화면 (잘림 없음·배율 유지)
+        import handlog
+        app.order_note = handlog.ORDER_NOTE
+        for kind in ("pre", "flop"):
+            layout_state(app, kind)
+            fails += layout_check(app, f"{kind}+순서 확인 줄", 1.0)
+        app.order_note = None
         # 끌어 옮긴 섹션은 보이는 그대로 저장되고, 균형 맞추기가 다시 옮기지 않음 (pin)
         for kind in ("옮긴 직후", "다음 핸드 플랍"):
             if kind == "옮긴 직후":
@@ -386,6 +393,7 @@ def layout_cases(app):
             if not ok:
                 fails.append(f"pin {kind}")
     finally:
+        app.order_note = None
         app.cfg["section_layout"], app.cfg["ui_bias"], app.dpi = saved[:3]
         if saved[0] is None:
             app.cfg.pop("section_layout", None)
@@ -457,6 +465,45 @@ def guard_review_cases(app):
     return fails
 
 
+def order_note_cases(app):
+    """순서 확인 중 (handlog.OrderGuard 가 포지션·순서를 못 믿음): 추천 카드 맨 위 노란 한 줄, 추천 신뢰도 '낮음', 추천 입력은
+    포지션 없이 (hero_pos/villain_pos/hero_ip 없음), 상태 칩은 '포지션 ?'. 고쳐지면 (note None) 줄이 사라지고 포지션이 돌아옴. 한 화면."""
+    import handlog
+    fails = []
+    saved = app.track, app.table_state, app.order_note
+    app.declog = None
+    try:
+        app.track = {"reads": None, "names": {}, "profiles": {}, "live": {}}
+        for street, board in (("프리플랍", []), ("플랍", ["Kh", "7d", "2c"])):
+            for note in (handlog.ORDER_NOTE, None):
+                app.order_note = note
+                app.table_state = table([seat("seat_TC", "BTN", bet=3.0)], call=3.0)
+                state(app, ["Ah", "Kd"], board)
+                app.advice_key = None
+                app.compute_advice()
+                app.render(force=True)
+                app.root.update()
+                txt = canvas_text(app)
+                ctx = app.advice_ctx()
+                drawn = handlog.ORDER_NOTE in txt
+                conf = (app.advice or {}).get("confidence")
+                ok = drawn == bool(note) and max(app.col_bottoms) <= app.win_h and app.advice is not None
+                if note:
+                    ok = ok and conf == "low" and ctx.get("hero_pos") is None and ctx.get("villain_pos") is None \
+                        and "hero_ip" not in ctx and "포지션 ?" in txt
+                else:
+                    ok = ok and ctx.get("hero_pos") == "BB" and "포지션 ?" not in txt
+                print("ok  " if ok else "FAIL", "순서 확인 줄", street, "| 보임", drawn, "| 신뢰도", conf, "| 내 포지션",
+                      ctx.get("hero_pos"), "| 아래", max(app.col_bottoms), "/", app.win_h)
+                if not ok:
+                    fails.append(f"order note {street} {bool(note)}")
+    finally:
+        app.track, app.table_state, app.order_note = saved
+        app.render(force=True)
+        app.root.update()
+    return fails
+
+
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -495,6 +542,7 @@ def main():
         fails += len(layout_cases(app))
         fails += len(type_cases(app))
         fails += len(guard_review_cases(app))
+        fails += len(order_note_cases(app))
     except Exception as e:
         import traceback
         traceback.print_exc()

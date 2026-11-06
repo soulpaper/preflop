@@ -145,19 +145,25 @@ def _clean(text):
     return t
 
 
+def _lost_dot(number):
+    """'05' 처럼 0 으로 시작하는 두 자리 이상 정수 = 소수점을 놓친 것 ('0.5BB' 를 '05BB' 로 읽음) → '0.5'."""
+    return "0." + number[1:] if re.fullmatch(r"0\d+", number) else number
+
+
 def candidates(text):
-    """OCR 문자열 하나 → (값, 단위, 정확히 읽힘 여부). 해석 불가면 None."""
+    """OCR 문자열 하나 → (값, 단위, 정확히 읽힘 여부). 해석 불가면 None.
+    0 으로 시작하는 정수는 소수점을 놓친 것으로 본다 ('05BB' = 0.5BB; 예전엔 '058B' 와 글자 수를 맞춰 58BB 로 읽었다)."""
     t = _clean(text)
     m = re.search(r"(\d+(?:\.\d+)?)BB", t)
     if m:
-        return float(m.group(1)), "BB", True
+        return float(_lost_dot(m.group(1))), "BB", True
     m = re.search(r"(\d+(?:\.\d+)?)만(\d{1,4})?", t)   # '1.5만' = 15000 (예전엔 소수점 뒤 '5만'만 잡혀 50000)
     if m:
         return int(round(float(m.group(1)) * 10000)) + int(m.group(2) or 0), "만", True
     m = re.search(r"(\d+(?:\.\d+)?)([^\d.]*)(\d{1,4})?", t)
     if not m:
         return None
-    number, junk, tail = m.group(1), m.group(2), m.group(3)
+    number, junk, tail = _lost_dot(m.group(1)), m.group(2), m.group(3)
     if not junk:
         return float(number), None, True
     # 애매한 글자: 한글이면 '만'을, 아니면 'BB'를 잘못 읽은 것으로 추정 (단위 힌트로 최종 결정)
