@@ -579,6 +579,26 @@ def test_recorder_recalib_same_second():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_upcoming_follows_action_order():
+    """Tracker.upcoming: 행동 순서상 다음에 행동할 좌석 (앱이 기다리는 동안 그 좌석만 지켜봄). 기록은 안 바꿈."""
+    tr = handlog.Tracker("up")
+    assert tr.upcoming() == []                                   # 핸드 없음
+    tb = Table(tr)   # 딜러 UR → SB=BR, BB=hero, UTG=BL, MP=UL, CO=TC, BTN=UR
+    tb.step()
+    assert tr.upcoming() == ["seat_BL", "seat_UL"], tr.upcoming()          # 프리플랍 첫 행동 = UTG
+    tb.step(bets={"UTG": 2.5}, bubble={"UTG": "raise"})
+    assert tr.upcoming() == ["seat_UL", "seat_TC"], tr.upcoming()
+    tb.step(fold=["MP"], bubble={"MP": "fold"})
+    assert tr.upcoming(n=3) == ["seat_TC", "seat_UR", "seat_BR"], tr.upcoming(n=3)
+    assert tr.upcoming(after="seat_UR") == ["seat_BR", "hero"]           # 차례 고리가 BTN 에 있을 때
+    tb.step(allin=["CO"], bets={"CO": 50.0}, bubble={"CO": "allin"})    # 올인한 사람은 더 행동 안 함
+    assert tr.upcoming(after="seat_BR", n=5) == ["hero", "seat_BL", "seat_UR"], tr.upcoming(after="seat_BR", n=5)
+    issues = list(tr.hand.issues)
+    tr.hand.seats["seat_BR"].pos.clear()                                 # 포지션 모름: 조용히 화면 순서
+    tr.upcoming()
+    assert tr.hand.issues == issues, tr.hand.issues
+
+
 def test_tablestate_positions_headsup():
     import tablestate
     order = [{"key": "seat_UR"}, {"key": "hero"}]

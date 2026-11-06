@@ -82,6 +82,167 @@ def reader_checks():
           == ["2c", "2d", "2h"])
 
 
+ORDER = ["seat_BL", "seat_L", "seat_UL", "seat_TL", "seat_TR", "seat_UR", "seat_R", "seat_BR", "hero"]  # 시계 방향, 나는 마지막
+
+
+def _seats(dealt, folded=(), occupied=None):
+    occ = set(ORDER if occupied is None else occupied)
+    return [{"key": k, "dealt": k in dealt, "folded": k in folded, "occupied": k in occ} for k in ORDER]
+
+
+def _pos(tr, dealt, dealer, discs=None, folded=()):
+    order = _seats(dealt, folded)
+    return tr._hand_positions(order, [s for s in order if s["dealt"]], dealer, dict(discs or {}), [])
+
+
+def order_checks():
+    """핸드마다 한 번 정하는 포지션 · 고정 버튼 자리 · 다음 차례 좌석 지켜보기 (2026-11-06 녹화에서 찾은 문제들)."""
+    import types
+    import reader
+    TR = tablestate.TableReader
+    # 딜링 첫 프레임: 블라인드 두 사람만 카드가 보임 (딜러는 아직 없음) → 헤즈업이 아니라 SB, BB 순서 그대로
+    got = TR._positions([{"key": k} for k in ORDER], [{"key": "seat_TR"}, {"key": "seat_UR"}], "seat_TL", {}, [])
+    check("딜링 첫 프레임 2명 (딜러 빠짐) → SB, BB 순서", got == {"seat_TR": "SB", "seat_UR": "BB"}, got)
+    got = TR._positions([{"key": k} for k in ORDER], [{"key": "seat_UR"}, {"key": "hero"}], "hero", {}, [])
+    check("진짜 헤즈업 (딜러 = SB) 은 그대로", got == {"hero": "SB", "seat_UR": "BB"}, got)
+
+    tr = TR()
+    full = ORDER[:]
+    pos, n = _pos(tr, full, "seat_TL")
+    check("9명: 딜러 TL → TR SB, UR BB, R UTG", (pos["seat_TL"], pos["seat_TR"], pos["seat_UR"], pos["seat_R"], n)
+          == ("BTN", "SB", "BB", "UTG", 9), (pos, n))
+    first = dict(pos)
+    # 핸드 중 한 사람이 화면에서 빠짐 (공개 카드가 아바타를 가림 등) → 이름이 밀리지 않음
+    pos, n = _pos(tr, [k for k in full if k != "seat_R"], "seat_TL", folded=["seat_BL"])
+    check("핸드 중 8명으로 보여도 포지션 고정", n == 9 and all(pos[k] == first[k] for k in pos) and "seat_R" not in pos, (pos, n))
+    # 딜러 원판이 잠깐 안 보여도 유지
+    pos, n = _pos(tr, full, None, folded=["seat_BL"])
+    check("딜러 원판이 가려져도 포지션 유지", pos == first and tr._lock["dealer"] == "seat_TL", pos)
+    # 뒤늦게 '카드 받음' 으로 보인 빈자리 (이미 폴드가 있고 LOCK_GROW 번 지남) → 무시
+    for _ in range(tablestate.LOCK_GROW):
+        _pos(tr, full, "seat_TL", folded=["seat_BL"])
+    tr._lock["keys"].discard("seat_L")
+    tr._lock["pos"].pop("seat_L")
+    pos, n = _pos(tr, full, "seat_TL", folded=["seat_BL"])
+    check("늦은 오판 '카드 받음' 은 포지션 없음 (다른 사람 그대로)", "seat_L" not in pos and pos["seat_R"] == "UTG", pos)
+    # 딜러가 움직임 = 새 핸드 → 다시 계산
+    pos, n = _pos(tr, full, "seat_TR")
+    check("딜러 이동 → 새 포지션", pos["seat_TR"] == "BTN" and pos["seat_UR"] == "SB", pos)
+    # 핸드 사이 (카드 받은 사람 2명 미만) → 고정 풀림
+    _pos(tr, [], "seat_TR")
+    check("핸드 사이 → 고정 풀림", tr._lock is None)
+    # 딜링 중: 처음엔 4명만 보이고 다음 프레임에 모두 → 처음 LOCK_GROW 번 안이라 다시 계산
+    tr = TR()
+    _pos(tr, ["seat_R", "seat_BR", "hero", "seat_BL"], "seat_UR", {"SB": "seat_R", "BB": "seat_BR"})
+    pos, n = _pos(tr, full, "seat_UR")
+    check("딜링 중 늘어난 사람 → 다시 계산 (9명 이름)", n == 9 and pos["seat_BL"] == "U1" and pos["hero"] == "UTG", (pos, n))
+    # SB 원판 좌석은 카드가 아직 안 보여도 넣는다 (예전: 첫 프레임에 BB 가 'SB' → 'BB 0.5 블라인드 → 1 콜' 기록)
+    tr = TR()
+    dealt = [k for k in full if k != "hero"]
+    pos, n = _pos(tr, dealt, "seat_BR", {"SB": "hero", "BB": "seat_BL"})
+    check("SB(나) 카드가 아직 안 보여도 BB 는 BB", pos.get("seat_BL") == "BB" and "hero" not in pos and n == 9, (pos, n))
+    # 딜러를 못 찾아 BB 원판으로 정한 포지션 → 딜러가 보이면 딜러 기준으로 다시
+    tr = TR()
+    pos, _ = _pos(tr, full, None, {"BB": "seat_UR"})
+    check("딜러 없음 → BB 원판으로", pos.get("seat_UR") == "BB" and tr._lock["src"] == ("BB", "seat_UR"), pos)
+    pos, _ = _pos(tr, full, "seat_UL")
+    check("그 뒤 딜러가 보이면 딜러 기준", pos.get("seat_UL") == "BTN" and pos.get("seat_TR") == "BB", pos)
+
+    # 딜러 버튼 → 좌석: 사람이 있는지와 상관없이 가장 가까운 고정 자리 (가려진 딜러 아바타)
+    seats = [{"key": "seat_R", "occupied": False, "cfg": {"bet_text": (946, 441, 91, 27)}},
+             {"key": "seat_BR", "occupied": True, "cfg": {"bet_text": (879, 559, 91, 27)}}]
+    got = TR._button_seat((1001, 488), seats)
+    check("버튼 → 가장 가까운 고정 자리 (그 자리가 비어 보여도)", got == "seat_R", got)
+
+    # 버튼 찾기: 배운 자리만 확인, 모든 좌석 자리를 알면 펠트 전체는 DEALER_FULL_EVERY 프레임마다
+    pw = 228.0
+    t = tablestate._template(tablestate._D_B64, tablestate._D_SHAPE, pw, 1.0)
+    rng = np.random.default_rng(1)
+    base = rng.integers(40, 80, (600, 900)).astype(np.uint8)
+
+    def with_d(x, y):
+        g = base.copy()
+        g[y - t.shape[0] // 2:y - t.shape[0] // 2 + t.shape[0], x - t.shape[1] // 2:x - t.shape[1] // 2 + t.shape[1]] = t
+        return g
+    geom = {"ring": [450, 300, 420, 260]}
+    tr = TR()
+    big = []
+    orig = cv2.matchTemplate
+
+    def mt(win, tpl, method):
+        if win.shape[0] > 200 and tpl.shape == t.shape:   # 펠트 전체 찾기 1번 (배율 1.0 템플릿)
+            big.append(win.shape)
+        return orig(win, tpl, method)
+    cv2.matchTemplate = mt
+    try:
+        a = tr._dealer(with_d(200, 200), geom, pw, ["a", "b"])
+        tr._spots["a"] = tr.dealer_at
+        b = tr._dealer(with_d(600, 350), geom, pw, ["a", "b"])
+        tr._spots["b"] = tr.dealer_at
+        n_learn = len(big)
+        c = tr._dealer(with_d(200, 200), geom, pw, ["a", "b"])
+        check("버튼이 배운 자리로 옮김 → 펠트 전체를 안 찾음", c and abs(c[0][1][0] - 200) < 3 and len(big) == n_learn,
+              (c, len(big) - n_learn))
+        misses = [bool(tr._dealer(base, geom, pw, ["a", "b"])) for _ in range(6)]
+        check("버튼이 안 보임 (자리를 모두 앎) → 펠트 전체는 3프레임에 한 번", not any(misses) and len(big) - n_learn == 2,
+              len(big) - n_learn)
+        before = len(big)
+        tr._dealer(base, geom, pw, ["a", "b", "c"])
+        tr._dealer(base, geom, pw, ["a", "b", "c"])
+        check("자리를 모르는 좌석이 있으면 매 프레임 펠트 전체", len(big) == before + 2, len(big) - before)
+        check("처음/모르는 자리는 펠트 전체에서 찾음", a and b and abs(b[0][1][0] - 600) < 3, (a, b))
+    finally:
+        cv2.matchTemplate = orig
+
+    # 상대 좌석 영역 (아바타 가운데·말풍선·벳): 나는 빼고, 말풍선 칸은 차례 고리(1.45r) 바깥
+    calib = {"geom": {"pill_center": [600.0, 364.0], "pw": pw, "ring": [600.0, 478.0, 478.8, 273.6], "size": [1200, 900]},
+             "my_stack": [459, 738, 80, 29], "seats": []}
+    tr = TR()
+    regs = tr.action_regions(calib)
+    cfg = {s["key"]: s for s in tr._slot_cfg(calib)}
+    ok = "hero" not in regs and len(regs) >= 8
+    for k, rs in regs.items():
+        ax, ay, ar = cfg[k]["avatar"]
+        for x, y, w, h in rs[1:-1]:
+            ok = ok and (x >= ax + 1.45 * ar or x + w <= ax - 1.45 * ar)
+    check("좌석 영역: 상대만, 말풍선 칸은 고리 바깥", ok, regs.get("seat_R"))
+
+    # SeatWatch: 마지막으로 읽은 화면과 비교, 다음 차례 좌석만 찍어 보고 멈춘 뒤에 True
+    img = rng.integers(0, 255, (300, 400, 3)).astype(np.uint8)
+    regions = {"s1": [(10, 10, 40, 40)], "s2": [(200, 20, 40, 40)]}
+    w = reader.SeatWatch()
+    check("SeatWatch: 처음엔 바뀜", w.changed(img, regions))
+    w.accept()
+    check("SeatWatch: 같은 화면 → 안 바뀜", not w.changed(img.copy(), regions))
+    moved = img.copy()
+    cv2.putText(moved, "2.5", (202, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    check("SeatWatch: 그 좌석 영역에 글자 → 바뀜", w.changed(moved, regions))
+    w.changed(img, regions)
+    w.target((1000, 500, 400, 300), ["s2", "nope"])
+    check("SeatWatch: 지켜볼 영역 = 그 좌석 (화면 좌표)", w.box == (1200, 520, 40, 40) and list(w.parts) == ["s2"], w.box)
+    screen = {"img": img}
+    real_grab = reader.grab
+    reader.grab = lambda sct, r: screen["img"][r[1] - 500:r[1] - 500 + r[3], r[0] - 1000:r[0] - 1000 + r[2]].copy()
+    try:
+        quiet = [w.poll(None) for _ in range(3)]
+        screen["img"] = moved
+        p1, p2 = w.poll(None), w.poll(None)
+    finally:
+        reader.grab = real_grab
+    check("SeatWatch.poll: 그대로면 False, 바뀐 뒤 멈추면 True (첫 번째는 움직이는 중일 수 있어 False)",
+          not any(quiet) and not p1 and p2, (quiet, p1, p2))
+    # 지켜볼 좌석 고르기: 차례 고리 좌석 + 행동 순서상 다음, 다음이 나면 거기서 멈춤
+    app = types.SimpleNamespace(tracker=types.SimpleNamespace(upcoming=lambda after=None, n=2: ["s2", "hero", "s9"]))
+    ww = types.SimpleNamespace(target=lambda rect, keys: setattr(ww, "keys", keys))
+    reader.App.watch_next(app, ww, (0, 0, 10, 10), {"acting_seat": "s1"})
+    check("지켜볼 좌석: 고리 좌석 + 다음", ww.keys == ["s1", "s2"], ww.keys)
+    reader.App.watch_next(app, ww, (0, 0, 10, 10), {"acting_seat": "hero"})
+    check("내 차례면 상대 좌석은 안 봄", ww.keys == [], ww.keys)
+    app.tracker = types.SimpleNamespace(upcoming=lambda after=None, n=2: ["hero", "s3"])
+    reader.App.watch_next(app, ww, (0, 0, 10, 10), {"acting_seat": None})
+    check("다음이 나면 안 봄 (액션 바가 잡음)", ww.keys == [], ww.keys)
+
+
 def main():
     tr = tablestate.TableReader()
     have_ocr = ocr.available()
@@ -127,6 +288,7 @@ def main():
     kind = tablestate.TableReader._mid_kind(hsv, BAR["call"])
     check("색 판정: 청록 → 체크, 파랑 → 콜", kind == "call", kind)
     reader_checks()
+    order_checks()
     print(f"\n{sum(results)}/{len(results)} passed")
     return 0 if all(results) else 1
 

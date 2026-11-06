@@ -458,7 +458,32 @@ class Tracker:
         return None
 
     # --- 행동 순서 -----------------------------------------------------------------------------------
-    def _order(self, h, street):
+    def upcoming(self, after=None, n=2):
+        """이번 스트리트에서 다음에 행동할 좌석 키 (행동 순서대로 최대 n개): after(없으면 마지막으로 행동한 사람) 다음부터
+        폴드·올인 안 한 사람. 진행 중 핸드가 없거나 끝났으면 []. 앱이 기다리는 동안 이 좌석만 지켜본다 (기록은 안 바꿈)."""
+        try:
+            h = self.hand
+            if h is None or h.over:
+                return []
+            order = self._order(h, h.street, quiet=True)
+            last = after if after in order else h.last_actor
+            start = order.index(last) + 1 if last in order else 0
+            out = []
+            for i in range(len(order)):
+                k = order[(start + i) % len(order)]
+                s = h.seats[k]
+                if k == last or s.folded or s.allin:
+                    continue
+                out.append(k)
+                if len(out) >= n:
+                    break
+            return out
+        except Exception as exc:
+            self.errors += 1
+            self.last_error = repr(exc)
+            return []
+
+    def _order(self, h, street, quiet=False):
         keys = list(h.seats)
         pos = {k: (h.seats[k].pos.most_common(1)[0][0] if h.seats[k].pos else None) for k in keys}
         n = len(keys)
@@ -476,7 +501,8 @@ class Tracker:
             i = keys.index(dealer)
             post = keys[i + 1:] + keys[:i + 1]
         else:
-            h.issue("positions_unknown")
+            if not quiet:
+                h.issue("positions_unknown")
             post = keys
         if street == 0 and n > 2:
             return post[2:] + post[:2]

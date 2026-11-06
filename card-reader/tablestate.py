@@ -95,6 +95,20 @@ _D_B64 = (
 _D_SHAPE = (23, 24)
 D_SCALES = (1.0, 1.05, 1.1)
 D_MIN = 0.72            # 실측 진짜 ≥0.96 (배율 맞을 때), 가짜 ≤0.61
+# 딜러 버튼은 좌석마다 정해진 자리 하나에만 놓인다 (창이 안 움직이니 고정). 2026-11-06 녹화 1458프레임 실측:
+#   원판 → 가장 가까운 좌석(빈자리 포함 모든 고정 자리)이 늘 맞음 (거리 ≤73px, 다음 좌석 ≥87px).
+#   예전엔 '사람 있는' 좌석 중 가장 가까운 곳으로 정해서, 쇼다운 카드·WINNER 가 딜러 아바타를 덮은 프레임에 옆 좌석이
+#   딜러가 됨 → 가짜 '딜러 이동' 으로 핸드가 둘로 갈림 (44핸드 중 5번).
+#   찾기: 직전 자리 → 이번 화면 설정에서 본 좌석별 버튼 자리 → (모든 사람 있는 좌석의 자리를 알면 DEALER_FULL_EVERY
+#   프레임마다만) 펠트 전체. 펠트 전체 찾기 ~27ms, 자리 확인 ~0.1ms.
+DEALER_FULL_EVERY = 3
+DEALER_SAME = 3.0       # 원판이 직전 프레임과 이 px 안이면 멈춰 있음 (움직이는 중인 자리는 배우지 않음)
+# 포지션은 핸드마다 한 번: 딜러가 움직이거나(새 핸드) 카드 받은 사람이 2명 미만(핸드 사이)일 때만 다시 계산.
+#   핸드 중에는 카드 받은 사람이 화면에서 잠깐 빠져도(공개 카드·아바타 가림) 포지션 이름이 바뀌지 않는다
+#   (예전: 44핸드 중 38핸드에서 프레임 103장이 그 핸드의 최종 포지션과 달랐다 — 8명 → 7명으로 세어 이름이 밀림).
+#   딜링 애니메이션으로 늦게 보인 사람은 처음 LOCK_GROW 번 읽기 안에, 또는 아직 아무도 폴드하지 않았으면 더한다.
+LOCK_GROW = 3
+BLIND_FRAMES = 3        # SB/BB 원판(펠트 전체 ~4ms)은 딜러를 못 찾았을 때와 새 핸드의 처음 이만큼만 찾는다
 _tpl_cache = {}
 
 
@@ -203,6 +217,12 @@ class TableReader:
         self.last_slow = 0       # 그중 여러 장 다수결까지 간 수
         self.dealer_at = None    # 직전 'D' 원판 (x, y, 배율) — 먼저 그 자리만 확인
         self._slots = None       # (보정 키, layout.slot_seats 결과)
+        self._spots = {}         # 좌석 키 -> 그 좌석의 딜러 버튼 자리 ((x, y), 배율) — 이번 보정에서 본 것만
+        self._spots_key = None
+        self._d_prev = None      # 직전 프레임 원판 위치 (멈춰 있는지 확인용)
+        self._d_miss = 0         # 버튼을 못 찾은 연속 프레임 수
+        self._lock = None        # 이번 핸드의 포지션 {src, dealer, keys, pos, age, folds, blinds}
+        self._regions = None     # (보정 키, {좌석 키: [영역]}) — action_regions
 
     # OCR: {key: (여백 붙은 crop, 글자 수)} 중 캐시와 다른 것만 읽어서 {key: (값, 단위) 또는 None}
     def _ocr(self, crops, unit):
@@ -338,7 +358,6 @@ class TableReader:
                 s["in_hand"] = s["icons"] and not s["grey"]
 
         # 3. 딜러 / 블라인드 원판
-        discs = self._dealer(gray, geom, pw) + self._discs(img, hsv, calib, geom, pw)
         bet_center = {s["key"]: _center(s["cfg"]["bet_text"]) for s in seats}
 
         def nearest_seat(pt, pool):
@@ -346,10 +365,29 @@ class TableReader:
             if not pool:
                 return None
             return min(pool, key=lambda s: math.dist(pt, bet_center[s["key"]]))["key"]
-        disc_seat = {}
-        for kind, pt in discs:
-            if kind not in disc_seat:
-                disc_seat[kind] = nearest_seat(pt, seats)
+        ckey = self._calib_key(calib)
+        if ckey != self._spots_key:  # 다른 보정: 배운 버튼 자리·이번 핸드 포지션을 버림
+            self._spots, self._spots_key, self._d_prev, self._d_miss, self._lock = {}, ckey, None, 0, None
+        dealer = None
+        found = self._dealer(gray, geom, pw, [s["key"] for s in seats if s["occupied"]])
+        if found and seats:
+            pt = found[0][1]
+            dealer = self._button_seat(pt, seats)
+            if self._d_prev is not None and math.dist(pt, self._d_prev) <= DEALER_SAME:
+                self._spots[dealer] = self.dealer_at   # 멈춰 있는 원판만 그 좌석의 버튼 자리로 배움
+            self._d_prev = pt
+        else:
+            self._d_prev = None
+        lock = self._lock
+        if dealer is None or lock is None or lock["dealer"] != dealer or lock["age"] < BLIND_FRAMES:
+            disc_seat = {}
+            for kind, pt in self._discs(img, hsv, calib, geom, pw):
+                if kind not in disc_seat:
+                    disc_seat[kind] = nearest_seat(pt, seats)
+        else:
+            disc_seat = dict(lock["blinds"])   # 같은 핸드: 처음 몇 프레임에 본 SB/BB 를 그대로
+        if dealer is not None:
+            disc_seat["D"] = dealer
 
         # 4. 바닥 벳 (픽셀로 있는지 보고, 있는 것만 OCR)
         crops, boxes = {}, {}
@@ -396,16 +434,20 @@ class TableReader:
             call = to_bb(values.get("call")) if amount_box is not None else None
             can_check = False
 
-        # 6. 포지션
+        # 6. 포지션 (핸드마다 한 번 정해 고정, _hand_positions)
         order = [s for s in seats]  # 시계 방향 (내 왼쪽부터, 나는 마지막)
         dealt = [s for s in order if s["dealt"]]
         n = len(dealt)
-        dealer = disc_seat.get("D")
-        pos_players = min(10, max(6, n)) if n else None
-        clamped = bool(n) and n != pos_players
+        positions, n_pos = self._hand_positions(order, dealt, dealer, disc_seat, notes)
+        if self._lock is not None:
+            dealer = self._lock["dealer"]   # 원판이 잠깐 가려져도 이번 핸드의 딜러
+            for kind in ("SB", "BB"):
+                if disc_seat.get(kind):
+                    self._lock["blinds"][kind] = disc_seat[kind]
+        pos_players = min(10, max(6, n_pos)) if n_pos else None
+        clamped = bool(n_pos) and n_pos != pos_players
         if clamped:
-            notes.append(f"dealt {n} → position names of {pos_players}-max" if n < 6 else f"dealt {n} > 10")
-        positions = self._positions(order, dealt, dealer, disc_seat, notes)
+            notes.append(f"dealt {n_pos} → position names of {pos_players}-max" if n_pos < 6 else f"dealt {n_pos} > 10")
         for s in seats:
             s["pos"] = positions.get(s["key"])
 
@@ -476,15 +518,63 @@ class TableReader:
         return state
 
     # --- 픽셀 판정들 ------------------------------------------------------------------------
+    @staticmethod
+    def _button_seat(pt, seats):
+        """딜러 원판 위치 → 좌석 키. 버튼 자리는 좌석마다 고정이라 사람이 있는지와 상관없이 가장 가까운 고정 자리
+        (벳 숫자 칸 가운데 기준). 쇼다운 카드·WINNER 가 딜러 아바타를 덮어 '빈자리' 로 보여도 옆 좌석으로 안 넘어간다."""
+        if not seats:
+            return None
+        return min(seats, key=lambda s: math.dist(pt, _center(s["cfg"]["bet_text"])))["key"]
+
+    @staticmethod
+    def _calib_key(calib):
+        """보정이 같은지 비교하는 키 (고정 자리 배치를 정하는 값만)."""
+        return repr((calib.get("geom"), calib.get("my_stack"),
+                     [(s.get("key"), s.get("slot")) for s in calib.get("seats") or []]))
+
     def _slot_cfg(self, calib):
         """layout.slot_seats(calib) 를 보정마다 한 번만 계산. 쓸 수 없으면 None."""
-        key = repr((calib.get("geom"), calib.get("my_stack"), [(s.get("key"), s.get("slot")) for s in calib.get("seats") or []]))
+        key = self._calib_key(calib)
         if self._slots is None or self._slots[0] != key:
             try:
                 self._slots = (key, layout.slot_seats(calib))
             except Exception:
                 self._slots = (key, None)
         return self._slots[1]
+
+    def action_regions(self, calib):
+        """좌석별로 상대 액션이 보이는 작은 영역 {좌석 키: [(x, y, w, h) ...]} (나는 뺌, 보정마다 한 번 계산).
+        아바타 가운데(폴드 = 흑백), 말풍선 자리 중 차례 고리(≤1.45r) 바깥쪽, 바닥 벳 숫자 자리.
+        reader 가 이 영역 서명만 비교해서 상대가 행동한 순간 다시 읽는다 (차례 고리의 반짝이 회전에는 안 흔들림)."""
+        key = self._calib_key(calib)
+        if self._regions is not None and self._regions[0] == key:
+            return self._regions[1]
+        out = {}
+        try:
+            seats_cfg = self._slot_cfg(calib)
+            if seats_cfg is None:
+                seats_cfg = (calib if calib.get("seats") else layout.anchors(calib)).get("seats") or []
+            geom = calib.get("geom") or {}
+            pw = float(geom.get("pw") or (calib["pill"][2] if "pill" in calib else 228.0))
+            for sc in seats_cfg:
+                if sc["key"] == "hero":
+                    continue
+                ax, ay, ar = sc["avatar"]
+                c = AVATAR_CORE * ar
+                side = -1 if sc.get("slot") in LEFT_SLOTS else 1
+                bx0, bx1 = ax + side * 0.25 * pw - 0.09 * pw, ax + side * 0.25 * pw + 0.09 * pw
+                if side > 0:
+                    bx0 = max(bx0, ax + 1.5 * ar)
+                else:
+                    bx1 = min(bx1, ax - 1.5 * ar)
+                rects = [(ax - c, ay - c, 2 * c, 2 * c), tuple(sc["bet_text"])]
+                if bx1 - bx0 > 4:
+                    rects.insert(1, (bx0, ay - 0.08 * pw, bx1 - bx0, 0.16 * pw))
+                out[sc["key"]] = [tuple(int(round(v)) for v in r) for r in rects]
+        except Exception:
+            out = {}
+        self._regions = (key, out)
+        return out
 
     @staticmethod
     def _avatar_present(gray, ax, ay, ar):
@@ -563,9 +653,11 @@ class TableReader:
                 return True
         return False
 
-    def _dealer(self, gray, geom, pw):
+    def _dealer(self, gray, geom, pw, occupied=()):
         """'D' 원판: 템플릿 (흰 바탕이 글자 테두리로 조각나서 덩어리 찾기로는 안 잡힘) → [('D', (x, y))] 또는 [].
-        딜러는 핸드마다 한 번 움직이므로 직전 자리를 먼저 확인하고, 없을 때만 펠트 전체를 찾음."""
+        딜러는 핸드마다 한 번 움직이고 좌석마다 자리가 정해져 있으므로: 직전 자리 → 이번 보정에서 배운 좌석별 버튼 자리 →
+        펠트 전체. occupied(사람 있는 좌석 키)의 버튼 자리를 모두 아는데 어디에도 없으면 (핸드 사이·가려짐)
+        펠트 전체는 DEALER_FULL_EVERY 프레임마다만 찾는다."""
         ring = geom.get("ring")
         if not ring:
             return []
@@ -583,16 +675,35 @@ class TableReader:
                 if mx > best[0]:
                     best = (mx, (x0 + loc[0] + t.shape[1] / 2, y0 + loc[1] + t.shape[0] / 2), s)
             return best
+        r = 0.15 * pw
+
+        def near(at):
+            (px, py), s = at
+            return search(px - r, py - r, px + r, py + r, (s,))
         if self.dealer_at is not None:
-            (px, py), s = self.dealer_at
-            r = 0.15 * pw
-            score, pt, s = search(px - r, py - r, px + r, py + r, (s,))
+            score, pt, s = near(self.dealer_at)
             if score >= D_MIN:
-                self.dealer_at = (pt, s)
+                self.dealer_at, self._d_miss = (pt, s), 0
                 return [("D", pt)]
+        best = (0.0, None, None)
+        for at in self._spots.values():
+            if self.dealer_at is not None and math.dist(at[0], self.dealer_at[0]) <= DEALER_SAME:
+                continue  # 방금 본 자리
+            got = near(at)
+            if got[0] > best[0]:
+                best = got
+        if best[0] >= D_MIN:
+            self.dealer_at, self._d_miss = (best[1], best[2]), 0
+            return [("D", best[1])]
+        self._d_miss += 1
+        if occupied and all(k in self._spots for k in occupied) and (self._d_miss - 1) % DEALER_FULL_EVERY:
+            self.dealer_at = None
+            return []
         rcx, rcy, ra, rb = ring
         score, pt, s = search(rcx - ra, rcy - rb, rcx + ra, rcy + rb, D_SCALES)
         self.dealer_at = (pt, s) if score >= D_MIN else None
+        if score >= D_MIN:
+            self._d_miss = 0
         return [("D", pt)] if score >= D_MIN else []
 
     @staticmethod
@@ -746,8 +857,8 @@ class TableReader:
             return sorted(dealt_keys, key=lambda k: (idx[k] - start - 1) % len(keys))
         if dealer is not None:
             seq = after(dealer)            # SB, BB, ..., 딜러
-            if n == 2:                     # 헤즈업: 딜러가 SB → [BB, 딜러] 를 다른 경우와 같은 SB, BB 순서로
-                seq = seq[::-1]
+            if n == 2 and dealer in dealt_keys:  # 헤즈업: 딜러가 SB → [BB, 딜러] 를 다른 경우와 같은 SB, BB 순서로
+                seq = seq[::-1]            # (딜러가 없는 2명 = 딜링 첫 프레임의 SB, BB — 순서 그대로)
         elif disc_seat.get("BB") in dealt_keys:
             notes.append("no dealer disc: positions from BB disc")
             seq = after(disc_seat["BB"])   # UTG, ..., BB
@@ -764,6 +875,52 @@ class TableReader:
         names = pf.seats(min(10, max(6, n)))[-n:] if n <= 10 else pf.seats(10)
         action = seq[2:] + seq[:2]         # UTG.. 딜러, SB, BB
         return {k: names[i] for i, k in enumerate(action[:len(names)])}
+
+    def _hand_positions(self, order, dealt, dealer, disc_seat, notes):
+        """이번 핸드의 포지션 → ({카드 받은 좌석 키: 포지션}, 포지션 인원 수). 핸드마다 한 번 계산해 self._lock 에 고정.
+        다시 계산: 딜러 버튼이 다른 좌석으로 감(새 핸드, 또는 원판으로 정했던 것을 딜러로), 카드 받은 사람 2명 미만(핸드 사이),
+        딜러가 안 보이는데 보이는 SB/BB 원판이 고정한 포지션과 어긋남. 늦게 보인 사람은 LOCK_GROW 번 읽기 안에 또는
+        아직 아무도 폴드 안 했을 때만 더한다 (그 뒤에 처음 보이는 '카드 받음'은 오판으로 보고 포지션을 주지 않음)."""
+        keys = [s["key"] for s in dealt]
+        if len(keys) < 2:
+            self._lock = None
+            return {}, len(keys)
+        # SB/BB 원판이 있는 좌석은 이번 핸드에 낀 사람: 카드가 아직 안 보여도(딜링 중, 내 카드는 마지막) 포지션 계산에 넣는다.
+        # 예전엔 첫 프레임에 SB 가 빠져 BB 가 'SB' 로 잡혔다 (녹화 7핸드: 'BB 0.5 블라인드 → 1 콜' 로 기록돼 VPIP 로 셈)
+        blinds = {disc_seat.get("SB"), disc_seat.get("BB")} - {None}
+        dealt = [s for s in order if s["dealt"] or (s["key"] in blinds and s["occupied"])]
+        in_hand = {s["key"] for s in dealt}
+        blind_src = next(((k, disc_seat[k]) for k in ("BB", "SB") if disc_seat.get(k) in in_hand), None)
+        lock = self._lock
+        if lock is not None:
+            if dealer is not None and lock["dealer"] != dealer:
+                lock = None
+            elif dealer is None and lock["dealer"] is None and blind_src is not None and blind_src != lock["src"]:
+                lock = None
+            elif dealer is None and any(lock["pos"].get(disc_seat.get(k), k) != k for k in ("SB", "BB")
+                                        if disc_seat.get(k) in lock["pos"]):
+                lock = None
+        if lock is not None:
+            lock["age"] += 1
+            new = in_hand - lock["keys"]
+            if new and (lock["age"] <= LOCK_GROW or not lock["folds"]):
+                grown = [s for s in order if s["key"] in lock["keys"] or s["key"] in new]
+                pos = self._positions(order, grown, lock["dealer"], lock["disc"], [])
+                if pos:
+                    lock["keys"], lock["pos"] = {s["key"] for s in grown}, pos
+            lock["folds"] = lock["folds"] or any(s["folded"] for s in dealt)
+            if lock["dealer"] is None:
+                notes.append(f"no dealer disc: positions from {lock['src'][0]} disc")
+        else:
+            pos = self._positions(order, dealt, dealer, disc_seat, notes)
+            if not pos:
+                self._lock = None
+                return {}, len(keys)
+            lock = {"dealer": dealer, "src": ("D", dealer) if dealer is not None else blind_src,
+                    "disc": {k: disc_seat[k] for k in ("SB", "BB") if disc_seat.get(k)},
+                    "keys": in_hand, "pos": pos, "age": 0, "folds": any(s["folded"] for s in dealt), "blinds": {}}
+        self._lock = lock
+        return {k: p for k, p in lock["pos"].items() if k in keys}, len(lock["keys"])
 
     # --- 프리플랍 상황 ---------------------------------------------------------------------
     def _preflop(self, seats, positions, pos_players, unit, img, gray, pw, to_bb):
@@ -867,3 +1024,8 @@ _DEFAULT = TableReader()
 def read(img, calib):
     """img: 보정 때와 같은 크기의 게임 창 캡처(BGR), calib: layout.calibrate() 결과 → 상태 dict."""
     return _DEFAULT.read(img, calib)
+
+
+def action_regions(calib):
+    """TableReader.action_regions (앱이 쓰는 기본 읽기 객체)."""
+    return _DEFAULT.action_regions(calib)

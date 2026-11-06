@@ -407,6 +407,76 @@ class Steady:
         self.state = {}
 
 
+class SeatWatch:
+    """상대 액션이 보이는 좌석 영역(tablestate.action_regions: 아바타 가운데·말풍선·바닥 벳)의 서명을 마지막으로 읽은
+    화면과 비교한다 (상태 스레드 전용).
+      changed(img, regions): 게임 창 전체를 찍었을 때 — 어느 좌석이든 바뀌었으면 True. 창 전체 서명(64px 로 줄임)만으로는
+        작은 칩 숫자·말풍선 변화를 못 봐서 최대 STATE_REFRESH(5초)까지 다시 읽지 않았다.
+      target(rect, keys) / poll(sct): 다음 읽기를 기다리는 동안 다음 차례 좌석(지금 차례 고리 + 행동 순서상 다음)만 작게 찍어 보고,
+        바뀐 뒤 멈추면 바로 읽게 한다 (액션 바와 같은 방식)."""
+
+    def __init__(self):
+        self.ref, self.cur, self.rects = {}, {}, {}
+        self.box, self.parts, self.prev, self.keys = None, {}, None, []
+
+    @staticmethod
+    def _clip(regions, shape):
+        H, W = shape[:2]
+        out = {}
+        for k, rs in (regions or {}).items():
+            rr = []
+            for x, y, w, h in rs:
+                x0, y0, x1, y1 = max(0, int(x)), max(0, int(y)), min(W, int(x + w)), min(H, int(y + h))
+                if x1 - x0 >= 4 and y1 - y0 >= 4:
+                    rr.append((x0, y0, x1 - x0, y1 - y0))
+            if rr:
+                out[k] = rr
+        return out
+
+    @staticmethod
+    def _sigs(img, rects):
+        return [signature(img[y:y + h, x:x + w]) for x, y, w, h in rects]
+
+    def _moved(self, k, sigs):
+        ref = self.ref.get(k)
+        return ref is None or len(ref) != len(sigs) or any(sig_changed(a, b) for a, b in zip(ref, sigs))
+
+    def changed(self, img, regions):
+        self.rects = self._clip(regions, img.shape)
+        self.cur = {k: self._sigs(img, rs) for k, rs in self.rects.items()}
+        return any(self._moved(k, v) for k, v in self.cur.items())
+
+    def accept(self):
+        """방금 찍은 화면을 읽었음 → 비교 기준."""
+        self.ref = self.cur
+
+    def reset(self):
+        self.__init__()
+
+    def target(self, rect, keys):
+        keys = [k for k in keys if k in self.rects]
+        self.prev, self.keys = None, keys
+        if not keys or rect is None:
+            self.box, self.parts = None, {}
+            return
+        rs = [r for k in keys for r in self.rects[k]]
+        x0, y0 = min(r[0] for r in rs), min(r[1] for r in rs)
+        x1, y1 = max(r[0] + r[2] for r in rs), max(r[1] + r[3] for r in rs)
+        self.box = (rect[0] + x0, rect[1] + y0, x1 - x0, y1 - y0)
+        self.parts = {k: [(x - x0, y - y0, w, h) for x, y, w, h in self.rects[k]] for k in keys}
+
+    def poll(self, sct):
+        """지켜보는 좌석을 한 번 찍음 → 마지막으로 읽은 화면과 달라졌고 직전 찍기와 같으면(움직임이 멈춤) True."""
+        if self.box is None:
+            return False
+        crop = grab(sct, self.box)
+        cur = {k: self._sigs(crop, rs) for k, rs in self.parts.items()}
+        prev, self.prev = self.prev, cur
+        if not any(self._moved(k, v) for k, v in cur.items()):
+            return False
+        return prev is not None and not any(sig_changed(a, b) for k in cur for a, b in zip(prev.get(k, []), cur[k]))
+
+
 def to_json(value):
     """numpy 값/튜플이 섞인 결과를 config.json에 저장할 수 있게."""
     return json.loads(json.dumps(value, ensure_ascii=False,
@@ -2465,7 +2535,8 @@ class App:
         같은 스레드에서 닉네임 읽기 · 핸드 기록 · 상대 통계 · (내 차례에만) 상대 핸드 리딩 · 기록 모드도 처리 — 실패해도 앱은 계속."""
         steady = Steady(settle=False)
         last, last_read, last_rect = None, 0.0, None
-        bar = {"t": None}
+        watch = SeatWatch()
+        bar = {"t": None, "watch": watch}
         self.init_tracking()
         with MSS() as sct:
             while not self.closed:
@@ -2475,17 +2546,22 @@ class App:
                 if not (rect and calib):
                     last = None
                     bar["box"] = None
+                    watch.reset()
                     continue
                 try:
                     if rect != last_rect:
                         steady.reset()
+                        watch.reset()
                         last, last_rect = None, list(rect)
                     img = grab(sct, rect)
                     self.bar_ref(bar, rect, calib, img)
                     changed = steady.check("table", img)
+                    regions = getattr(self.tablestate, "action_regions", None)
+                    seats_moved = watch.changed(img, regions(calib)) if regions is not None else False
                     now = time.time()
-                    if changed or last is None or now - last_read > STATE_REFRESH:
+                    if changed or seats_moved or last is None or now - last_read > STATE_REFRESH:
                         last, last_read = self.tablestate.read(img, calib), now
+                        watch.accept()
                     self.state_queue.put(last if isinstance(last, dict) else {"empty": True})
                 except Exception as exc:
                     last = None
@@ -2496,6 +2572,27 @@ class App:
                     self.track_frame(img, calib, last, now)
                 except Exception:
                     self.log_once("track_frame")
+                try:
+                    self.watch_next(watch, rect, last)
+                except Exception:
+                    watch.target(None, [])
+                    self.log_once("watch_next")
+
+    def watch_next(self, watch, rect, st):
+        """기다리는 동안 지켜볼 상대 좌석: 지금 차례 고리가 있는 좌석 + 행동 순서상 그다음 (핸드 기록의 순서, 최대 2곳).
+        내 차례(고리가 나)이거나 다음이 나면 상대 좌석은 안 본다 (액션 바가 잡음)."""
+        acting = st.get("acting_seat") if isinstance(st, dict) else None
+        keys = []
+        if acting != "hero":
+            if acting:
+                keys.append(acting)
+            tr = self.tracker
+            for k in (tr.upcoming(after=acting, n=2) if tr is not None and hasattr(tr, "upcoming") else []):
+                if k == "hero" or len(keys) >= 2:
+                    break
+                if k not in keys:
+                    keys.append(k)
+        watch.target(rect, keys)
 
     @staticmethod
     def bar_ref(bar, rect, calib, img):
@@ -2520,7 +2617,8 @@ class App:
     def state_wait(self, sct, bar):
         """다음 테이블 읽기까지 기다림: 지난 읽기 시작에서 STATE_INTERVAL 뒤 (읽기·추적에 걸린 시간만큼 덜 잔다).
         그 사이 액션 바 자리만 BAR_POLL 마다 찍어서, 지난 읽기와 '의미 있게' 달라진 뒤 멈추면 (버튼이 나타나거나 사라짐,
-        미리 선택 버튼) 바로 읽는다 → 내 차례가 최대 1초 늦게 잡히던 것을 줄임. 움직이는 중(나타나는 애니메이션)엔 기다림."""
+        미리 선택 버튼) 바로 읽는다 → 내 차례가 최대 1초 늦게 잡히던 것을 줄임. 움직이는 중(나타나는 애니메이션)엔 기다림.
+        같은 방식으로 다음 차례 상대 좌석(bar['watch'], SeatWatch)도 찍어 봐서 그 사람이 행동하면 바로 읽는다."""
         t0 = bar.get("t")
         if t0 is None:
             time.sleep(STATE_INTERVAL)
@@ -2548,6 +2646,13 @@ class App:
             if sig_changed(bar.get("ref"), sig) and prev is not None and not sig_changed(prev, sig):
                 bar["early"] = True
                 return
+            watch = bar.get("watch")
+            try:
+                if watch is not None and watch.poll(sct):   # 다음 차례 상대가 행동함 (말풍선·칩·흑백)
+                    bar["early"] = True
+                    return
+            except Exception:
+                watch.target(None, [])
 
     # --- 추적: 이름 · 핸드 기록 · 프로필 · 상대 핸드 리딩 · 기록 모드 (상태 스레드) ---------------------
     def init_tracking(self):
