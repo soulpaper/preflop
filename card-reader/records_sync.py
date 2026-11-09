@@ -272,6 +272,11 @@ def _app_phrases():
     global _AP
     if _AP is None:
         raw = set(_AP_BASE)
+        try:
+            from records_appwords import WORDS as _AW    # 생성 파일 (tools/gen_app_words.py): 소스 없는 exe 용 낱말
+            raw.update(_AW)
+        except ImportError:
+            pass
         raw.update(getattr(RC, "CLASSES", ()))
         for vs in RC.ENUMS.values():
             raw.update(vs)
@@ -293,6 +298,7 @@ def _app_phrases():
             for nd in ast.walk(tree):
                 if isinstance(nd, ast.Constant) and isinstance(nd.value, str) and id(nd) not in skip:
                     raw.update(_AP_RUN.findall(nd.value))
+                    raw.update(re.findall(r"[가-힣]{2,12}", _fold(nd.value)))    # 긴 문구·f-string 속 낱말도 (exe 와 같게)
         _AP = frozenset(q for q in map(_squash, raw) if _SPACELESS.search(q) and len(q) <= 12)
     return _AP
 

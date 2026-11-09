@@ -15,6 +15,7 @@ import hashlib
 import http.client
 import http.server
 import json
+from unittest import mock
 import os
 import random
 import shutil
@@ -2939,6 +2940,36 @@ class T62_NameHold(unittest.TestCase):
         base, up, code = _held_base("t62k1", ["블라인드", "플러시드로", "기타", "브로드웨이", "중간"], reason=txt)
         self.assertEqual(code, 0)
         self.assertEqual(_state(base)["held"], {})
+
+    def test_62_appwords_up_to_date(self):
+        # records_appwords.py 는 tools/gen_app_words.py 출력과 같아야 한다 (앱 문구를 바꾸면 다시 생성)
+        sys.path.insert(0, os.path.join(HERE, "tools"))
+        try:
+            import gen_app_words as G
+        finally:
+            sys.path.pop(0)
+        import records_appwords as AW
+        self.assertEqual(list(AW.WORDS), G.collect(HERE), "python3 tools/gen_app_words.py 를 다시 실행")
+        with open(os.path.join(HERE, "records_appwords.py"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), G.render(G.collect(HERE)))
+
+    def test_62_appwords_without_source(self):
+        # exe 흉내: 폴더 목록이 비어도 낱말 목록만으로 앱 단어와 같은 짧은 이름을 건너뛴다
+        import records_appwords as AW
+        base_only = set(map(RS._squash, RS._AP_BASE))
+        pick = [w for w in AW.WORDS if RS._squash(w) not in base_only and w not in
+                {x for vs in RS.RC.ENUMS.values() for x in vs}][:20]
+        self.assertTrue(pick)
+        old, real = RS._AP, os.listdir
+        try:
+            RS._AP = None
+            with mock.patch.object(RS.os, "listdir", side_effect=OSError("no source")):
+                self.assertEqual(len(RS.NameSet(pick)), 0)
+                self.assertTrue(set(map(RS._squash, AW.WORDS)) <= RS._app_phrases())
+        finally:
+            RS._AP = None
+        self.assertEqual(len(RS.NameSet(["가나다라마"])), 1)   # 앱 단어가 아닌 이름은 그대로
+        RS._AP = None
 
     def test_62_korean_short_names_word_boundary(self):
         ns = RS.NameSet(["라마", "가나다", "바사아자"])
