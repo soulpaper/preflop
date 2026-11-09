@@ -196,8 +196,15 @@ class NameSet:
                 continue
             if _SPACELESS.search(_fold(x)):
                 q = _squash(x)
-                if len(q) < 2 or any(q in ph for ph in _app_phrases()):
-                    continue    # 앱 고정 문구 안에 든 이름은 닉네임으로 보지 않는다 ("기타", "블라인드" ...)
+                if len(q) < 2:
+                    continue
+                if len(q) == 2:
+                    # 2자 이름은 낱말 경계로만 맞추므로 앱 낱말과 "똑같을" 때만 건너뛴다 (긴 앱 낱말의 일부면 검사한다).
+                    # 한글이 아닌 CJK(가나·한자) 2자는 낱말 목록이 없어 앱 문구와 정확히 같을 때만 건너뛴다.
+                    if q in (_app_words() if _HANGUL_ONLY.fullmatch(q) else _app_phrases()):
+                        continue
+                elif any(q in ph for ph in _app_phrases()):
+                    continue    # 앱 고정 문구 안에 든 3자 이상 이름은 닉네임으로 보지 않는다 ("블라인드" ...)
                 (self.sub if len(q) >= 3 else self.word).add(q)
                 continue
             if len(norm_name(x)) < 4:
@@ -256,6 +263,10 @@ class NameSet:
 
 
 _AP = None
+_AW = None
+_HANGUL_ONLY = re.compile(r"[가-힣]+")
+# 정규식 글자 묶음 조각 (userinfo.py [보브] 등) - 앱 단어가 아니다. gen_app_words.py 도 이 값을 쓴다.
+APPWORD_EXCLUDE = frozenset({"보브", "패매", "어그레"})
 # 소스를 못 읽을 때(exe 등)도 쓰는 기본 앱 고정 한글 문구. 출처: records_check.py ENUMS·CLASSES·HAND_NAME,
 # handread.py 의 그룹 이름 (탑페어, 오버페어, 포켓페어, 셋, 투페어, 드로우 ...), advisor.py 의 행동 문구
 _AP_BASE = ("기타", "수딧", "오프수딧", "올인", "블라인드", "브로드웨이", "중간", "탑페어", "오버페어", "포켓페어",
@@ -266,41 +277,60 @@ _AP_BASE = ("기타", "수딧", "오프수딧", "올인", "블라인드", "브�
 _AP_RUN = re.compile(r"[가-힣](?:[가-힣 \u00b7/+()→]*[가-힣])?")
 
 
+def _app_build():
+    """(_AP, _AW) 를 함께 만든다. 낱말 _AW = 모든 원본 항목의 한글 연속 2~12자 - APPWORD_EXCLUDE."""
+    global _AP, _AW
+    raw = set(_AP_BASE)
+    try:
+        from records_appwords import WORDS as _AWL    # 생성 파일 (tools/gen_app_words.py): 소스 없는 exe 용 낱말
+        raw.update(_AWL)
+    except ImportError:
+        pass
+    raw.update(getattr(RC, "CLASSES", ()))
+    for vs in RC.ENUMS.values():
+        raw.update(vs)
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        names = sorted(os.listdir(here))
+    except OSError:
+        names = []
+    longs = set()
+    for n in names:
+        if not n.endswith(".py") or n.startswith("test_") or n.startswith("records_"):
+            continue
+        try:
+            with open(os.path.join(here, n), encoding="utf-8") as f:
+                tree = ast.parse(f.read())
+        except (OSError, SyntaxError, ValueError):
+            continue
+        skip = {id(nd.value) for nd in ast.walk(tree)
+                if isinstance(nd, ast.Expr) and isinstance(nd.value, ast.Constant)}
+        for nd in ast.walk(tree):
+            if isinstance(nd, ast.Constant) and isinstance(nd.value, str) and id(nd) not in skip:
+                raw.update(_AP_RUN.findall(nd.value))
+                longs.add(nd.value)    # 긴 문구·f-string 은 낱말 추출용으로만 (구문 목록은 12자 제한)
+    words = set()
+    for r in raw | longs:
+        words.update(re.findall(r"[가-힣]{2,12}", _fold(r)))
+    words -= APPWORD_EXCLUDE
+    _AW = frozenset(words)
+    _AP = frozenset(q for q in map(_squash, raw | words) if _SPACELESS.search(q) and len(q) <= 12
+                    and q not in APPWORD_EXCLUDE)
+
+
 def _app_phrases():
     """앱이 고정으로 쓰는 한글 문구 (공백 뺀 형태). 기본 목록 + RC.ENUMS·CLASSES + 같은 폴더 앱 소스의 짧은 문자열 상수
     (ast, import 안 함). 12자를 넘는 문구는 제외해 닉네임이 긴 문장 속에 우연히 들어 있다고 건너뛰지 않게 한다."""
-    global _AP
     if _AP is None:
-        raw = set(_AP_BASE)
-        try:
-            from records_appwords import WORDS as _AW    # 생성 파일 (tools/gen_app_words.py): 소스 없는 exe 용 낱말
-            raw.update(_AW)
-        except ImportError:
-            pass
-        raw.update(getattr(RC, "CLASSES", ()))
-        for vs in RC.ENUMS.values():
-            raw.update(vs)
-        here = os.path.dirname(os.path.abspath(__file__))
-        try:
-            names = sorted(os.listdir(here))
-        except OSError:
-            names = []
-        for n in names:
-            if not n.endswith(".py") or n.startswith("test_") or n.startswith("records_"):
-                continue
-            try:
-                with open(os.path.join(here, n), encoding="utf-8") as f:
-                    tree = ast.parse(f.read())
-            except (OSError, SyntaxError, ValueError):
-                continue
-            skip = {id(nd.value) for nd in ast.walk(tree)
-                    if isinstance(nd, ast.Expr) and isinstance(nd.value, ast.Constant)}
-            for nd in ast.walk(tree):
-                if isinstance(nd, ast.Constant) and isinstance(nd.value, str) and id(nd) not in skip:
-                    raw.update(_AP_RUN.findall(nd.value))
-                    raw.update(re.findall(r"[가-힣]{2,12}", _fold(nd.value)))    # 긴 문구·f-string 속 낱말도 (exe 와 같게)
-        _AP = frozenset(q for q in map(_squash, raw) if _SPACELESS.search(q) and len(q) <= 12)
+        _app_build()
     return _AP
+
+
+def _app_words():
+    """앱 한글 낱말 (한글 연속 2~12자, 정규식 조각 APPWORD_EXCLUDE 제외). 2자 이름은 여기와 똑같을 때만 건너뛴다."""
+    if _AW is None:
+        _app_build()
+    return _AW
 
 
 _CV = None

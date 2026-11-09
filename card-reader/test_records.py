@@ -2971,6 +2971,50 @@ class T62_NameHold(unittest.TestCase):
         self.assertEqual(len(RS.NameSet(["가나다라마"])), 1)   # 앱 단어가 아닌 이름은 그대로
         RS._AP = None
 
+    def _reset_ap(self):
+        RS._AP = None
+        RS._AW = None
+
+    def test_62_two_char_exact_app_word_only(self):
+        # 2자 이름: 앱 낱말과 똑같을 때만 건너뛴다. 긴 앱 낱말의 일부면 낱말 경계로 검사한다 (합성·파생 이름만)
+        self._reset_ap()
+        self.addCleanup(self._reset_ap)
+        words = RS._app_words()
+        pick = None
+        for w in sorted(words):
+            if len(w) >= 3 and w[:2] not in words:
+                pick = w[:2]
+                break
+        self.assertTrue(pick)
+        self.assertTrue(any(pick in ph for ph in RS._app_phrases()))    # 예전 규칙이면 건너뛰었을 이름
+        ns = RS.NameSet([pick])                                         # (a) 유지
+        self.assertEqual(ns.word, {pick})
+        base, up, code = _held_base("t62w1", [pick], reason="그 %s 가 말함" % pick)
+        self.assertEqual(code, 1)
+        self.assertEqual(sorted(_state(base)["held"]), [D0])
+        exact = sorted(w for w in words if len(w) == 2)[0]              # (b) 똑같은 낱말은 건너뜀
+        self.assertEqual(RS.NameSet([exact]).word, set())
+        long_ph = sorted(ph for ph in RS._app_phrases() if len(ph) >= 4)[0]  # (c) 3자 이상은 그대로
+        self.assertEqual(len(RS.NameSet([long_ph[:3]])), 0)
+        self.assertEqual(len(RS.NameSet([long_ph])), 0)
+        self.assertEqual(RS.NameSet(["가나다라마"]).sub, {"가나다라마"})
+
+    def test_62_appword_exclude_in_source_path(self):
+        # (d) 정규식 조각은 소스 경로(_app_phrases, _app_words)에도 없다. 생성기와 같은 상수를 쓴다
+        self._reset_ap()
+        self.addCleanup(self._reset_ap)
+        self.assertEqual(RS.APPWORD_EXCLUDE, frozenset({"보브", "패매", "어그레"}))
+        for fr in RS.APPWORD_EXCLUDE:
+            self.assertNotIn(fr, RS._app_words())
+            self.assertNotIn(fr, RS._app_phrases())
+        sys.path.insert(0, os.path.join(HERE, "tools"))
+        try:
+            import gen_app_words as G
+        finally:
+            sys.path.pop(0)
+        self.assertIs(G.EXCLUDE, RS.APPWORD_EXCLUDE)
+        self.assertEqual(RS.NameSet(["보브"]).word, {"보브"})
+
     def test_62_korean_short_names_word_boundary(self):
         ns = RS.NameSet(["라마", "가나다", "바사아자"])
         self.assertEqual(len(ns), 3)

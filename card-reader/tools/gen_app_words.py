@@ -11,7 +11,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 OUT = os.path.join(ROOT, "records_appwords.py")
 _HANGUL = re.compile(r"[가-힣]+")
-EXCLUDE = frozenset({"보브", "패매", "어그레"})   # 정규식 글자 묶음 조각 (userinfo.py [보브] 등) - 앱 단어가 아니다
+sys.path.insert(0, ROOT)
+from records_sync import APPWORD_EXCLUDE as EXCLUDE   # 정규식 글자 묶음 조각 - 앱 소스 경로와 같은 값
 
 
 def _fold(s):
