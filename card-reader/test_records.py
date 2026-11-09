@@ -2995,12 +2995,13 @@ class T63_LineCache(unittest.TestCase):
     def test_63_same_as_uncached(self):
         lines = [dline(1, extra=',"advice":{"reason":"fine"}'), b"{broken\n", RAW_EXTRA_DEC.rstrip(b"\n") + b"\n",
                  dline(4, extra=',"advice":{"reason":"x synthnick01 y"}'), dline(5, typ="resolution"),
-                 dline(6, extra=',"advice":{"reason":"\\ud14c\\uc2a4\\ud2b8\\ub2c9 \\uc785\\ub2c8\\ub2e4"}')]
+                 dline(6, extra=',"advice":{"reason":"\\ud14c\\uc2a4\\ud2b8\\ub2c9 \\uc785\\ub2c8\\ub2e4"}'),
+                 dline(7, extra=',"advice":{"reason":"\\uafc0\\ubc8c \\uc785\\ub2c8\\ub2e4"}')]
         full = b"".join(lines)
         half = b"".join(lines[:3])
         hand = RAW_EXTRA_HAND + hline(2) + hline(3)
         cache = RS.LineCache()
-        seqs = (None, ["Jack"], ["Jack", "Zelda"], ["Zelda", NICK], ["Jack"], ["테스트닉"], ["Jack", "Zelda", "테스트닉", NICK], [])
+        seqs = (None, ["Jack"], ["Jack", "Zelda"], ["Zelda", NICK], ["Jack"], ["테스트닉"], ["Jack", "Zelda", "테스트닉", NICK], ["Jack", "꿀벌"], ["Jack", "Zelda", "꿀벌"], [])
         seen_block = set()
         for names in seqs:
             for name, raw in ((D0, half), (D0, full), (D1, hand)):
@@ -3012,7 +3013,20 @@ class T63_LineCache(unittest.TestCase):
             cache.sweep()
         self.assertIn(("known_name", 4), seen_block)    # 영문 닉네임: 4번째 줄
         self.assertIn(("known_name", 6), seen_block)    # 한글 닉네임 (부분 일치): 6번째 줄
+        self.assertIn(("known_name", 7), seen_block)    # 2자 한글 닉네임 (낱말 일치): 7번째 줄
         self.assertGreater(cache.hits, 0)
+
+    def test_63_two_char_name_added_after_pass(self):
+        raw = dline(1, extra=',"advice":{"reason":"\\uafc0\\ubc8c \\uc785\\ub2c8\\ub2e4"}')
+        for first in (["Jack"], ["Jack", "다람"], None):
+            c = RS.LineCache()
+            self.assertEqual(self._run(D0, raw, first, c)[0], "ok")
+            c.sweep()
+            for second in (["Jack", "꿀벌"], ["다람", "꿀벌"]):
+                want = self._run(D0, raw, second)
+                got = self._run(D0, raw, second, c)
+                self.assertEqual(want[:3], ("err", "Block", "known_name"))
+                self.assertEqual(got, want, (first, second))
 
     def test_63_check_bytes_line_check_hook(self):
         body = RS.build_body(D0, dline(1) + dline(2, typ="resolution"))[0]

@@ -213,14 +213,17 @@ class NameSet:
 
     def key(self):
         """검사 항목 전체 (LineCache 가 '이 줄은 어느 항목들로 이미 검사했나'를 기억할 때)."""
-        return frozenset(self.sub), frozenset(self.seq.items())
+        return frozenset(self.sub), frozenset(self.word), frozenset(self.seq.items())
 
     def minus(self, done):
         """done(key())에 없는 항목만 가진 NameSet. hit 는 항목별 판정의 OR 이므로
         hit(self) == hit(done 의 항목) or hit(self.minus(done)) — done 으로 이미 통과한 줄은 나머지만 보면 된다."""
+        cur = self.key()
+        assert len(done) == len(cur), "NameSet.key() 항목 수 불일치"
         part = NameSet()
         part.sub = self.sub - done[0]
-        part.seq = {k: v for k, v in self.seq.items() if (k, v) not in done[1]}
+        part.word = self.word - done[1]
+        part.seq = {k: v for k, v in self.seq.items() if (k, v) not in done[2]}
         return part
 
     def hit(self, mode, s):
@@ -453,7 +456,7 @@ def build_body(name, raw, extra_names=None, stats=None, cache=None, pace=None):
                 else:
                     pm = parts.get(id(done))
                     if pm is None:
-                        pm = parts[id(done)] = (ns.minus(done), (done[0] | nskey[0], done[1] | nskey[1]), done)
+                        pm = parts[id(done)] = (ns.minus(done), tuple(a | b for a, b in zip(done, nskey)), done)
                     part, merged = pm[0], pm[1]
                 hit = bool(part) and any(part.hit(m, t) for m, t in strings)
                 if not hit:
